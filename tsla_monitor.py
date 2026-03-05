@@ -9056,7 +9056,7 @@ function renderAlgoAlert(alert) {
   var priceEl = document.getElementById('algoAlertPrice');
   var timeEl  = document.getElementById('algoAlertTime');
 
-  if (iconEl)  { iconEl.textContent = isBuy ? '\u25b2' : '\u25bc'; iconEl.style.color = color; }
+  if (iconEl)  { iconEl.textContent = isBuy ? '\\u25b2' : '\\u25bc'; iconEl.style.color = color; }
   if (lblEl)   { lblEl.textContent  = alert.label   || '--'; lblEl.style.color = color; }
   if (detEl)   { detEl.textContent  = alert.detail  || '--'; }
   if (priceEl) { priceEl.textContent = '$' + (alert.price || '--'); priceEl.style.color = color; }
@@ -9072,7 +9072,7 @@ function renderAlgoHistory(history) {
     var a     = history[i];
     var isBuy = (a.direction === 'BUY');
     var c     = isBuy ? '#00ff88' : '#ff3355';
-    var arrow = isBuy ? '\u25b2' : '\u25bc';
+    var arrow = isBuy ? '\\u25b2' : '\\u25bc';
     var lbl   = a.label   || '';
     var det   = (a.detail || '').slice(0, 70);
     var px    = '$' + (a.price || '--');
@@ -9202,7 +9202,7 @@ function askSpock() {
 
 function spockExtract(txt, label) {
   // Extract section content following a label like "SITUATION:"
-  var lines   = txt.split('\n');
+  var lines   = txt.split('\\n');
   var result  = [];
   var found   = false;
   var labelUp = label.toUpperCase();
@@ -9228,12 +9228,12 @@ function spockExtract(txt, label) {
       result.push(trimmed);
     }
   }
-  return result.join('\n').trim() || '--';
+  return result.join('\\n').trim() || '--';
 }
 
 function spockFmtBullets(txt) {
   // Replace bullet chars at line start with styled arrow
-  return (txt || '--').replace(/(\n|^)[-*] /g, '$1&#9658; ');
+  return (txt || '--').replace(/(\\n|^)[-*] /g, '$1&#9658; ');
 }
 
 function spockExtractPrice(txt) {
@@ -9245,7 +9245,7 @@ function spockExtractPrice(txt) {
 function spockParseSellPlan(txt) {
   // Returns array of 3 target objects: {price, size, why}
   var targets = [{}, {}, {}];
-  var lines   = txt.split('\n');
+  var lines   = txt.split('\\n');
   for (var i = 0; i < lines.length; i++) {
     var line   = lines[i].trim();
     var lineUp = line.toUpperCase();
@@ -9293,7 +9293,7 @@ function renderSpockAnalysis(d) {
   var safety  = spockExtract(txt, 'POSITION SAFETY');
   var safeEl  = document.getElementById('spockSafe');
   if (safeEl) {
-    var firstLine = safety.split('\n')[0].toUpperCase();
+    var firstLine = safety.split('\\n')[0].toUpperCase();
     var isSafe    = firstLine.indexOf('YES') >= 0 || firstLine.indexOf('SAFE') >= 0;
     safeEl.textContent = isSafe ? 'YES' : 'NO';
     safeEl.style.color = isSafe ? '#00ff88' : '#ff3355';
