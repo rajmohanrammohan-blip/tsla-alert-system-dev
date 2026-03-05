@@ -17,6 +17,7 @@ Setup:
 """
 
 import os
+import sys
 import json
 import threading
 import time
@@ -951,10 +952,10 @@ def calculate_spy_analysis(tsla_closes, tsla_price):
     }
     try:
         print("  🌍 Fetching SPY, QQQ, VIX, TLT...")
-        spy_hist = yf.Ticker("SPY").history(period="6mo", interval="1d")
-        qqq_hist = yf.Ticker("QQQ").history(period="6mo", interval="1d")
-        vix_hist = yf.Ticker("^VIX").history(period="6mo", interval="1d")
-        tlt_hist = yf.Ticker("TLT").history(period="3mo", interval="1d")
+        spy_hist = yf.Ticker("SPY").history(period="6mo", interval="1d", auto_adjust=True)
+        qqq_hist = yf.Ticker("QQQ").history(period="6mo", interval="1d", auto_adjust=True)
+        vix_hist = yf.Ticker("^VIX").history(period="6mo", interval="1d", auto_adjust=True)
+        tlt_hist = yf.Ticker("TLT").history(period="3mo", interval="1d", auto_adjust=True)
         if spy_hist.empty:
             result["macro_signal"] = "NO SPY DATA"; return result
 
@@ -4355,13 +4356,13 @@ last_signal = None
 
 def run_analysis():
     global last_signal
-    print(f"\n🔍 Analyzing {TICKER} @ {datetime.now().strftime('%H:%M:%S')}...")
+    print(f"\n[ANALYSIS] {TICKER} @ {datetime.now().strftime('%H:%M:%S')}...", flush=True)
     try:
         # ── Fetch price history with retry ──
         hist = None
         for _attempt in range(3):
             try:
-                hist = yf.Ticker(TICKER).history(period="6mo", interval="1d")
+                hist = yf.Ticker(TICKER).history(period="6mo", interval="1d", auto_adjust=True)
                 if not hist.empty:
                     break
                 print(f"  ⚠️ yfinance returned empty data (attempt {_attempt+1}/3)")
@@ -4370,7 +4371,7 @@ def run_analysis():
                 print(f"  ⚠️ yfinance fetch error (attempt {_attempt+1}/3): {_ye}")
                 time.sleep(2)
         if hist is None or hist.empty:
-            print(f"  ❌ FATAL: Could not fetch {TICKER} price data after 3 attempts — aborting analysis")
+            print(f"[FATAL] Could not fetch {TICKER} data after 3 attempts", flush=True)
             return
         closes  = hist["Close"]
         volumes = hist["Volume"]
@@ -4919,8 +4920,12 @@ def fetch_institutional_periodically():
 
 
 def monitor_loop():
+    cycle = 0
     while True:
+        cycle += 1
+        print(f"[LOOP] cycle {cycle} starting", flush=True)
         run_analysis()
+        print(f"[LOOP] cycle {cycle} done, sleeping {CHECK_INTERVAL}s", flush=True)
         time.sleep(CHECK_INTERVAL)
 
 
@@ -11032,10 +11037,10 @@ setTimeout(pollSpockStatus, 5000);
 # ── Start background threads with delay so gunicorn can bind port first ──
 def start_background_threads():
     time.sleep(3)  # short wait for gunicorn to bind port
-    print("🚀 Starting background monitor threads...")
+    print("[STARTUP] Starting background monitor threads...", flush=True)
     # Run first analysis immediately so dashboard populates fast
     try:
-        print("  ▶ Running first analysis now...")
+        print("[STARTUP] Running first analysis...", flush=True)
         run_analysis()
     except Exception as e:
         print(f"  ⚠️ First analysis error: {e}")
