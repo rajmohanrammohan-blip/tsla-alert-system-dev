@@ -9555,7 +9555,7 @@ setTimeout(pollSpockStatus, 5000);
   <div style="display:grid;grid-template-columns:3fr 340px;gap:1px;background:var(--border);">
 
     <!-- LEFT: Chart -->
-    <div class="panel chart-panel" style="display:flex;flex-direction:column;height:400px;min-height:400px;">
+    <div class="panel chart-panel" style="display:flex;flex-direction:column;min-height:400px;">
       <div style="display:flex;gap:0;margin-bottom:12px;border-bottom:1px solid var(--border);">
         <button id="tabPrice" onclick="showChartTab('price')" style="background:none;border:none;border-bottom:2px solid var(--green);color:var(--green);font-family:var(--font-mono);font-size:10px;letter-spacing:2px;padding:8px 16px;cursor:pointer;margin-bottom:-1px;">PRICE</button>
         <button id="tabIchimoku" onclick="showChartTab('ichimoku')" style="background:none;border:none;border-bottom:2px solid transparent;color:var(--text-dim);font-family:var(--font-mono);font-size:10px;letter-spacing:2px;padding:8px 16px;cursor:pointer;margin-bottom:-1px;">ICHIMOKU CLOUD</button>
@@ -10573,9 +10573,6 @@ setTimeout(pollSpockStatus, 5000);
   </div>
 
   <!-- EXTENDED HOURS PANEL — full width -->
-
-
-  <!-- EXTENDED HOURS PANEL — full width -->
   <div class="panel" id="ext-panel" style="grid-column:1/-1;border:1px solid rgba(120,80,255,0.3);background:rgba(8,5,20,0.97);">
     <div class="panel-title" onclick="togglePanel('ext-panel')" style="cursor:pointer;" title="Click to collapse" style="color:#ce93d8;margin-bottom:16px;">
       ⏰ Extended Hours Activity — Pre-Market · After-Hours · Overnight Gap
@@ -10741,7 +10738,7 @@ setTimeout(pollSpockStatus, 5000);
     </div>
 
     <!-- ROW 2: Charts + Details -->
-    <div style="display:grid;grid-template-columns:2fr 2fr 1fr;gap:12px;">
+    <div style="display:grid;grid-template-columns:2fr 3fr;gap:12px;">
 
 
 
@@ -10833,7 +10830,7 @@ setTimeout(pollSpockStatus, 5000);
     </div>
 
     <!-- ROW 2: Walls + GEX chart + Dark Pools -->
-    <div style="display:grid;grid-template-columns:1fr 2fr 1fr;gap:12px;margin-bottom:14px;">
+    <div style="display:grid;grid-template-columns:1fr 2fr;gap:12px;margin-bottom:14px;">
 
       <!-- Call/Put Walls -->
       <div style="background:var(--bg3);border:1px solid var(--border);padding:14px;border-radius:1px;">
