@@ -5253,7 +5253,7 @@ def call_spock(trigger="manual", portfolio=100000, shares=0, entry_price=0):
         prompt = build_spock_prompt(portfolio, shares, entry_price)
 
         payload = _json.dumps({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "max_tokens": 600,
             "messages": [{"role": "user", "content": prompt}]
         }).encode("utf-8")
@@ -5305,8 +5305,15 @@ def call_spock(trigger="manual", portfolio=100000, shares=0, entry_price=0):
         return result
 
     except Exception as e:
-        print(f"  ❌ Spock error: {e}")
-        return {"error": str(e)}
+        err_msg = str(e)
+        try:
+            if hasattr(e, 'read'):
+                body = e.read().decode('utf-8', errors='replace')
+                err_msg = str(e) + " | " + body[:300]
+        except Exception:
+            pass
+        print(f"  Spock error: {err_msg}")
+        return {"error": err_msg}
     finally:
         _spock_cache["running"] = False
 
