@@ -4355,10 +4355,23 @@ last_signal = None
 
 def run_analysis():
     global last_signal
-    print(f"\n🔍 Analyzing TSLA @ {datetime.now().strftime('%H:%M:%S')}...")
+    print(f"\n🔍 Analyzing {TICKER} @ {datetime.now().strftime('%H:%M:%S')}...")
     try:
-        hist    = yf.Ticker(TICKER).history(period="6mo", interval="1d")
-        if hist.empty: return
+        # ── Fetch price history with retry ──
+        hist = None
+        for _attempt in range(3):
+            try:
+                hist = yf.Ticker(TICKER).history(period="6mo", interval="1d")
+                if not hist.empty:
+                    break
+                print(f"  ⚠️ yfinance returned empty data (attempt {_attempt+1}/3)")
+                time.sleep(2)
+            except Exception as _ye:
+                print(f"  ⚠️ yfinance fetch error (attempt {_attempt+1}/3): {_ye}")
+                time.sleep(2)
+        if hist is None or hist.empty:
+            print(f"  ❌ FATAL: Could not fetch {TICKER} price data after 3 attempts — aborting analysis")
+            return
         closes  = hist["Close"]
         volumes = hist["Volume"]
         price   = round(closes.iloc[-1], 2)
@@ -4400,25 +4413,47 @@ def run_analysis():
         }
 
         # ══ SPY / MACRO ENGINE ══
-        spy_data = calculate_spy_analysis(closes, price)
+        try:
+            spy_data = calculate_spy_analysis(closes, price)
+        except Exception as _e:
+            print(f"  ⚠️ SPY analysis error: {_e}")
+            spy_data = {"macro_score":0,"macro_signal":"ERROR","spy_trend":"UNKNOWN","spy_change_pct":0,"beta_20d":2.0,"vix":20,"vix_regime":"UNKNOWN","rs_signal":"NEUTRAL","divergence_warning":False,"expected_tsla_move":0,"tsla_spy_deviation":0}
 
         # ══ NEWS ENGINE ══
         print("  📰 Fetching real-time news...")
-        raw_articles = fetch_news()
-        news_data    = calculate_news_sentiment(raw_articles)
+        try:
+            raw_articles = fetch_news()
+            news_data    = calculate_news_sentiment(raw_articles)
+        except Exception as _e:
+            print(f"  ⚠️ News error: {_e}")
+            raw_articles = []
+            news_data    = {"score":0,"signal":"ERROR","bull_count":0,"bear_count":0,"articles":[]}
 
         # ══ EXTENDED HOURS ENGINE ══
         print("  ⏰ Fetching extended hours data...")
-        ext_data = calculate_extended_hours(TICKER)
+        try:
+            ext_data = calculate_extended_hours(TICKER)
+        except Exception as _e:
+            print(f"  ⚠️ Extended hours error: {_e}")
+            ext_data = {"session":"UNKNOWN","ext_score":0,"ext_signal":"ERROR","premarket_change_pct":0,"afterhours_change_pct":0,"overnight_gap_pct":0,"gap_direction":"NONE"}
 
         # ══ MARKET MAKER ENGINE ══
         print("  🎰 Running Market Maker analysis...")
-        mm_data   = calculate_market_maker_data(TICKER, price)
-        dark_pool = calculate_dark_pool_levels(closes, volumes, highs, lows)
+        try:
+            mm_data   = calculate_market_maker_data(TICKER, price)
+            dark_pool = calculate_dark_pool_levels(closes, volumes, highs, lows)
+        except Exception as _e:
+            print(f"  ⚠️ Market maker error: {_e}")
+            mm_data   = {"gex_total":0,"gex_signal":"ERROR","max_pain":None,"pc_ratio":None,"iv_rank":50,"iv_signal":"ERROR","hedging_pressure":"NEUTRAL","call_walls":[],"put_walls":[],"pin_risk":False,"zero_dte_risk":False}
+            dark_pool = {"above":[],"below":[],"gaps":[]}
 
         # ══ UNUSUAL OPTIONS ACTIVITY ENGINE ══
         print("  🔍 Scanning for unusual options activity...")
-        uoa_data = calculate_unusual_options_activity(TICKER, price)
+        try:
+            uoa_data = calculate_unusual_options_activity(TICKER, price)
+        except Exception as _e:
+            print(f"  ⚠️ UOA error: {_e}")
+            uoa_data = {"net_flow":"ERROR","flow_score":0,"whale_alerts":[],"unusual_calls":[],"unusual_puts":[],"total_call_premium":0,"total_put_premium":0,"uoa_reasons":["Options data unavailable"]}
 
         # ── Derived values needed for indicators dict ──
         prev_macd_hist = state.get("indicators", {}).get("macd_hist", macd_hist)
@@ -4513,36 +4548,52 @@ def run_analysis():
         portfolio_val = state.get("_portfolio_value", 100_000)
         target_vol    = state.get("_target_vol", 0.12)
         print("  📐 Computing CTA position sizing...")
-        sizing = calculate_cta_sizing(
+        try:
+            sizing = calculate_cta_sizing(
             closes, volumes, indicators, spy_data, hmm_result,
             inst_models, mm_data, news_data, ext_data,
             portfolio_value=portfolio_val,
             target_vol=target_vol,
         )
+        except Exception as _e:
+            print(f"  ⚠️ CTA sizing error: {_e}")
+            sizing = {"sizing_signal":"ERROR","final_exposure_pct":0,"final_exposure_dollar":0,"share_count":0,"vol_history":[]}
 
         signal, strength, reasons = generate_signal(indicators, price)
 
         # ── EXIT / PEAK DETECTION ENGINE ──
-        exit_data = calculate_exit_analysis(closes, highs, lows, volumes, indicators, inst_models)
+        try:
+            exit_data = calculate_exit_analysis(closes, highs, lows, volumes, indicators, inst_models)
+        except Exception as _e:
+            print(f"  ⚠️ Exit analysis error: {_e}")
+            exit_data = {"exit_analysis": {"urgency":"ERROR","exit_score":0,"optimal_sell_low":None,"optimal_sell_high":None,"stop_loss":None,"sell_tranches":[],"exit_reasons":[]}}
         exit_analysis = exit_data.get("exit_analysis", {})
         exit_urgency  = exit_analysis.get("urgency", "HOLD — NO TOP YET")
         exit_score    = exit_analysis.get("exit_score", 0)
 
         # ── PRECISION TOP ENGINE (9 leading signals) ──
         print("  🎯 Running precision top detection...")
-        peak_data = calculate_peak_signals(
+        try:
+            peak_data = calculate_peak_signals(
             closes, highs, lows, volumes, opens_s,
             mm_data=mm_data, indicators=indicators
         )
+        except Exception as _e:
+            print(f"  ⚠️ Peak signals error: {_e}")
+            peak_data = {"peak_score":0,"peak_urgency":"✅ CLEAR","signals":[],"top_price_target":None,"hard_stop":None}
 
         # ── PRECISION ENTRY ENGINE (when + how much to buy) ──
         print("  🟢 Running precision entry detection...")
         portfolio_val = state.get("_portfolio_value", 100_000)
-        entry_data = calculate_entry_signals(
+        try:
+            entry_data = calculate_entry_signals(
             closes, highs, lows, volumes, opens_s,
             mm_data=mm_data, indicators=indicators,
             spy_data=spy_data, portfolio_value=portfolio_val
         )
+        except Exception as _e:
+            print(f"  ⚠️ Entry signals error: {_e}")
+            entry_data = {"entry_score":0,"entry_urgency":"⏳ WAIT","tranche_plan":[],"signals":[],"total_deploy_pct":0,"invalidation":None}
 
         # ── Build chart history data ──
         # vol_history comes from sizing (CTA engine computes rolling vol)
@@ -4953,6 +5004,69 @@ def api_switch_ticker():
         return jsonify({"status": "switched", "ticker": TICKER})
     return jsonify({"status": "error", "msg": "invalid ticker"}), 400
 
+
+
+
+@app.route("/api/debug")
+def api_debug():
+    """Diagnostic endpoint — shows exactly what is failing."""
+    import traceback, sys
+    results = {}
+
+    # 1. Test yfinance
+    try:
+        import yfinance as yf
+        h = yf.Ticker("TSLA").history(period="5d", interval="1d")
+        results["yfinance"] = {
+            "ok": not h.empty,
+            "rows": len(h),
+            "latest_close": float(h["Close"].iloc[-1]) if not h.empty else None,
+            "columns": list(h.columns),
+        }
+    except Exception as e:
+        results["yfinance"] = {"ok": False, "error": str(e), "trace": traceback.format_exc()[-500:]}
+
+    # 2. Test state
+    results["state_price"] = state.get("price")
+    results["state_keys_populated"] = {k: bool(v) for k, v in state.items() if isinstance(v, dict)}
+    results["last_updated"] = state.get("last_updated", "NEVER")
+
+    # 3. Try running a mini-analysis inline
+    try:
+        import yfinance as yf
+        hist = yf.Ticker("TSLA").history(period="6mo", interval="1d")
+        if hist.empty:
+            results["mini_analysis"] = "FAIL - hist.empty"
+        else:
+            results["mini_analysis"] = f"OK - {len(hist)} rows, close={float(hist['Close'].iloc[-1]):.2f}"
+            # Try each major sub-function
+            closes  = hist["Close"]
+            volumes = hist["Volume"]
+            highs   = hist["High"]
+            lows    = hist["Low"]
+            opens_s = hist["Open"]
+            for fn_name, fn_call in [
+                ("rsi",        lambda: calculate_rsi(closes)),
+                ("macd",       lambda: calculate_macd(closes)),
+                ("bollinger",  lambda: calculate_bollinger(closes)),
+                ("ichimoku",   lambda: calculate_ichimoku(highs, lows, closes)),
+                ("spy",        lambda: calculate_spy_analysis(closes, float(closes.iloc[-1]))),
+                ("mm_data",    lambda: calculate_market_maker_data("TSLA", float(closes.iloc[-1]))),
+                ("uoa",        lambda: calculate_unusual_options_activity("TSLA", float(closes.iloc[-1]))),
+                ("exit",       lambda: calculate_exit_analysis(closes, highs, lows, volumes, {}, {})),
+                ("darthvader", lambda: calculate_darthvader(closes, highs, lows, volumes, opens_s, {}, {}, {})),
+            ]:
+                try:
+                    r = fn_call()
+                    results[f"fn_{fn_name}"] = f"OK ({type(r).__name__})"
+                except Exception as fe:
+                    results[f"fn_{fn_name}"] = f"FAIL: {str(fe)[:200]}"
+
+    except Exception as e:
+        results["mini_analysis"] = f"FAIL: {str(e)}"
+        results["mini_trace"] = traceback.format_exc()[-800:]
+
+    return jsonify(results)
 
 @app.route("/api/spock", methods=["GET", "POST"])
 def api_spock():
