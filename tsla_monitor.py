@@ -957,9 +957,11 @@ def calculate_spy_analysis(tsla_closes, tsla_price):
         vix_hist = yf.Ticker("^VIX").history(period="6mo", interval="1d", auto_adjust=True)
         tlt_hist = yf.Ticker("TLT").history(period="3mo", interval="1d", auto_adjust=True)
         if spy_hist.empty:
-            result["macro_signal"] = "NO SPY DATA"; return result
-
-        spy_closes = spy_hist["Close"]
+            print("  ⚠️ SPY hist empty - using fallback", flush=True)
+            # Don't return - try to populate what we can from other tickers
+            spy_closes = None
+        else:
+            spy_closes = spy_hist["Close"]
         qqq_closes = qqq_hist["Close"] if not qqq_hist.empty else None
         vix_closes = vix_hist["Close"] if not vix_hist.empty else None
         tlt_closes = tlt_hist["Close"] if not tlt_hist.empty else None
@@ -985,7 +987,10 @@ def calculate_spy_analysis(tsla_closes, tsla_price):
                 for i in range(-60, 0) if abs(i) <= len(vix_closes)
             ]
 
-        # Align returns
+        # Align returns — skip if SPY data unavailable
+        if spy_closes is None:
+            result["macro_signal"] = "SPY UNAVAILABLE"
+            return result
         tsla_ret = tsla_closes.pct_change().dropna()
         spy_ret  = spy_closes.pct_change().dropna()
         common   = tsla_ret.index.intersection(spy_ret.index)
@@ -5144,7 +5149,17 @@ def api_darthvader():
     """DarthVader 1.0 institutional intelligence API endpoint."""
     dv = state.get("darthvader", {})
     if not dv:
-        return jsonify({"error": "DarthVader not yet computed", "tsla_state": {}, "prob_signals": {}})
+        return jsonify({
+            "error": "DarthVader not yet computed",
+            "tsla_state": {"state":"ANALYZING","confidence":0,"action":"Waiting for first analysis..."},
+            "prob_signals": {"prob_breakout":0,"prob_breakdown":0,"prob_revert":50},
+            "risk_mode": "NORMAL",
+            "risk_color": "#00ff88",
+            "risk_bg": "rgba(0,255,136,0.08)",
+            "features": {"ofi_ratio":0,"aggression":0,"absorption":0,"vol_ratio":1,"trend_score":5,"momentum_5":0,"vacuum":0},
+            "market_intent": "Initializing analysis...",
+            "updated": "—",
+        })
     return jsonify(_sanitize(dv))
 
 
@@ -7605,7 +7620,7 @@ function renderPeakPanel(pk) {
 }
 
 function renderCTAPanel(sz, price) {
-  if(!sz || !sz.sizing_signal) return;
+  if(!sz || !Object.keys(sz).length) return;
   const G = '#00ff88', R = 'var(--accent-red)', GO = 'var(--gold)', B = '#40c4ff', O = '#ff6d00';
   const fmt$ = v => v != null ? '$' + Number(v).toLocaleString('en-US',{maximumFractionDigits:0}) : '-';
   const fmtN = (v,d=2) => v != null ? Number(v).toFixed(d) : '-';
@@ -7736,7 +7751,7 @@ function updatePortfolio() {
 }
 
 function renderExtPanel(ext) {
-  if(!ext || !ext.session) return;
+  if(!ext || !Object.keys(ext).length) return;
   const G = 'var(--accent-green)', R = 'var(--accent-red)', GO = 'var(--gold)', P = '#ce93d8', C = '#00e5ff';
   const gc = v => (!v || v===0) ? GO : v > 0 ? G : R;
   const fmt = (v, suffix='') => v != null ? (v>0?'+':'')+v+suffix : '-';
@@ -7811,7 +7826,7 @@ function renderExtPanel(ext) {
 let _newsCache = [];
 
 function renderNewsPanel(nd) {
-  if(!nd || !nd.articles) return;
+  if(!nd) return;
   _newsCache = nd.articles || [];
   const G = 'var(--accent-green)', R = 'var(--accent-red)', GO = 'var(--gold)';
   const sigColors = {'VERY BULLISH':G,'BULLISH':G,'NEUTRAL':GO,'BEARISH':R,'VERY BEARISH':R};
@@ -7893,7 +7908,7 @@ function filterNews(type) {
 }
 
 function renderSPYPanel(spy) {
-  if(!spy || !spy.spy_price) return;
+  if(!spy || !Object.keys(spy).length) return;
   const G = 'var(--accent-green)', R = 'var(--accent-red)', GO = 'var(--gold)', B = '#00b4ff', O = '#ff6d00';
   const gc = v => v > 0 ? G : v < 0 ? R : 'var(--text-dim)';
   function row(label, val, color) {
