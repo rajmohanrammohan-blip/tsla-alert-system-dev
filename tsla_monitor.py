@@ -58,6 +58,7 @@ GREEN_INSTANCE = os.getenv("GREEN_INSTANCE", "")   # e.g. 1101234567
 GREEN_TOKEN    = os.getenv("GREEN_TOKEN",    "")   # long token from Green API
 GREEN_PHONE    = os.getenv("GREEN_PHONE",    "")   # e.g. 919547025845
 WA_ENABLED     = bool(GREEN_INSTANCE and GREEN_TOKEN and GREEN_PHONE)
+ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY", "")   # Claude API key for Spock
 
 # Minimum minutes between the same type of alert (prevents spam)
 WA_THROTTLE_MIN = 15
@@ -93,6 +94,18 @@ state = {
     "ichimoku_history": [],
     "darthvader": {},  # DarthVader 1.0 institutional intelligence
 }
+
+# ── Spock AI cache ──
+_spock_cache = {
+    "last_analysis":    None,   # last Spock response text
+    "last_trigger":     None,   # what triggered it
+    "last_ts":          0,      # unix timestamp of last call
+    "last_dv_state":    None,   # DV state at last analysis
+    "last_risk_mode":   None,   # risk mode at last analysis
+    "last_whale_count": 0,      # whale count at last analysis
+    "running":          False,  # prevent concurrent calls
+}
+SPOCK_COOLDOWN = 180  # seconds between auto-triggers
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -4829,6 +4842,12 @@ def run_analysis():
 
         state["_prev_exit_score"] = exit_score
 
+        # ── Spock auto-trigger check ──
+        try:
+            check_spock_triggers()
+        except Exception as _se:
+            print(f"  ⚠️ Spock trigger error: {_se}")
+
     except Exception as e:
         print(f"❌ Analysis error: {e}")
 
@@ -4923,6 +4942,33 @@ def api_switch_ticker():
         return jsonify({"status": "switched", "ticker": TICKER})
     return jsonify({"status": "error", "msg": "invalid ticker"}), 400
 
+
+@app.route("/api/spock", methods=["GET", "POST"])
+def api_spock():
+    """Spock AI endpoint — manual trigger or fetch cached result."""
+    from flask import request as freq
+    data       = freq.get_json(silent=True) or {}
+    trigger    = data.get("trigger", "manual")
+    portfolio  = int(data.get("portfolio", 100000))
+    shares     = float(data.get("shares", 0))
+    entry_price= float(data.get("entry_price", 0))
+
+    result = call_spock(trigger=trigger, portfolio=portfolio,
+                        shares=shares, entry_price=entry_price)
+    return jsonify(result)
+
+
+@app.route("/api/spock/status")
+def api_spock_status():
+    """Returns cached Spock analysis without triggering a new one."""
+    cached = _spock_cache.get("last_analysis")
+    return jsonify({
+        "has_analysis": cached is not None,
+        "analysis":     cached,
+        "running":      _spock_cache["running"],
+        "last_trigger": _spock_cache["last_trigger"],
+    })
+
 @app.route("/api/refresh")
 def api_refresh():
     threading.Thread(target=run_analysis).start()
@@ -4961,6 +5007,235 @@ def api_darthvader():
 
 @app.route("/health")
 def health(): return jsonify({"status": "ok"}), 200
+
+# ═══════════════════════════════════════════════════════════════
+#  SPOCK 2.0 — AI TRADING CO-PILOT (Claude-powered, server-side)
+# ═══════════════════════════════════════════════════════════════
+
+def build_spock_prompt(portfolio=100000, shares=0, entry_price=0):
+    """Assembles full market snapshot into Spock's prompt."""
+    s = state
+    dv        = s.get("darthvader", {})
+    dv_state  = dv.get("tsla_state", {})
+    risk      = dv.get("risk_mode", "UNKNOWN")
+    probs     = dv.get("probabilistic_signals", {})
+    uoa       = s.get("uoa_data", {})
+    ind       = s.get("indicators", {})
+    ichi      = s.get("ichimoku", {})
+    hmm       = s.get("hmm", {})
+    news      = s.get("news_data", {})
+    ext       = s.get("ext_data", {})
+    price     = s.get("price", 0) or 0
+
+    # State probabilities
+    state_dist = dv_state.get("state_distribution", {})
+    probs_str  = "\n".join(
+        f"  {k}: {round(v*100)}%" for k, v in
+        sorted(state_dist.items(), key=lambda x: -x[1])
+    ) if state_dist else "  No distribution data"
+
+    # Top news headlines
+    articles   = news.get("articles", [])[:3]
+    news_str   = "\n".join(
+        f"  [{a.get('sentiment','?').upper()}] {a.get('headline','')[:80]}"
+        for a in articles
+    ) if articles else "  No recent news"
+
+    # Whale summary
+    whales     = uoa.get("whale_alerts", [])
+    whale_str  = whales[0].get("premium_fmt","") + " " + whales[0].get("type","") + " $" + str(whales[0].get("strike","")) if whales else "None detected"
+
+    # Position P&L
+    position_value = round(shares * price, 2) if shares else 0
+    pnl = round((price - entry_price) * shares, 2) if (shares and entry_price) else 0
+    pnl_pct = round((price / entry_price - 1) * 100, 2) if entry_price else 0
+
+    # BB position
+    bb_upper = ind.get("bb_upper", 0)
+    bb_lower = ind.get("bb_lower", 0)
+    bb_pos   = "ABOVE UPPER" if price > bb_upper else "BELOW LOWER" if price < bb_lower else "INSIDE BANDS"
+
+    prompt = f"""You are SPOCK — a ruthlessly logical AI trading co-pilot for an active TSLA trader.
+You have access to a sophisticated multi-layer quant system called DarthVader 2.0.
+Analyze the current market state and give a precise, actionable assessment.
+Be direct. No hedging. No disclaimers. The trader trusts the data.
+
+CURRENT MARKET SNAPSHOT:
+========================
+Ticker: {s.get("ticker", "TSLA")} | Price: ${price} | Session: {ext.get("session", "UNKNOWN")}
+Time: {ext.get("current_et_time", "—")}
+
+DARTHVADER STATE ENGINE:
+- Behavioral State: {dv_state.get("state", "UNKNOWN")} (confidence: {round((dv_state.get("confidence",0))*100)}%)
+- Risk Mode: {risk}
+- Market Intent: {dv.get("market_intent", "—")}
+- State Description: {dv_state.get("description", "—")}
+
+STATE PROBABILITY DISTRIBUTION:
+{probs_str}
+
+PROBABILISTIC SIGNALS:
+- Breakout (30m): {round(probs.get("prob_breakout",0)*100)}%
+- Breakdown (30m): {round(probs.get("prob_breakdown",0)*100)}%
+- Mean Revert: {round(probs.get("prob_revert",0)*100)}%
+- Expected Move: {probs.get("expected_move_low","—")}% to {probs.get("expected_move_high","—")}%
+- Model Reliability: {round(probs.get("model_reliability",0)*100)}%
+
+OPTIONS FLOW (UOA):
+- Net Flow: {uoa.get("net_flow","—")} | Signal: {uoa.get("uoa_signal","—")}
+- Whale Trades: {len(uoa.get("whale_alerts",[]))} | Unusual Strikes: {uoa.get("total_unusual",0)}
+- Call Premium: ${round(uoa.get("total_call_premium",0)/1e6,2)}M | Put Premium: ${round(uoa.get("total_put_premium",0)/1e6,2)}M
+- Top Whale: {whale_str}
+
+PRICE ACTION:
+- EMA50: ${ind.get("ema50","—")} | EMA200: ${ind.get("ema200","—")}
+- RSI: {ind.get("rsi","—")} | MACD Hist: {ind.get("macd_hist","—")}
+- Bollinger: {bb_pos} (upper: ${bb_upper} lower: ${bb_lower})
+- Ichimoku Cloud: {ichi.get("cloud_signal","—")}
+- HMM Regime: {hmm.get("regime","—")} ({hmm.get("confidence","—")}% confidence)
+
+RECENT NEWS:
+{news_str}
+
+TRADER'S POSITION:
+- Portfolio Size: ${portfolio:,}
+- Current Position: {shares} shares (value: ${position_value:,})
+- Entry Price: ${entry_price} | Unrealized P&L: ${pnl:,} ({pnl_pct}%)
+
+RESPOND IN THIS EXACT FORMAT — no extra text before or after:
+================================================================
+ACTION: [BUY / ADD / HOLD / REDUCE / EXIT / HEDGE / WAIT]
+SIZE: [specific recommendation e.g. "Buy 10 shares" or "Exit 50% of position" or "N/A"]
+CONFIDENCE: [HIGH / MEDIUM / LOW]
+
+SITUATION:
+[2-3 sentences describing what the market is doing RIGHT NOW]
+
+REASONING:
+• [most important signal driving your call]
+• [second signal]
+• [third signal if meaningful, otherwise omit]
+
+RISK:
+[1-2 sentences — what price/event would invalidate this view]
+
+WATCH FOR:
+• [next key level or event]
+• [second thing to monitor]"""
+
+    return prompt
+
+
+def call_spock(trigger="manual", portfolio=100000, shares=0, entry_price=0):
+    """Call Claude API server-side and cache the result."""
+    import time, urllib.request, json as _json
+
+    global _spock_cache
+
+    if not ANTHROPIC_KEY:
+        return {"error": "ANTHROPIC_API_KEY not set in Railway environment variables"}
+
+    if _spock_cache["running"]:
+        return {"error": "Spock is already thinking..."}
+
+    # Cooldown check for auto-triggers
+    if trigger != "manual":
+        elapsed = time.time() - _spock_cache["last_ts"]
+        if elapsed < SPOCK_COOLDOWN:
+            return {"error": f"Cooldown: {int(SPOCK_COOLDOWN - elapsed)}s remaining"}
+
+    _spock_cache["running"] = True
+    try:
+        prompt = build_spock_prompt(portfolio, shares, entry_price)
+
+        payload = _json.dumps({
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 600,
+            "messages": [{"role": "user", "content": prompt}]
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=payload,
+            headers={
+                "Content-Type":      "application/json",
+                "x-api-key":         ANTHROPIC_KEY,
+                "anthropic-version": "2023-06-01",
+            },
+            method="POST"
+        )
+
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = _json.loads(resp.read())
+
+        text = data["content"][0]["text"].strip()
+
+        # Parse structured response
+        def extract(label, txt):
+            for line in txt.split("\n"):
+                if line.strip().startswith(label + ":"):
+                    return line.split(":", 1)[1].strip()
+            return "—"
+
+        result = {
+            "action":     extract("ACTION", text),
+            "size":       extract("SIZE", text),
+            "confidence": extract("CONFIDENCE", text),
+            "full_text":  text,
+            "trigger":    trigger,
+            "timestamp":  datetime.now().strftime("%H:%M:%S ET"),
+            "price":      state.get("price", 0),
+            "dv_state":   state.get("darthvader", {}).get("tsla_state", {}).get("state", "—"),
+        }
+
+        _spock_cache.update({
+            "last_analysis":    result,
+            "last_trigger":     trigger,
+            "last_ts":          time.time(),
+            "last_dv_state":    result["dv_state"],
+            "last_risk_mode":   state.get("darthvader", {}).get("risk_mode", "—"),
+            "last_whale_count": len(state.get("uoa_data", {}).get("whale_alerts", [])),
+        })
+
+        print(f"  🖖 Spock: {result['action']} | {result['confidence']} | triggered by {trigger}")
+        return result
+
+    except Exception as e:
+        print(f"  ❌ Spock error: {e}")
+        return {"error": str(e)}
+    finally:
+        _spock_cache["running"] = False
+
+
+def check_spock_triggers():
+    """Called every analysis cycle — fires Spock if something changed meaningfully."""
+    import threading, time
+
+    dv       = state.get("darthvader", {})
+    cur_state = dv.get("tsla_state", {}).get("state", "")
+    cur_risk  = dv.get("risk_mode", "")
+    cur_whales= len(state.get("uoa_data", {}).get("whale_alerts", []))
+
+    trigger = None
+
+    if cur_state and cur_state != _spock_cache["last_dv_state"] and _spock_cache["last_dv_state"]:
+        trigger = f"STATE CHANGE: {_spock_cache['last_dv_state']} → {cur_state}"
+
+    elif cur_risk in ("DEFENSIVE",) and cur_risk != _spock_cache["last_risk_mode"]:
+        trigger = f"RISK ESCALATED to {cur_risk}"
+
+    elif cur_whales > _spock_cache["last_whale_count"] and cur_whales > 0:
+        trigger = f"NEW WHALE TRADE DETECTED ({cur_whales} total)"
+
+    if trigger:
+        print(f"  🖖 Spock auto-trigger: {trigger}")
+        threading.Thread(
+            target=call_spock,
+            kwargs={"trigger": trigger},
+            daemon=True
+        ).start()
+
+
 @app.route("/")
 def dashboard():
     from flask import Response
@@ -8886,7 +9161,96 @@ setTimeout(function(){ loadNHL(false); }, 5000);</script>
     </div>
   </div>
 
-  <!-- UNUSUAL OPTIONS ACTIVITY PANEL — full width -->
+  
+  <!-- SPOCK 2.0 — AI TRADING CO-PILOT -->
+  <div class="panel" id="spock-panel" style="grid-column:1/-1;border:2px solid rgba(0,229,255,0.35);background:rgba(0,10,20,0.95);position:relative;">
+    <div class="panel-title" onclick="togglePanel('spock-panel')" style="cursor:pointer;display:flex;align-items:center;gap:12px;">
+      <span style="color:#00e5ff;font-size:13px;">🖖</span>
+      <span>SPOCK 2.0 — AI TRADING CO-PILOT</span>
+      <span style="font-size:9px;color:var(--text-dim);letter-spacing:2px;">CLAUDE-POWERED · REAL-TIME ANALYSIS</span>
+      <span id="spockTriggerBadge" style="display:none;font-size:9px;background:rgba(0,229,255,0.2);color:#00e5ff;padding:2px 8px;border-radius:2px;border:1px solid #00e5ff;margin-left:8px;"></span>
+      <span class="panel-collapse-btn" id="btn-spock-panel" style="margin-left:auto;">▾</span>
+    </div>
+
+    <!-- Position Input Row -->
+    <div style="display:flex;gap:12px;align-items:center;margin-bottom:16px;padding:12px;background:rgba(0,229,255,0.05);border:1px solid rgba(0,229,255,0.15);border-radius:2px;">
+      <span style="font-size:9px;letter-spacing:2px;color:#00e5ff;white-space:nowrap;">YOUR POSITION</span>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+        <input id="spockPortfolio" type="number" value="100000" placeholder="Portfolio $"
+          style="background:var(--bg3);border:1px solid rgba(0,229,255,0.3);color:var(--text-primary);font-family:var(--font-mono);font-size:11px;padding:6px 10px;width:130px;border-radius:1px;">
+        <input id="spockShares" type="number" value="0" placeholder="Shares held"
+          style="background:var(--bg3);border:1px solid rgba(0,229,255,0.3);color:var(--text-primary);font-family:var(--font-mono);font-size:11px;padding:6px 10px;width:120px;border-radius:1px;">
+        <input id="spockEntry" type="number" value="0" placeholder="Entry price $"
+          style="background:var(--bg3);border:1px solid rgba(0,229,255,0.3);color:var(--text-primary);font-family:var(--font-mono);font-size:11px;padding:6px 10px;width:130px;border-radius:1px;">
+        <button onclick="askSpock()" id="spockBtn"
+          style="background:rgba(0,229,255,0.15);border:1px solid #00e5ff;color:#00e5ff;font-family:var(--font-mono);font-size:11px;padding:7px 20px;cursor:pointer;letter-spacing:2px;border-radius:1px;white-space:nowrap;">
+          🖖 ASK SPOCK
+        </button>
+        <span id="spockStatus" style="font-size:10px;color:var(--text-dim);">Ready</span>
+      </div>
+    </div>
+
+    <!-- Analysis Output -->
+    <div id="spockOutput" style="display:none;">
+
+      <!-- Action Bar -->
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr 2fr;gap:10px;margin-bottom:16px;">
+        <div style="background:var(--bg2);border:1px solid rgba(0,229,255,0.2);padding:14px;text-align:center;">
+          <div style="font-size:9px;letter-spacing:2px;color:#00e5ff;margin-bottom:6px;">ACTION</div>
+          <div id="spockAction" style="font-family:var(--font-mono);font-size:22px;font-weight:700;color:#00e5ff;">—</div>
+        </div>
+        <div style="background:var(--bg2);border:1px solid rgba(0,229,255,0.2);padding:14px;text-align:center;">
+          <div style="font-size:9px;letter-spacing:2px;color:#00e5ff;margin-bottom:6px;">CONFIDENCE</div>
+          <div id="spockConf" style="font-family:var(--font-mono);font-size:18px;font-weight:700;">—</div>
+        </div>
+        <div style="background:var(--bg2);border:1px solid rgba(0,229,255,0.2);padding:14px;text-align:center;">
+          <div style="font-size:9px;letter-spacing:2px;color:#00e5ff;margin-bottom:6px;">SIZE</div>
+          <div id="spockSize" style="font-family:var(--font-mono);font-size:13px;font-weight:700;color:var(--gold);">—</div>
+        </div>
+        <div style="background:var(--bg2);border:1px solid rgba(0,229,255,0.2);padding:14px;">
+          <div style="font-size:9px;letter-spacing:2px;color:#00e5ff;margin-bottom:6px;">TRIGGERED BY</div>
+          <div id="spockTrigger" style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim);">—</div>
+          <div id="spockTime" style="font-size:9px;color:var(--text-dim);margin-top:4px;">—</div>
+        </div>
+      </div>
+
+      <!-- Full analysis text -->
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+
+        <div>
+          <div style="font-size:9px;letter-spacing:2px;color:#00e5ff;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid rgba(0,229,255,0.2);">SITUATION</div>
+          <div id="spockSituation" style="font-size:12px;line-height:1.7;color:var(--text-primary);">—</div>
+
+          <div style="font-size:9px;letter-spacing:2px;color:#00e5ff;margin:14px 0 8px;padding-bottom:4px;border-bottom:1px solid rgba(0,229,255,0.2);">REASONING</div>
+          <div id="spockReasoning" style="font-size:12px;line-height:1.8;color:var(--text-primary);">—</div>
+        </div>
+
+        <div>
+          <div style="font-size:9px;letter-spacing:2px;color:#ff3355;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid rgba(255,51,85,0.3);">RISK / INVALIDATION</div>
+          <div id="spockRisk" style="font-size:12px;line-height:1.7;color:var(--text-primary);">—</div>
+
+          <div style="font-size:9px;letter-spacing:2px;color:var(--gold);margin:14px 0 8px;padding-bottom:4px;border-bottom:1px solid rgba(255,179,0,0.3);">WATCH FOR</div>
+          <div id="spockWatch" style="font-size:12px;line-height:1.8;color:var(--text-primary);">—</div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Loading state -->
+    <div id="spockLoading" style="display:none;text-align:center;padding:30px;">
+      <div style="font-family:var(--font-mono);font-size:13px;color:#00e5ff;letter-spacing:3px;">🖖 SPOCK IS ANALYZING...</div>
+      <div style="font-size:10px;color:var(--text-dim);margin-top:8px;">Processing all market signals</div>
+    </div>
+
+    <!-- Empty state -->
+    <div id="spockEmpty" style="text-align:center;padding:20px;">
+      <div style="font-size:11px;color:var(--text-dim);">Enter your position details above and click ASK SPOCK for a full analysis.</div>
+      <div style="font-size:10px;color:var(--text-dim);margin-top:6px;">Spock also auto-triggers on state changes, risk escalations, and new whale trades.</div>
+    </div>
+
+  </div>
+
+<!-- UNUSUAL OPTIONS ACTIVITY PANEL — full width -->
   <div class="panel" id="uoa-panel" style="grid-column:1/-1;border:2px solid rgba(180,100,255,0.35);background:rgba(10,5,20,0.98);">
     <div class="panel-title" onclick="togglePanel('uoa-panel')" style="cursor:pointer;" title="Click to collapse" style="color:#b388ff;margin-bottom:18px;">
       🔍 Unusual Options Activity — Whale &amp; Sweep Detection
