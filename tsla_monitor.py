@@ -4844,7 +4844,10 @@ def run_analysis():
 
         # ── Spock auto-trigger check ──
         try:
-            check_spock_triggers()
+            algo_alert = detect_algo_activity()
+            state["algo_alert"] = algo_alert
+            state["algo_history"] = _algo_state.get("alert_history", [])
+            check_spock_triggers(algo_alert=algo_alert)
         except Exception as _se:
             print(f"  ⚠️ Spock trigger error: {_se}")
 
@@ -4920,7 +4923,15 @@ def api_state():
         safe = {k: v for k, v in state.items() if k != "darthvader"}
         safe["wa_enabled"]    = WA_ENABLED
         safe["wa_phone_tail"] = GREEN_PHONE[-4:] if GREEN_PHONE else ""
-        safe["darthvader"]    = {}
+        # Include darthvader features for algo radar gauges (strip heavy data)
+        dv_full = state.get("darthvader", {})
+        safe["darthvader"]    = {
+            "features":           dv_full.get("features", {}),
+            "tsla_state":         dv_full.get("tsla_state", {}),
+            "risk_mode":          dv_full.get("risk_mode", "NORMAL"),
+            "probabilistic_signals": dv_full.get("probabilistic_signals", {}),
+            "market_intent":      dv_full.get("market_intent", ""),
+        }
         return jsonify(safe)
 
 @app.route("/api/switch_ticker")
@@ -4956,6 +4967,19 @@ def api_spock():
     result = call_spock(trigger=trigger, portfolio=portfolio,
                         shares=shares, entry_price=entry_price)
     return jsonify(result)
+
+
+@app.route("/api/algo_alerts")
+def api_algo_alerts():
+    """Returns current algo detection state."""
+    return jsonify({
+        "last_alert":   _algo_state.get("last_alert"),
+        "alert_history": _algo_state.get("alert_history", [])[:10],
+        "signal_counts": {
+            "ofi_ratio":   _algo_state.get("prev_ofi_ratio", 0),
+            "aggression":  _algo_state.get("prev_aggression", 0),
+        }
+    })
 
 
 @app.route("/api/spock/status")
@@ -5014,7 +5038,7 @@ def health(): return jsonify({"status": "ok"}), 200
 
 def build_spock_prompt(portfolio=100000, shares=0, entry_price=0):
     """Assembles full market snapshot into Spock's prompt."""
-    s = state
+    s         = state
     dv        = s.get("darthvader", {})
     dv_state  = dv.get("tsla_state", {})
     risk      = dv.get("risk_mode", "UNKNOWN")
@@ -5025,7 +5049,39 @@ def build_spock_prompt(portfolio=100000, shares=0, entry_price=0):
     hmm       = s.get("hmm", {})
     news      = s.get("news_data", {})
     ext       = s.get("ext_data", {})
-    price     = s.get("price", 0) or 0
+    exit_data = s.get("exit_data", {})
+    entry_data= s.get("entry_data", {})
+    mm        = s.get("mm_data", {})
+    price     = float(s.get("price", 0) or 0)
+
+    # Position calculations
+    has_position   = shares > 0 and entry_price > 0
+    position_value = round(shares * price, 2)
+    cost_basis     = round(shares * entry_price, 2)
+    pnl_usd        = round((price - entry_price) * shares, 2)
+    pnl_pct        = round((price / entry_price - 1) * 100, 2) if entry_price else 0
+    position_pct   = round((position_value / portfolio) * 100, 1) if portfolio else 0
+    risk_per_share = round(price - entry_price, 2) if entry_price else 0
+
+    # Key price levels from exit engine
+    targets    = exit_data.get("targets", [])
+    stop_level = exit_data.get("stop_loss", None)
+    t1 = targets[0].get("price") if len(targets) > 0 else None
+    t2 = targets[1].get("price") if len(targets) > 1 else None
+    t3 = targets[2].get("price") if len(targets) > 2 else None
+
+    # Risk/reward if in position
+    if has_position and t1 and stop_level:
+        reward    = round(t1 - entry_price, 2)
+        risk_amt  = round(entry_price - stop_level, 2)
+        rr_ratio  = round(reward / risk_amt, 2) if risk_amt > 0 else 0
+    else:
+        rr_ratio  = 0
+        risk_amt  = 0
+
+    # Max Pain / GEX levels
+    max_pain  = mm.get("max_pain", "—")
+    gex_level = mm.get("gex_flip", "—")
 
     # State probabilities
     state_dist = dv_state.get("state_distribution", {})
@@ -5034,97 +5090,145 @@ def build_spock_prompt(portfolio=100000, shares=0, entry_price=0):
         sorted(state_dist.items(), key=lambda x: -x[1])
     ) if state_dist else "  No distribution data"
 
-    # Top news headlines
-    articles   = news.get("articles", [])[:3]
-    news_str   = "\n".join(
-        f"  [{a.get('sentiment','?').upper()}] {a.get('headline','')[:80]}"
+    # Top 3 news
+    articles  = news.get("articles", [])[:3]
+    news_str  = "\n".join(
+        f"  [{a.get('sentiment','?').upper()}] {a.get('headline','')[:90]}"
         for a in articles
     ) if articles else "  No recent news"
 
-    # Whale summary
-    whales     = uoa.get("whale_alerts", [])
-    whale_str  = whales[0].get("premium_fmt","") + " " + whales[0].get("type","") + " $" + str(whales[0].get("strike","")) if whales else "None detected"
-
-    # Position P&L
-    position_value = round(shares * price, 2) if shares else 0
-    pnl = round((price - entry_price) * shares, 2) if (shares and entry_price) else 0
-    pnl_pct = round((price / entry_price - 1) * 100, 2) if entry_price else 0
+    # Top whale
+    whales    = uoa.get("whale_alerts", [])
+    if whales:
+        w = whales[0]
+        whale_str = f"{w.get('premium_fmt','')} {w.get('type','')} ${w.get('strike','')} exp {w.get('expiry','')} ({w.get('severity','')})"
+    else:
+        whale_str = "None detected"
 
     # BB position
-    bb_upper = ind.get("bb_upper", 0)
-    bb_lower = ind.get("bb_lower", 0)
-    bb_pos   = "ABOVE UPPER" if price > bb_upper else "BELOW LOWER" if price < bb_lower else "INSIDE BANDS"
+    bb_upper  = ind.get("bb_upper", 0) or 0
+    bb_lower  = ind.get("bb_lower", 0) or 0
+    if price > bb_upper:     bb_pos = f"ABOVE UPPER BAND (${bb_upper}) — stretched"
+    elif price < bb_lower:   bb_pos = f"BELOW LOWER BAND (${bb_lower}) — oversold"
+    else:                    bb_pos = f"Inside bands (${bb_lower} - ${bb_upper})"
+
+    # Position context block
+    if has_position:
+        position_block = f"""
+TRADER'S ACTIVE POSITION — THIS IS THE CORE OF YOUR ANALYSIS:
+==============================================================
+Shares Held:      {shares} shares
+Entry Price:      ${entry_price}
+Current Price:    ${price}
+Cost Basis:       ${cost_basis:,}
+Current Value:    ${position_value:,}
+Unrealized P&L:   ${pnl_usd:+,} ({pnl_pct:+.2f}%)
+Portfolio Alloc:  {position_pct}% of ${portfolio:,}
+Risk Per Share:   ${risk_per_share:+.2f}
+
+EXIT TARGETS FROM SYSTEM:
+  T1 (first target):  ${t1 or "—"} → sell 40% of position
+  T2 (main target):   ${t2 or "—"} → sell 40% of position
+  T3 (extension):     ${t3 or "—"} → sell remaining 20%
+  Stop Loss:          ${stop_level or "—"}
+  Risk/Reward:        {rr_ratio}:1
+
+YOUR SPECIFIC QUESTIONS TO ANSWER:
+1. Is it safe to hold this position RIGHT NOW given current market state?
+2. At what exact price should I start selling? Which tranche first?
+3. How much should I sell at each level? (give % of position)
+4. What is the stop loss level where I should cut losses?
+5. What is the biggest risk to this position in the next 24-48 hours?"""
+    else:
+        position_block = f"""
+TRADER HAS NO CURRENT POSITION:
+Portfolio: ${portfolio:,}
+Watching for entry. Assess whether current conditions warrant opening a position.
+If yes: what price, how many shares, what stop loss."""
 
     prompt = f"""You are SPOCK — a ruthlessly logical AI trading co-pilot for an active TSLA trader.
-You have access to a sophisticated multi-layer quant system called DarthVader 2.0.
-Analyze the current market state and give a precise, actionable assessment.
-Be direct. No hedging. No disclaimers. The trader trusts the data.
+You have access to a sophisticated multi-layer quant system (DarthVader 2.0).
+Be precise. Be direct. Give exact prices and percentages. No vague answers.
+The trader is relying on you for actionable guidance.
 
 CURRENT MARKET SNAPSHOT:
 ========================
 Ticker: {s.get("ticker", "TSLA")} | Price: ${price} | Session: {ext.get("session", "UNKNOWN")}
-Time: {ext.get("current_et_time", "—")}
+Time: {ext.get("current_et_time", "—")} | Pre-mkt change: {ext.get("premarket_change_pct", "—")}%
 
-DARTHVADER STATE ENGINE:
-- Behavioral State: {dv_state.get("state", "UNKNOWN")} (confidence: {round((dv_state.get("confidence",0))*100)}%)
-- Risk Mode: {risk}
-- Market Intent: {dv.get("market_intent", "—")}
-- State Description: {dv_state.get("description", "—")}
+DARTHVADER BEHAVIORAL STATE ENGINE:
+- Current State:  {dv_state.get("state", "UNKNOWN")} ({round((dv_state.get("confidence",0))*100)}% confidence)
+- Risk Mode:      {risk}
+- Market Intent:  {dv.get("market_intent", "—")}
+- Description:    {dv_state.get("description", "—")}
+- Detection:      {" | ".join(dv_state.get("detection_signals", [])[:3])}
 
 STATE PROBABILITY DISTRIBUTION:
 {probs_str}
 
-PROBABILISTIC SIGNALS:
-- Breakout (30m): {round(probs.get("prob_breakout",0)*100)}%
-- Breakdown (30m): {round(probs.get("prob_breakdown",0)*100)}%
-- Mean Revert: {round(probs.get("prob_revert",0)*100)}%
-- Expected Move: {probs.get("expected_move_low","—")}% to {probs.get("expected_move_high","—")}%
-- Model Reliability: {round(probs.get("model_reliability",0)*100)}%
+PROBABILISTIC SIGNALS (30-minute horizon):
+- Breakout probability:  {round(probs.get("prob_breakout",0)*100)}%
+- Breakdown probability: {round(probs.get("prob_breakdown",0)*100)}%
+- Mean reversion:        {round(probs.get("prob_revert",0)*100)}%
+- Expected move range:   {probs.get("expected_move_low","—")}% to {probs.get("expected_move_high","—")}%
+- Model reliability:     {round(probs.get("model_reliability",0)*100)}%
 
 OPTIONS FLOW (UOA):
-- Net Flow: {uoa.get("net_flow","—")} | Signal: {uoa.get("uoa_signal","—")}
-- Whale Trades: {len(uoa.get("whale_alerts",[]))} | Unusual Strikes: {uoa.get("total_unusual",0)}
-- Call Premium: ${round(uoa.get("total_call_premium",0)/1e6,2)}M | Put Premium: ${round(uoa.get("total_put_premium",0)/1e6,2)}M
-- Top Whale: {whale_str}
+- Net Flow Direction: {uoa.get("net_flow","—")} | Signal: {uoa.get("uoa_signal","—")}
+- Whale Trades:       {len(uoa.get("whale_alerts",[]))} detected
+- Call Premium:       ${round(uoa.get("total_call_premium",0)/1e6,2)}M
+- Put Premium:        ${round(uoa.get("total_put_premium",0)/1e6,2)}M
+- Call/Put Ratio:     {uoa.get("call_put_premium_ratio","—")}%
+- Top Whale Alert:    {whale_str}
+- Unusual Strikes:    {uoa.get("total_unusual",0)}
 
-PRICE ACTION:
-- EMA50: ${ind.get("ema50","—")} | EMA200: ${ind.get("ema200","—")}
-- RSI: {ind.get("rsi","—")} | MACD Hist: {ind.get("macd_hist","—")}
-- Bollinger: {bb_pos} (upper: ${bb_upper} lower: ${bb_lower})
-- Ichimoku Cloud: {ichi.get("cloud_signal","—")}
+PRICE ACTION & TECHNICALS:
+- EMA50:    ${ind.get("ema50","—")} | EMA200: ${ind.get("ema200","—")}
+- RSI:      {ind.get("rsi","—")} | MACD Hist: {ind.get("macd_hist","—")}
+- Bollinger: {bb_pos}
+- Ichimoku: {ichi.get("cloud_signal","—")} — {" | ".join(ichi.get("cloud_details",[])[:2])}
 - HMM Regime: {hmm.get("regime","—")} ({hmm.get("confidence","—")}% confidence)
+- Volume Ratio: {ind.get("volume_ratio","—")}x avg
 
-RECENT NEWS:
+MARKET STRUCTURE:
+- Max Pain:   ${max_pain}
+- GEX Flip:   ${gex_level}
+
+RECENT NEWS SENTIMENT ({news.get("signal","--")} | score: {news.get("score","--")}):
 {news_str}
 
-TRADER'S POSITION:
-- Portfolio Size: ${portfolio:,}
-- Current Position: {shares} shares (value: ${position_value:,})
-- Entry Price: ${entry_price} | Unrealized P&L: ${pnl:,} ({pnl_pct}%)
+ALGO DETECTION ENGINE (real-time order flow signals):
+{get_spock_algo_context()}
 
-RESPOND IN THIS EXACT FORMAT — no extra text before or after:
+{position_block}
+
+RESPOND IN THIS EXACT FORMAT:
 ================================================================
-ACTION: [BUY / ADD / HOLD / REDUCE / EXIT / HEDGE / WAIT]
-SIZE: [specific recommendation e.g. "Buy 10 shares" or "Exit 50% of position" or "N/A"]
+ACTION: [HOLD / REDUCE / EXIT / ADD / WAIT — pick ONE]
 CONFIDENCE: [HIGH / MEDIUM / LOW]
 
-SITUATION:
-[2-3 sentences describing what the market is doing RIGHT NOW]
+POSITION SAFETY:
+[Is this position safe to hold? Yes/No and why in 2 sentences max]
 
-REASONING:
-• [most important signal driving your call]
-• [second signal]
-• [third signal if meaningful, otherwise omit]
+SELL PLAN:
+• T1 SELL: [exact price] — sell [X]% of position — reason: [why this level]
+• T2 SELL: [exact price] — sell [X]% of position — reason: [why this level]  
+• T3 SELL: [exact price] — sell [X]% of position — reason: [why this level]
 
-RISK:
-[1-2 sentences — what price/event would invalidate this view]
+STOP LOSS:
+[Exact price to cut losses. No negotiation.]
+
+BIGGEST RISK RIGHT NOW:
+[Single most dangerous thing that could hurt this position in next 48hrs]
+
+MARKET READ:
+[2 sentences — what is the market telling us RIGHT NOW]
 
 WATCH FOR:
-• [next key level or event]
-• [second thing to monitor]"""
+• [Most important trigger/level to monitor]
+• [Second key thing]"""
 
     return prompt
-
 
 def call_spock(trigger="manual", portfolio=100000, shares=0, entry_price=0):
     """Call Claude API server-side and cache the result."""
@@ -5207,7 +5311,222 @@ def call_spock(trigger="manual", portfolio=100000, shares=0, entry_price=0):
         _spock_cache["running"] = False
 
 
-def check_spock_triggers():
+
+# ═══════════════════════════════════════════════════════════════
+#  ALGO DETECTION ENGINE — 5-Signal Real-Time Scanner
+# ═══════════════════════════════════════════════════════════════
+
+# Rolling history for velocity detection (last 10 price snapshots)
+_price_history_rt = []   # [(timestamp, price, volume)]
+_algo_state = {
+    "last_alert":       None,   # last fired AlgoAlert dict
+    "last_alert_ts":    0,      # unix time of last alert
+    "alert_history":    [],     # last 20 alerts for display
+    "prev_ofi_ratio":   0,
+    "prev_aggression":  0,
+    "prev_volume":      0,
+    "consecutive_up":   0,
+    "consecutive_down": 0,
+    "baseline_volume":  0,
+}
+ALGO_COOLDOWN = 45   # min seconds between same-type alerts
+
+
+def detect_algo_activity():
+    """
+    Runs every analysis cycle. Checks 5 signals against current
+    order flow features. Returns AlgoAlert dict or None.
+    """
+    import time as _time
+
+    dv       = state.get("darthvader", {})
+    features = dv.get("features", {})
+    price    = float(state.get("price", 0) or 0)
+    if not features or not price:
+        return None
+
+    ofi_ratio   = float(features.get("ofi_ratio",   0) or 0)
+    aggression  = float(features.get("aggression",  0) or 0)
+    absorption  = float(features.get("absorption",  0) or 0)
+    vacuum      = float(features.get("vacuum",      0) or 0)
+    vol_ratio   = float(features.get("vol_ratio",   0) or 0)
+    trend_score = float(features.get("trend_score", 0) or 0)
+    momentum_5  = float(features.get("momentum_5",  0) or 0)
+    volume_now  = float(features.get("volume_now",  0) or 0)
+
+    now         = _time.time()
+    alerts      = []   # collect all firing signals this cycle
+
+    # ── SIGNAL 1: OFI SPIKE ──────────────────────────────────────
+    # ofi_ratio > 2.0  = buy programs dominating last 5 bars
+    # ofi_ratio < -2.0 = sell programs dominating last 5 bars
+    ofi_prev = _algo_state["prev_ofi_ratio"]
+    if ofi_ratio > 2.0:
+        intensity = "STRONG" if ofi_ratio > 4.0 else "MODERATE"
+        alerts.append({
+            "signal":    "OFI_BUY_SPIKE",
+            "direction": "BUY",
+            "intensity": intensity,
+            "value":     round(ofi_ratio, 2),
+            "label":     "OFI BUY SPIKE",
+            "detail":    f"Buy imbalance {round(ofi_ratio,1)}x baseline — algo accumulation detected",
+            "urgency":   "HIGH" if ofi_ratio > 4.0 else "MEDIUM",
+        })
+    elif ofi_ratio < -2.0:
+        intensity = "STRONG" if ofi_ratio < -4.0 else "MODERATE"
+        alerts.append({
+            "signal":    "OFI_SELL_SPIKE",
+            "direction": "SELL",
+            "intensity": intensity,
+            "value":     round(ofi_ratio, 2),
+            "label":     "OFI SELL SPIKE",
+            "detail":    f"Sell imbalance {round(abs(ofi_ratio),1)}x baseline — algo distribution detected",
+            "urgency":   "HIGH" if ofi_ratio < -4.0 else "MEDIUM",
+        })
+
+    # ── SIGNAL 2: AGGRESSION SURGE ───────────────────────────────
+    # Closes pinned near high (>0.25) = buying aggression
+    # Closes pinned near low (<-0.25) = selling aggression
+    if aggression > 0.25 and vol_ratio > 1.2:
+        alerts.append({
+            "signal":    "AGGRESSION_BUY",
+            "direction": "BUY",
+            "intensity": "STRONG" if aggression > 0.4 else "MODERATE",
+            "value":     round(aggression, 3),
+            "label":     "BUY AGGRESSION",
+            "detail":    f"Bars closing near highs (aggr={round(aggression,2)}) on {round(vol_ratio,1)}x volume — aggressive buyers",
+            "urgency":   "HIGH" if aggression > 0.4 else "MEDIUM",
+        })
+    elif aggression < -0.25 and vol_ratio > 1.2:
+        alerts.append({
+            "signal":    "AGGRESSION_SELL",
+            "direction": "SELL",
+            "intensity": "STRONG" if aggression < -0.4 else "MODERATE",
+            "value":     round(aggression, 3),
+            "label":     "SELL AGGRESSION",
+            "detail":    f"Bars closing near lows (aggr={round(aggression,2)}) on {round(vol_ratio,1)}x volume — aggressive sellers",
+            "urgency":   "HIGH" if aggression < -0.4 else "MEDIUM",
+        })
+
+    # ── SIGNAL 3: VOLUME VACUUM ───────────────────────────────────
+    # vacuum > 3.0 AND ofi near zero = bids/offers pulled, gap risk
+    prev_vol = _algo_state["prev_volume"]
+    vol_collapse = (prev_vol > 0 and volume_now < prev_vol * 0.35 and volume_now > 0)
+    if (vacuum > 3.0 or vol_collapse) and abs(ofi_ratio) < 1.0:
+        direction = "SELL" if momentum_5 < 0 else "BUY"
+        alerts.append({
+            "signal":    "VOLUME_VACUUM",
+            "direction": direction,
+            "intensity": "STRONG",
+            "value":     round(vacuum, 2),
+            "label":     "VOLUME VACUUM",
+            "detail":    f"Liquidity evaporating — bids/offers pulled. Vacuum={round(vacuum,1)}. Fast move imminent.",
+            "urgency":   "HIGH",
+        })
+
+    # ── SIGNAL 4: ABSORPTION WALL ────────────────────────────────
+    # High volume + tiny range = institution defending a level
+    if absorption > 2.0 and vol_ratio > 1.5:
+        # Determine if defending support (price near low of range) or resistance
+        direction = "BUY" if momentum_5 >= 0 else "SELL"
+        label = "BUY ABSORPTION" if direction == "BUY" else "SELL ABSORPTION"
+        alerts.append({
+            "signal":    "ABSORPTION_WALL",
+            "direction": direction,
+            "intensity": "STRONG" if absorption > 3.0 else "MODERATE",
+            "value":     round(absorption, 2),
+            "label":     label,
+            "detail":    f"Institution absorbing {'supply' if direction=='BUY' else 'demand'} at ${round(price,2)} — {round(vol_ratio,1)}x vol, tiny range",
+            "urgency":   "MEDIUM",
+        })
+
+    # ── SIGNAL 5: PRICE VELOCITY ─────────────────────────────────
+    # trend_score counts how many of last 10 bars closed in same direction
+    # +7 or better = momentum ignition (BUY), -7 or worse = momentum collapse
+    if trend_score >= 7:
+        alerts.append({
+            "signal":    "VELOCITY_UP",
+            "direction": "BUY",
+            "intensity": "STRONG" if trend_score >= 9 else "MODERATE",
+            "value":     round(trend_score, 0),
+            "label":     "PRICE VELOCITY UP",
+            "detail":    f"{int(trend_score)}/10 bars closing up — momentum ignition, algo buy program running",
+            "urgency":   "HIGH" if trend_score >= 9 else "MEDIUM",
+        })
+    elif trend_score <= -7:
+        alerts.append({
+            "signal":    "VELOCITY_DOWN",
+            "direction": "SELL",
+            "intensity": "STRONG" if trend_score <= -9 else "MODERATE",
+            "value":     round(trend_score, 0),
+            "label":     "PRICE VELOCITY DOWN",
+            "detail":    f"{abs(int(trend_score))}/10 bars closing down — momentum collapse, algo sell program running",
+            "urgency":   "HIGH" if trend_score <= -9 else "MEDIUM",
+        })
+
+    # Update rolling state
+    _algo_state["prev_ofi_ratio"]  = ofi_ratio
+    _algo_state["prev_aggression"] = aggression
+    _algo_state["prev_volume"]     = volume_now
+
+    if not alerts:
+        return None
+
+    # Pick highest urgency alert
+    priority = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
+    top = max(alerts, key=lambda a: (priority.get(a["urgency"], 0),
+                                     abs(float(a["value"]))))
+
+    # Cooldown — don't repeat same signal within 45s
+    last = _algo_state["last_alert"]
+    if last and last.get("signal") == top["signal"]:
+        if now - _algo_state["last_alert_ts"] < ALGO_COOLDOWN:
+            return None
+
+    # Build full alert
+    alert = {
+        **top,
+        "price":       round(price, 2),
+        "timestamp":   __import__("datetime").datetime.now().strftime("%H:%M:%S"),
+        "all_signals": [a["signal"] for a in alerts],
+        "signal_count": len(alerts),
+        "ofi_ratio":   round(ofi_ratio, 2),
+        "aggression":  round(aggression, 3),
+        "absorption":  round(absorption, 2),
+        "vacuum":      round(vacuum, 2),
+        "vol_ratio":   round(vol_ratio, 2),
+        "trend_score": round(trend_score, 0),
+    }
+
+    _algo_state["last_alert"]    = alert
+    _algo_state["last_alert_ts"] = now
+    _algo_state["alert_history"].insert(0, alert)
+    _algo_state["alert_history"] = _algo_state["alert_history"][:20]  # keep last 20
+
+    print(f"  [ALGO] {alert['label']} | {alert['direction']} | {alert['urgency']} | ${alert['price']}")
+    return alert
+
+
+def get_spock_algo_context():
+    """Returns algo state summary string for Spock prompt."""
+    last  = _algo_state.get("last_alert")
+    hist  = _algo_state.get("alert_history", [])
+    if not last:
+        return "No algo signals detected in recent bars."
+
+    recent_dirs = [a["direction"] for a in hist[:5]]
+    buy_count   = recent_dirs.count("BUY")
+    sell_count  = recent_dirs.count("SELL")
+    bias        = "BUY BIAS" if buy_count > sell_count else "SELL BIAS" if sell_count > buy_count else "MIXED"
+
+    return (
+        f"LATEST ALGO SIGNAL: {last['label']} ({last['direction']}) at ${last['price']} @ {last['timestamp']}\n"
+        f"  Detail: {last['detail']}\n"
+        f"  OFI={last['ofi_ratio']} | Aggression={last['aggression']} | Absorption={last['absorption']} | Vol={last['vol_ratio']}x\n"
+        f"  Last 5 signals: {', '.join(recent_dirs)} => {bias}"
+    )
+
+def check_spock_triggers(algo_alert=None):
     """Called every analysis cycle — fires Spock if something changed meaningfully."""
     import threading, time
 
@@ -5226,6 +5545,9 @@ def check_spock_triggers():
 
     elif cur_whales > _spock_cache["last_whale_count"] and cur_whales > 0:
         trigger = f"NEW WHALE TRADE DETECTED ({cur_whales} total)"
+
+    if not trigger and algo_alert and algo_alert.get("urgency") == "HIGH":
+        trigger = f"ALGO: {algo_alert.get('label','?')} @ ${algo_alert.get('price','?')}"
 
     if trigger:
         print(f"  🖖 Spock auto-trigger: {trigger}")
@@ -6755,6 +7077,7 @@ function updateUI(s) {
   renderPeakPanel(s.peak_data || {});
   renderCTAPanel(s.sizing || {}, s.price || 0);
   renderExtPanel(s.ext_data || {});
+  updateAlgoRadar(s);
   renderNewsPanel(s.news_data || {});
   renderSPYPanel(s.spy_data || {});
   renderMMPanel(s.mm_data || {}, s.dark_pool || {}, s.price || 0);
@@ -8626,7 +8949,378 @@ var _aiRunning = false;
 
 setInterval(function(){ loadNHL(true); }, 20000);
 // Initial load after 5s (let main data load first)
-setTimeout(function(){ loadNHL(false); }, 5000);</script>
+setTimeout(function(){ loadNHL(false); }, 5000);
+// -------------------------------------------------------
+// SPOCK 2.0 -- Frontend JS
+
+// ALGO RADAR -- Frontend JS
+// =========================================================
+
+function updateAlgoRadar(s) {
+  var ft  = (s.darthvader && s.darthvader.features) ? s.darthvader.features : {};
+  var ofi = parseFloat(ft.ofi_ratio  || 0);
+  var agg = parseFloat(ft.aggression || 0);
+  var abs = parseFloat(ft.absorption || 0);
+  var vac = parseFloat(ft.vacuum     || 0);
+  var vel = parseFloat(ft.trend_score|| 0);
+
+  var G = '#00ff88', R = '#ff3355', A = '#ffb300', P = '#b388ff', C = '#00e5ff';
+
+  // OFI
+  var ofiColor = ofi > 2 ? G : ofi < -2 ? R : ofi > 0.5 ? '#80ff88' : ofi < -0.5 ? '#ff8090' : '#555';
+  var ofiFill  = Math.min(100, Math.max(0, 50 + ofi * 8));
+  setAlgoGauge('algoOfi', ofi.toFixed(2)+'x', ofiFill, ofiColor,
+    ofi > 2 ? 'BUY PROGRAM' : ofi < -2 ? 'SELL PROGRAM' : ofi > 0.5 ? 'BUY LEAN' : ofi < -0.5 ? 'SELL LEAN' : 'NEUTRAL');
+
+  // Aggression
+  var aggColor = agg > 0.25 ? G : agg < -0.25 ? R : '#555';
+  var aggFill  = Math.min(100, Math.max(0, 50 + agg * 150));
+  setAlgoGauge('algoAggr', agg.toFixed(3), aggFill, aggColor,
+    agg > 0.4 ? 'STRONG BUYERS' : agg > 0.25 ? 'BUYING AGGR' : agg < -0.4 ? 'STRONG SELLERS' : agg < -0.25 ? 'SELLING AGGR' : 'PASSIVE');
+
+  // Absorption
+  var absColor = abs > 2 ? A : abs > 1.5 ? '#ffcc44' : '#555';
+  var absFill  = Math.min(100, abs * 20);
+  setAlgoGauge('algoAbsor', abs.toFixed(2), absFill, absColor,
+    abs > 3 ? 'HEAVY ABSORB' : abs > 2 ? 'ABSORBING' : abs > 1.5 ? 'MILD ABSORB' : 'PASSIVE');
+
+  // Vacuum
+  var vacColor = vac > 3 ? P : vac > 1.5 ? '#cc88ff' : '#555';
+  var vacFill  = Math.min(100, vac * 15);
+  setAlgoGauge('algoVac', vac.toFixed(2), vacFill, vacColor,
+    vac > 3 ? 'DANGER VACUUM' : vac > 1.5 ? 'THINNING' : 'NORMAL');
+
+  // Velocity
+  var velColor = vel >= 7 ? G : vel <= -7 ? R : vel > 3 ? '#80ff88' : vel < -3 ? '#ff8090' : '#555';
+  var velFill  = Math.min(100, Math.max(0, 50 + vel * 5));
+  setAlgoGauge('algoVel', Math.round(vel)+'/10', velFill, velColor,
+    vel >= 9 ? 'IGNITION' : vel >= 7 ? 'MOMENTUM UP' : vel <= -9 ? 'COLLAPSE' : vel <= -7 ? 'MOMENTUM DOWN' : vel > 3 ? 'LEAN UP' : vel < -3 ? 'LEAN DOWN' : 'NEUTRAL');
+
+  // Live indicator
+  var ind = document.getElementById('algoLiveIndicator');
+  var anyFiring = Math.abs(ofi) > 2 || Math.abs(agg) > 0.25 || abs > 2 || vac > 3 || Math.abs(vel) >= 7;
+  if(ind) { ind.style.background = anyFiring ? G : '#555'; ind.style.boxShadow = anyFiring ? '0 0 6px '+G : 'none'; }
+
+  var stEl = document.getElementById('algoStatusText');
+  if(stEl) stEl.textContent = anyFiring ? 'SIGNAL FIRING' : 'Scanning...';
+  if(stEl) stEl.style.color  = anyFiring ? G : 'var(--text-dim)';
+
+  // Alert from backend
+  var alert = s.algo_alert;
+  renderAlgoAlert(alert);
+
+  // History
+  if(s.algo_history && s.algo_history.length) renderAlgoHistory(s.algo_history);
+}
+
+function setAlgoGauge(prefix, val, fillPct, color, label) {
+  var valEl   = document.getElementById(prefix+'Val');
+  var fillEl  = document.getElementById(prefix+'BarFill');
+  var labelEl = document.getElementById(prefix+'Label');
+  if(valEl)   { valEl.textContent = val;   valEl.style.color   = color; }
+  if(fillEl)  { fillEl.style.width = fillPct+'%'; fillEl.style.background = color; }
+  if(labelEl) { labelEl.textContent = label; labelEl.style.color = color; }
+}
+
+function renderAlgoAlert(alert) {
+  var banner = document.getElementById('algoAlertBanner');
+  if(!banner) return;
+  if(!alert) { banner.style.display='none'; return; }
+
+  var G = '#00ff88', R = '#ff3355';
+  var isBuy  = alert.direction === 'BUY';
+  var color  = isBy ? G : R;
+  var bg     = isBy ? 'rgba(0,255,136,0.07)' : 'rgba(255,51,85,0.07)';
+  var border = isBy ? 'rgba(0,255,136,0.3)'  : 'rgba(255,51,85,0.3)';
+
+  // Reassign (fix typo above)
+  var isBuy2 = alert.direction === 'BUY';
+  color  = isBuy2 ? G : R;
+  bg     = isBuy2 ? 'rgba(0,255,136,0.07)' : 'rgba(255,51,85,0.07)';
+  border = isBuy2 ? 'rgba(0,255,136,0.3)'  : 'rgba(255,51,85,0.3)';
+
+  banner.style.display     = 'block';
+  banner.style.background  = bg;
+  banner.style.borderTop   = '1px solid ' + border;
+  banner.style.borderBottom= '1px solid ' + border;
+
+  var icon  = document.getElementById('algoAlertIcon');
+  var lbl   = document.getElementById('algoAlertLabel');
+  var det   = document.getElementById('algoAlertDetail');
+  var price = document.getElementById('algoAlertPrice');
+  var time  = document.getElementById('algoAlertTime');
+
+  if(icon)  icon.textContent  = isBuy2 ? '\u25b2' : '\u25bc';
+  if(icon)  icon.style.color  = color;
+  if(lbl)   { lbl.textContent = alert.label || '--'; lbl.style.color = color; }
+  if(det)   det.textContent   = alert.detail || '--';
+  if(price) { price.textContent = '$'+(alert.price||'--'); price.style.color = color; }
+  if(time)  time.textContent  = alert.timestamp || '--';
+}
+
+function renderAlgoHistory(history) {
+  var el = document.getElementById('algoHistory');
+  if(!el) return;
+  if(!history.length) return;
+
+  var G = '#00ff88', R = '#ff3355';
+  el.innerHTML = history.slice(0,8).map(function(a) {
+    var isBuy = a.direction === 'BUY';
+    var c = isBuy ? G : R;
+    var arrow = isBuy ? '\u25b2' : '\u25bc';
+    return '<div style="display:flex;gap:10px;align-items:center;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.04);">'
+      + '<span style="color:'+c+';font-size:10px;">'+arrow+'</span>'
+      + '<span style="font-family:var(--font-mono);font-size:9px;color:'+c+';min-width:140px;">'+( a.label||'')+'</span>'
+      + '<span style="font-size:9px;color:var(--text-dim);flex:1;">'+( a.detail||'').slice(0,70)+'</span>'
+      + '<span style="font-family:var(--font-mono);font-size:9px;color:#fff;">$'+(a.price||'--')+'</span>'
+      + '<span style="font-size:8px;color:var(--text-dim);min-width:55px;text-align:right;">'+(a.timestamp||'')+'</span>'
+      + '</div>';
+  }).join('');
+}
+
+function askSpockAlgo() {
+  // Pre-fill trigger context and call Spock
+  var statusEl = document.getElementById('spockStatus');
+  if(statusEl) statusEl.textContent = 'Analyzing algo signal...';
+  askSpock();
+  // Scroll to Spock panel
+  var panel = document.getElementById('spock-panel');
+  if(panel) panel.scrollIntoView({behavior:'smooth', block:'start'});
+}
+
+// SPOCK 2.0 - Position Intelligence JS
+// =========================================================
+
+// Live P&L preview as user types
+function updateSpockPreview() {
+  var shares = parseFloat(document.getElementById('spockShares') ? document.getElementById('spockShares').value : 0) || 0;
+  var entry  = parseFloat(document.getElementById('spockEntry')  ? document.getElementById('spockEntry').value  : 0) || 0;
+  var price  = parseFloat(document.querySelector('[id="lastPrice"]') ? document.querySelector('[id="lastPrice"]').textContent.replace('$','') : 0) || 0;
+  var pnlEl  = document.getElementById('spockPnlPreview');
+  var pctEl  = document.getElementById('spockPnlPct');
+  if(!pnlEl) return;
+  if(shares > 0 && entry > 0 && price > 0) {
+    var pnl    = (price - entry) * shares;
+    var pct    = ((price / entry) - 1) * 100;
+    var color  = pnl >= 0 ? '#00ff88' : '#ff3355';
+    pnlEl.textContent  = (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2);
+    pnlEl.style.color  = color;
+    pctEl.textContent  = (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%  |  ' + shares + ' shares @ $' + entry;
+    pctEl.style.color  = color;
+  } else {
+    pnlEl.textContent = 'Enter position';
+    pnlEl.style.color = 'var(--text-dim)';
+    pctEl.textContent = '--';
+  }
+}
+
+// Wire up live preview
+(function() {
+  function wireInputs() {
+    var ids = ['spockShares','spockEntry','spockPortfolio'];
+    ids.forEach(function(id) {
+      var el = document.getElementById(id);
+      if(el) el.addEventListener('input', updateSpockPreview);
+    });
+  }
+  wireInputs();
+  setTimeout(wireInputs, 2000);
+})();
+
+function askSpock() {
+  var portfolio = parseFloat(document.getElementById('spockPortfolio') ? document.getElementById('spockPortfolio').value : 100000) || 100000;
+  var shares    = parseFloat(document.getElementById('spockShares')    ? document.getElementById('spockShares').value    : 0)      || 0;
+  var entry     = parseFloat(document.getElementById('spockEntry')     ? document.getElementById('spockEntry').value     : 0)      || 0;
+  var btn       = document.getElementById('spockBtn');
+  var status    = document.getElementById('spockStatus');
+
+  if(shares <= 0 || entry <= 0) {
+    if(status) { status.textContent = 'Enter shares and entry price first'; status.style.color = '#ff3355'; }
+    setTimeout(function(){ if(status){ status.textContent='Ready'; status.style.color='var(--text-dim)'; } }, 3000);
+    return;
+  }
+
+  document.getElementById('spockLoading').style.display = 'block';
+  document.getElementById('spockEmpty').style.display   = 'none';
+  document.getElementById('spockOutput').style.display  = 'none';
+  if(btn)    { btn.disabled = true; btn.style.opacity = '0.6'; btn.textContent = 'ANALYZING...'; }
+  if(status) { status.textContent = 'Calling Claude API...'; status.style.color = '#00e5ff'; }
+
+  fetch('/api/spock', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ trigger:'manual', portfolio:portfolio, shares:shares, entry_price:entry })
+  })
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    if(d.error) {
+      if(status) { status.textContent = 'Error: ' + d.error; status.style.color='#ff3355'; }
+      document.getElementById('spockLoading').style.display = 'none';
+      document.getElementById('spockEmpty').style.display   = 'block';
+    } else {
+      renderSpockAnalysis(d);
+      if(status) { status.textContent = 'Updated ' + (d.timestamp||''); status.style.color='#00ff88'; }
+    }
+  })
+  .catch(function(e){
+    if(status) { status.textContent = 'Network error: ' + e.message; status.style.color='#ff3355'; }
+    document.getElementById('spockLoading').style.display = 'none';
+    document.getElementById('spockEmpty').style.display   = 'block';
+  })
+  .finally(function(){
+    if(btn){ btn.disabled=false; btn.style.opacity='1'; btn.textContent='ANALYZE POSITION'; }
+  });
+}
+
+function parseSpockSections(txt) {
+  var sections = {};
+  var lines    = txt.split('\n');
+  var current  = null;
+  var buffer   = [];
+
+  // Patterns that mark section headers
+  var headers  = ['ACTION','CONFIDENCE','POSITION SAFETY','SELL PLAN','STOP LOSS','BIGGEST RISK','MARKET READ','WATCH FOR'];
+
+  for(var i = 0; i < lines.length; i++) {
+    var line = lines[i].trim();
+    var matched = false;
+    for(var h = 0; h < headers.length; h++) {
+      if(line.toUpperCase().startsWith(headers[h] + ':')) {
+        if(current) sections[current] = buffer.join('\n').trim();
+        current = headers[h];
+        buffer  = [line.split(':').slice(1).join(':').trim()];
+        matched = true;
+        break;
+      }
+    }
+    if(!matched && current) buffer.push(line);
+  }
+  if(current) sections[current] = buffer.join('\n').trim();
+  return sections;
+}
+
+function parseSellPlan(sellPlanText) {
+  var targets = [{},{},{}];
+  var lines   = sellPlanText.split('\n');
+  for(var i = 0; i < lines.length; i++) {
+    var line = lines[i].trim();
+    var tIdx = -1;
+    if(/T1|FIRST/i.test(line)) tIdx = 0;
+    else if(/T2|MAIN/i.test(line)) tIdx = 1;
+    else if(/T3|FINAL/i.test(line)) tIdx = 2;
+    if(tIdx >= 0) {
+      // Extract price: look for $XXX.XX
+      var priceMatch = line.match(/$(\d+\.?\d*)/);
+      if(priceMatch) targets[tIdx].price = '$' + priceMatch[1];
+      // Extract size: look for XX%
+      var sizeMatch  = line.match(/(\d+)%\s+of\s+position/i) || line.match(/sell\s+(\d+)%/i);
+      if(sizeMatch)  targets[tIdx].size  = 'Sell ' + sizeMatch[1] + '% of position';
+      // Extract reason after "reason:"
+      var reasonMatch = line.match(/reason:\s*(.+)/i);
+      if(reasonMatch) targets[tIdx].why = reasonMatch[1];
+    }
+  }
+  return targets;
+}
+
+function renderSpockAnalysis(d) {
+  var actionColors = {
+    'BUY':'#00ff88', 'ADD':'#00ff88',
+    'HOLD':'#00e5ff', 'WAIT':'#ffb300',
+    'REDUCE':'#ff6d00', 'EXIT':'#ff3355', 'HEDGE':'#b388ff'
+  };
+  var confColors = { 'HIGH':'#00ff88', 'MEDIUM':'#ffb300', 'LOW':'#ff3355' };
+
+  var txt      = d.full_text || '';
+  var sections = parseSpockSections(txt);
+
+  // Action + confidence
+  var action   = (d.action || sections['ACTION'] || '').replace(/^[\[\]]/g,'').trim().toUpperCase();
+  var aEl = document.getElementById('spockAction');
+  if(aEl) { aEl.textContent = action; aEl.style.color = actionColors[action] || '#00e5ff'; }
+
+  var conf = ((d.confidence || sections['CONFIDENCE'] || '').replace(/^[\[\]]/g,'')).trim().toUpperCase();
+  var cEl  = document.getElementById('spockConf');
+  if(cEl) { cEl.textContent = conf; cEl.style.color = confColors[conf] || '#00e5ff'; }
+
+  // Position safety
+  var safety    = sections['POSITION SAFETY'] || '';
+  var safeEl    = document.getElementById('spockSafe');
+  var isSafe    = /yes|safe|hold/i.test(safety.split('\n')[0]);
+  if(safeEl) {
+    safeEl.textContent = isSafe ? 'YES' : 'NO';
+    safeEl.style.color = isSafe ? '#00ff88' : '#ff3355';
+  }
+
+  // Meta
+  setText('spockTrigger', 'Triggered: ' + (d.trigger||'manual'));
+  setText('spockTime',    'At ' + (d.timestamp||'') + '  |  Price: $' + (d.price||''));
+
+  // Sell plan
+  var sellText = sections['SELL PLAN'] || '';
+  var targets  = parseSellPlan(sellText);
+  var tIds     = [['spockT1Price','spockT1Size','spockT1Why'],
+                  ['spockT2Price','spockT2Size','spockT2Why'],
+                  ['spockT3Price','spockT3Size','spockT3Why']];
+  tIds.forEach(function(ids, i) {
+    var t = targets[i] || {};
+    setText(ids[0], t.price || '--');
+    setText(ids[1], t.size  || '--');
+    setText(ids[2], t.why   || '--');
+  });
+
+  // Stop loss
+  var stopText = sections['STOP LOSS'] || '';
+  var stopPrice = (stopText.match(/$(\d+\.?\d*)/) || [])[1];
+  setText('spockStop', stopPrice ? '$' + stopPrice : '--');
+  var stopNote  = stopText.replace(/$\d+\.?\d*/, '').trim();
+  setText('spockStopNote', stopNote || 'Cut here. No negotiation.');
+
+  // Risk, market read, watch for
+  function fmtBullets(t) {
+    return (t || '--').replace(/\n[*\u2022-] /gm, '\n&#9658; ').replace(/^[*\u2022-] /, '&#9658; ');
+  }
+  setHTML('spockRisk',   fmtBullets(sections['BIGGEST RISK'] || '--'));
+  setHTML('spockMarket', fmtBullets(sections['MARKET READ']  || '--'));
+  setHTML('spockWatch',  fmtBullets(sections['WATCH FOR']    || '--'));
+
+  // Show output
+  document.getElementById('spockLoading').style.display = 'none';
+  document.getElementById('spockEmpty').style.display   = 'none';
+  document.getElementById('spockOutput').style.display  = 'block';
+}
+
+function setText(id, val) {
+  var el = document.getElementById(id);
+  if(el) el.textContent = val || '--';
+}
+function setHTML(id, val) {
+  var el = document.getElementById(id);
+  if(el) el.innerHTML = val || '--';
+}
+
+// Poll for auto-triggered analyses every 15s
+function pollSpockStatus() {
+  fetch('/api/spock/status')
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    if(!d.has_analysis || !d.analysis) return;
+    var badge  = document.getElementById('spockTriggerBadge');
+    var tmEl   = document.getElementById('spockTime');
+    var lastTs = tmEl ? tmEl.textContent : '';
+    var newTs  = d.analysis.timestamp || '';
+    if(newTs && !lastTs.includes(newTs)) {
+      if(badge){ badge.textContent='NEW: '+(d.last_trigger||'AUTO'); badge.style.display='inline-block'; }
+      renderSpockAnalysis(d.analysis);
+      setTimeout(function(){ if(badge) badge.style.display='none'; }, 10000);
+    }
+  })
+  .catch(function(){});
+}
+
+setInterval(pollSpockStatus, 15000);
+setTimeout(pollSpockStatus, 5000);
+</script>
 </head>
 <body>
 
@@ -9162,95 +9856,247 @@ setTimeout(function(){ loadNHL(false); }, 5000);</script>
   </div>
 
   
-  <!-- SPOCK 2.0 — AI TRADING CO-PILOT -->
-  <div class="panel" id="spock-panel" style="grid-column:1/-1;border:2px solid rgba(0,229,255,0.35);background:rgba(0,10,20,0.95);position:relative;">
-    <div class="panel-title" onclick="togglePanel('spock-panel')" style="cursor:pointer;display:flex;align-items:center;gap:12px;">
-      <span style="color:#00e5ff;font-size:13px;">🖖</span>
-      <span>SPOCK 2.0 — AI TRADING CO-PILOT</span>
-      <span style="font-size:9px;color:var(--text-dim);letter-spacing:2px;">CLAUDE-POWERED · REAL-TIME ANALYSIS</span>
-      <span id="spockTriggerBadge" style="display:none;font-size:9px;background:rgba(0,229,255,0.2);color:#00e5ff;padding:2px 8px;border-radius:2px;border:1px solid #00e5ff;margin-left:8px;"></span>
-      <span class="panel-collapse-btn" id="btn-spock-panel" style="margin-left:auto;">▾</span>
+  <!-- ALGO RADAR — Real-Time Order Flow Detection -->
+  <div class="panel" id="algo-panel" style="grid-column:1/-1;border:1px solid rgba(255,179,0,0.3);background:rgba(15,10,0,0.97);padding:0;">
+
+    <!-- Header with live status -->
+    <div style="display:flex;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid rgba(255,179,0,0.15);cursor:pointer;" onclick="togglePanel('algo-panel')">
+      <span style="font-size:11px;">&#9889;</span>
+      <span style="font-family:var(--font-mono);font-size:10px;letter-spacing:3px;color:var(--gold);">ALGO RADAR &mdash; ORDER FLOW DETECTION</span>
+      <span style="font-size:9px;color:var(--text-dim);letter-spacing:2px;">10s REFRESH &middot; 5 SIGNALS</span>
+      <div id="algoLiveIndicator" style="width:6px;height:6px;border-radius:50%;background:#333;margin-left:4px;"></div>
+      <span id="algoStatusText" style="font-size:9px;color:var(--text-dim);">Scanning...</span>
+      <span class="panel-collapse-btn" id="btn-algo-panel" style="margin-left:auto;">&#9662;</span>
     </div>
 
-    <!-- Position Input Row -->
-    <div style="display:flex;gap:12px;align-items:center;margin-bottom:16px;padding:12px;background:rgba(0,229,255,0.05);border:1px solid rgba(0,229,255,0.15);border-radius:2px;">
-      <span style="font-size:9px;letter-spacing:2px;color:#00e5ff;white-space:nowrap;">YOUR POSITION</span>
-      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-        <input id="spockPortfolio" type="number" value="100000" placeholder="Portfolio $"
-          style="background:var(--bg3);border:1px solid rgba(0,229,255,0.3);color:var(--text-primary);font-family:var(--font-mono);font-size:11px;padding:6px 10px;width:130px;border-radius:1px;">
-        <input id="spockShares" type="number" value="0" placeholder="Shares held"
-          style="background:var(--bg3);border:1px solid rgba(0,229,255,0.3);color:var(--text-primary);font-family:var(--font-mono);font-size:11px;padding:6px 10px;width:120px;border-radius:1px;">
-        <input id="spockEntry" type="number" value="0" placeholder="Entry price $"
-          style="background:var(--bg3);border:1px solid rgba(0,229,255,0.3);color:var(--text-primary);font-family:var(--font-mono);font-size:11px;padding:6px 10px;width:130px;border-radius:1px;">
-        <button onclick="askSpock()" id="spockBtn"
-          style="background:rgba(0,229,255,0.15);border:1px solid #00e5ff;color:#00e5ff;font-family:var(--font-mono);font-size:11px;padding:7px 20px;cursor:pointer;letter-spacing:2px;border-radius:1px;white-space:nowrap;">
-          🖖 ASK SPOCK
+    <!-- 5 signal gauges -->
+    <div style="display:grid;grid-template-columns:repeat(5,1fr);border-bottom:1px solid rgba(255,179,0,0.1);">
+
+      <div id="algoSig1" style="padding:12px 14px;border-right:1px solid rgba(255,255,255,0.05);">
+        <div style="font-size:8px;letter-spacing:2px;color:var(--text-dim);margin-bottom:6px;">OFI IMBALANCE</div>
+        <div id="algoOfiVal" style="font-family:var(--font-mono);font-size:16px;font-weight:700;color:var(--text-dim);">0.00x</div>
+        <div id="algoOfiBar" style="height:3px;background:rgba(255,255,255,0.08);margin-top:6px;border-radius:1px;overflow:hidden;">
+          <div id="algoOfiBarFill" style="height:100%;width:50%;background:#333;transition:all 0.5s;"></div>
+        </div>
+        <div id="algoOfiLabel" style="font-size:8px;color:var(--text-dim);margin-top:4px;">NEUTRAL</div>
+      </div>
+
+      <div id="algoSig2" style="padding:12px 14px;border-right:1px solid rgba(255,255,255,0.05);">
+        <div style="font-size:8px;letter-spacing:2px;color:var(--text-dim);margin-bottom:6px;">AGGRESSION</div>
+        <div id="algoAggrVal" style="font-family:var(--font-mono);font-size:16px;font-weight:700;color:var(--text-dim);">0.000</div>
+        <div id="algoAggrBar" style="height:3px;background:rgba(255,255,255,0.08);margin-top:6px;border-radius:1px;overflow:hidden;">
+          <div id="algoAggrBarFill" style="height:100%;width:50%;background:#333;transition:all 0.5s;"></div>
+        </div>
+        <div id="algoAggrLabel" style="font-size:8px;color:var(--text-dim);margin-top:4px;">NEUTRAL</div>
+      </div>
+
+      <div id="algoSig3" style="padding:12px 14px;border-right:1px solid rgba(255,255,255,0.05);">
+        <div style="font-size:8px;letter-spacing:2px;color:var(--text-dim);margin-bottom:6px;">ABSORPTION</div>
+        <div id="algoAbsorVal" style="font-family:var(--font-mono);font-size:16px;font-weight:700;color:var(--text-dim);">0.00</div>
+        <div id="algoAbsorBar" style="height:3px;background:rgba(255,255,255,0.08);margin-top:6px;border-radius:1px;overflow:hidden;">
+          <div id="algoAbsorBarFill" style="height:100%;width:0%;background:#ffb300;transition:all 0.5s;"></div>
+        </div>
+        <div id="algoAbsorLabel" style="font-size:8px;color:var(--text-dim);margin-top:4px;">PASSIVE</div>
+      </div>
+
+      <div id="algoSig4" style="padding:12px 14px;border-right:1px solid rgba(255,255,255,0.05);">
+        <div style="font-size:8px;letter-spacing:2px;color:var(--text-dim);margin-bottom:6px;">VOL VACUUM</div>
+        <div id="algoVacVal" style="font-family:var(--font-mono);font-size:16px;font-weight:700;color:var(--text-dim);">0.00</div>
+        <div id="algoVacBar" style="height:3px;background:rgba(255,255,255,0.08);margin-top:6px;border-radius:1px;overflow:hidden;">
+          <div id="algoVacBarFill" style="height:100%;width:0%;background:#b388ff;transition:all 0.5s;"></div>
+        </div>
+        <div id="algoVacLabel" style="font-size:8px;color:var(--text-dim);margin-top:4px;">NORMAL</div>
+      </div>
+
+      <div id="algoSig5" style="padding:12px 14px;">
+        <div style="font-size:8px;letter-spacing:2px;color:var(--text-dim);margin-bottom:6px;">PRICE VELOCITY</div>
+        <div id="algoVelVal" style="font-family:var(--font-mono);font-size:16px;font-weight:700;color:var(--text-dim);">0/10</div>
+        <div id="algoVelBar" style="height:3px;background:rgba(255,255,255,0.08);margin-top:6px;border-radius:1px;overflow:hidden;">
+          <div id="algoVelBarFill" style="height:100%;width:50%;background:#333;transition:all 0.5s;"></div>
+        </div>
+        <div id="algoVelLabel" style="font-size:8px;color:var(--text-dim);margin-top:4px;">NEUTRAL</div>
+      </div>
+
+    </div>
+
+    <!-- Active alert banner -->
+    <div id="algoAlertBanner" style="display:none;padding:14px 16px;animation:pulseGreen 1s 3;">
+      <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
+        <div id="algoAlertIcon" style="font-size:18px;">&#9889;</div>
+        <div>
+          <div id="algoAlertLabel" style="font-family:var(--font-mono);font-size:13px;font-weight:700;letter-spacing:2px;">--</div>
+          <div id="algoAlertDetail" style="font-size:10px;color:var(--text-dim);margin-top:3px;">--</div>
+        </div>
+        <div style="margin-left:auto;text-align:right;">
+          <div id="algoAlertPrice" style="font-family:var(--font-mono);font-size:14px;font-weight:700;">--</div>
+          <div id="algoAlertTime" style="font-size:9px;color:var(--text-dim);">--</div>
+        </div>
+        <button onclick="askSpockAlgo()" style="background:rgba(255,179,0,0.15);border:1px solid var(--gold);color:var(--gold);font-family:var(--font-mono);font-size:10px;padding:6px 14px;cursor:pointer;letter-spacing:2px;white-space:nowrap;border-radius:1px;">
+          ASK SPOCK &#8594;
         </button>
-        <span id="spockStatus" style="font-size:10px;color:var(--text-dim);">Ready</span>
       </div>
     </div>
 
-    <!-- Analysis Output -->
-    <div id="spockOutput" style="display:none;">
-
-      <!-- Action Bar -->
-      <div style="display:grid;grid-template-columns:1fr 1fr 1fr 2fr;gap:10px;margin-bottom:16px;">
-        <div style="background:var(--bg2);border:1px solid rgba(0,229,255,0.2);padding:14px;text-align:center;">
-          <div style="font-size:9px;letter-spacing:2px;color:#00e5ff;margin-bottom:6px;">ACTION</div>
-          <div id="spockAction" style="font-family:var(--font-mono);font-size:22px;font-weight:700;color:#00e5ff;">—</div>
-        </div>
-        <div style="background:var(--bg2);border:1px solid rgba(0,229,255,0.2);padding:14px;text-align:center;">
-          <div style="font-size:9px;letter-spacing:2px;color:#00e5ff;margin-bottom:6px;">CONFIDENCE</div>
-          <div id="spockConf" style="font-family:var(--font-mono);font-size:18px;font-weight:700;">—</div>
-        </div>
-        <div style="background:var(--bg2);border:1px solid rgba(0,229,255,0.2);padding:14px;text-align:center;">
-          <div style="font-size:9px;letter-spacing:2px;color:#00e5ff;margin-bottom:6px;">SIZE</div>
-          <div id="spockSize" style="font-family:var(--font-mono);font-size:13px;font-weight:700;color:var(--gold);">—</div>
-        </div>
-        <div style="background:var(--bg2);border:1px solid rgba(0,229,255,0.2);padding:14px;">
-          <div style="font-size:9px;letter-spacing:2px;color:#00e5ff;margin-bottom:6px;">TRIGGERED BY</div>
-          <div id="spockTrigger" style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim);">—</div>
-          <div id="spockTime" style="font-size:9px;color:var(--text-dim);margin-top:4px;">—</div>
-        </div>
+    <!-- Alert history -->
+    <div style="padding:10px 16px;">
+      <div style="font-size:8px;letter-spacing:2px;color:var(--text-dim);margin-bottom:8px;">RECENT ALGO SIGNALS</div>
+      <div id="algoHistory" style="display:flex;flex-direction:column;gap:4px;max-height:120px;overflow-y:auto;">
+        <div style="font-size:10px;color:var(--text-dim);">No signals detected yet</div>
       </div>
-
-      <!-- Full analysis text -->
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
-
-        <div>
-          <div style="font-size:9px;letter-spacing:2px;color:#00e5ff;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid rgba(0,229,255,0.2);">SITUATION</div>
-          <div id="spockSituation" style="font-size:12px;line-height:1.7;color:var(--text-primary);">—</div>
-
-          <div style="font-size:9px;letter-spacing:2px;color:#00e5ff;margin:14px 0 8px;padding-bottom:4px;border-bottom:1px solid rgba(0,229,255,0.2);">REASONING</div>
-          <div id="spockReasoning" style="font-size:12px;line-height:1.8;color:var(--text-primary);">—</div>
-        </div>
-
-        <div>
-          <div style="font-size:9px;letter-spacing:2px;color:#ff3355;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid rgba(255,51,85,0.3);">RISK / INVALIDATION</div>
-          <div id="spockRisk" style="font-size:12px;line-height:1.7;color:var(--text-primary);">—</div>
-
-          <div style="font-size:9px;letter-spacing:2px;color:var(--gold);margin:14px 0 8px;padding-bottom:4px;border-bottom:1px solid rgba(255,179,0,0.3);">WATCH FOR</div>
-          <div id="spockWatch" style="font-size:12px;line-height:1.8;color:var(--text-primary);">—</div>
-        </div>
-      </div>
-
-    </div>
-
-    <!-- Loading state -->
-    <div id="spockLoading" style="display:none;text-align:center;padding:30px;">
-      <div style="font-family:var(--font-mono);font-size:13px;color:#00e5ff;letter-spacing:3px;">🖖 SPOCK IS ANALYZING...</div>
-      <div style="font-size:10px;color:var(--text-dim);margin-top:8px;">Processing all market signals</div>
-    </div>
-
-    <!-- Empty state -->
-    <div id="spockEmpty" style="text-align:center;padding:20px;">
-      <div style="font-size:11px;color:var(--text-dim);">Enter your position details above and click ASK SPOCK for a full analysis.</div>
-      <div style="font-size:10px;color:var(--text-dim);margin-top:6px;">Spock also auto-triggers on state changes, risk escalations, and new whale trades.</div>
     </div>
 
   </div>
 
-<!-- UNUSUAL OPTIONS ACTIVITY PANEL — full width -->
+  <!-- SPOCK 2.0 — AI TRADING CO-PILOT -->
+  <div class="panel" id="spock-panel" style="grid-column:1/-1;border:2px solid rgba(0,229,255,0.35);background:rgba(0,10,20,0.97);position:relative;">
+    <div class="panel-title" onclick="togglePanel('spock-panel')" style="cursor:pointer;display:flex;align-items:center;gap:12px;">
+      <span style="font-size:14px;">&#128406;</span>
+      <span>SPOCK 2.0 &mdash; AI TRADING CO-PILOT</span>
+      <span style="font-size:9px;color:var(--text-dim);letter-spacing:2px;">CLAUDE-POWERED &middot; POSITION INTELLIGENCE</span>
+      <span id="spockTriggerBadge" style="display:none;font-size:9px;background:rgba(0,229,255,0.2);color:#00e5ff;padding:2px 8px;border-radius:2px;border:1px solid #00e5ff;margin-left:8px;animation:pulseGreen 1s infinite;"></span>
+      <span class="panel-collapse-btn" id="btn-spock-panel" style="margin-left:auto;">&#9662;</span>
+    </div>
+
+    <!-- POSITION INPUT -->
+    <div style="background:rgba(0,229,255,0.04);border:1px solid rgba(0,229,255,0.18);border-radius:2px;padding:16px;margin-bottom:16px;">
+      <div style="font-size:9px;letter-spacing:2px;color:#00e5ff;margin-bottom:12px;">&#9654; YOUR POSITION &mdash; ENTER TRADE DETAILS</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;align-items:end;">
+
+        <div>
+          <div style="font-size:9px;color:var(--text-dim);letter-spacing:1px;margin-bottom:5px;">PORTFOLIO SIZE ($)</div>
+          <input id="spockPortfolio" type="number" value="100000" min="1000"
+            style="width:100%;background:var(--bg3);border:1px solid rgba(0,229,255,0.3);color:#00e5ff;font-family:var(--font-mono);font-size:13px;font-weight:700;padding:8px 10px;border-radius:1px;box-sizing:border-box;">
+        </div>
+
+        <div>
+          <div style="font-size:9px;color:var(--text-dim);letter-spacing:1px;margin-bottom:5px;">SHARES HELD</div>
+          <input id="spockShares" type="number" value="0" min="0"
+            style="width:100%;background:var(--bg3);border:1px solid rgba(0,229,255,0.3);color:#00ff88;font-family:var(--font-mono);font-size:13px;font-weight:700;padding:8px 10px;border-radius:1px;box-sizing:border-box;">
+        </div>
+
+        <div>
+          <div style="font-size:9px;color:var(--text-dim);letter-spacing:1px;margin-bottom:5px;">ENTRY PRICE ($)</div>
+          <input id="spockEntry" type="number" value="0" min="0" step="0.01"
+            style="width:100%;background:var(--bg3);border:1px solid rgba(0,229,255,0.3);color:#00ff88;font-family:var(--font-mono);font-size:13px;font-weight:700;padding:8px 10px;border-radius:1px;box-sizing:border-box;">
+        </div>
+
+        <!-- Live P&L preview -->
+        <div style="background:var(--bg2);border:1px solid rgba(255,255,255,0.08);padding:8px 12px;border-radius:1px;">
+          <div style="font-size:9px;color:var(--text-dim);letter-spacing:1px;margin-bottom:4px;">LIVE P&amp;L</div>
+          <div id="spockPnlPreview" style="font-family:var(--font-mono);font-size:14px;font-weight:700;color:var(--text-dim);">Enter position</div>
+          <div id="spockPnlPct" style="font-size:10px;color:var(--text-dim);margin-top:2px;">&mdash;</div>
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:6px;">
+          <button onclick="askSpock()" id="spockBtn"
+            style="background:rgba(0,229,255,0.15);border:1px solid #00e5ff;color:#00e5ff;font-family:var(--font-mono);font-size:11px;font-weight:700;padding:9px 16px;cursor:pointer;letter-spacing:2px;border-radius:1px;white-space:nowrap;transition:all 0.2s;">
+            &#128406; ANALYZE POSITION
+          </button>
+          <div id="spockStatus" style="font-size:9px;color:var(--text-dim);text-align:center;">Ready &mdash; enter position and click analyze</div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- LOADING STATE -->
+    <div id="spockLoading" style="display:none;text-align:center;padding:40px 20px;">
+      <div style="font-family:var(--font-mono);font-size:13px;color:#00e5ff;letter-spacing:4px;">&#128406; SPOCK IS ANALYZING YOUR POSITION...</div>
+      <div style="font-size:10px;color:var(--text-dim);margin-top:10px;">Processing DarthVader state &middot; options flow &middot; price levels &middot; risk assessment</div>
+      <div style="margin-top:16px;height:2px;background:rgba(0,229,255,0.1);border-radius:1px;overflow:hidden;">
+        <div style="height:100%;background:#00e5ff;animation:loadBar 2s infinite;width:30%;"></div>
+      </div>
+    </div>
+
+    <!-- EMPTY STATE -->
+    <div id="spockEmpty" style="text-align:center;padding:24px;border:1px dashed rgba(0,229,255,0.15);border-radius:2px;">
+      <div style="font-size:11px;color:var(--text-dim);line-height:1.8;">
+        Enter your shares held and entry price above, then click <span style="color:#00e5ff;">ANALYZE POSITION</span>.<br>
+        Spock will assess position safety, give you exact sell targets, and flag the biggest risks.
+      </div>
+    </div>
+
+    <!-- ANALYSIS OUTPUT -->
+    <div id="spockOutput" style="display:none;">
+
+      <!-- Top action bar -->
+      <div style="display:grid;grid-template-columns:140px 130px 130px 1fr;gap:10px;margin-bottom:16px;">
+        <div style="background:var(--bg2);border:1px solid rgba(0,229,255,0.25);padding:14px;text-align:center;border-radius:1px;">
+          <div style="font-size:9px;letter-spacing:2px;color:var(--text-dim);margin-bottom:6px;">VERDICT</div>
+          <div id="spockAction" style="font-family:var(--font-mono);font-size:22px;font-weight:900;color:#00e5ff;">--</div>
+        </div>
+        <div style="background:var(--bg2);border:1px solid rgba(0,229,255,0.25);padding:14px;text-align:center;border-radius:1px;">
+          <div style="font-size:9px;letter-spacing:2px;color:var(--text-dim);margin-bottom:6px;">CONFIDENCE</div>
+          <div id="spockConf" style="font-family:var(--font-mono);font-size:18px;font-weight:700;">--</div>
+        </div>
+        <div style="background:var(--bg2);border:1px solid rgba(0,229,255,0.25);padding:14px;text-align:center;border-radius:1px;">
+          <div style="font-size:9px;letter-spacing:2px;color:var(--text-dim);margin-bottom:6px;">POSITION SAFE?</div>
+          <div id="spockSafe" style="font-family:var(--font-mono);font-size:16px;font-weight:700;">--</div>
+        </div>
+        <div style="background:var(--bg2);border:1px solid rgba(0,229,255,0.25);padding:14px;border-radius:1px;">
+          <div style="font-size:9px;letter-spacing:2px;color:var(--text-dim);margin-bottom:6px;">ANALYSIS META</div>
+          <div id="spockTrigger" style="font-family:var(--font-mono);font-size:10px;color:var(--text-dim);">--</div>
+          <div id="spockTime"    style="font-size:9px;color:var(--text-dim);margin-top:3px;">--</div>
+        </div>
+      </div>
+
+      <!-- SELL PLAN — the most important section -->
+      <div style="margin-bottom:16px;">
+        <div style="font-size:9px;letter-spacing:2px;color:#00ff88;padding:8px 12px;background:rgba(0,255,136,0.06);border:1px solid rgba(0,255,136,0.2);border-bottom:none;border-radius:2px 2px 0 0;">
+          &#9660; SELL PLAN &mdash; EXACT EXIT LEVELS
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;border:1px solid rgba(0,255,136,0.2);">
+          <div style="padding:14px;border-right:1px solid rgba(0,255,136,0.15);">
+            <div style="font-size:9px;letter-spacing:2px;color:#00ff88;margin-bottom:8px;">T1 &mdash; FIRST SELL</div>
+            <div id="spockT1Price" style="font-family:var(--font-mono);font-size:20px;font-weight:700;color:#00ff88;">--</div>
+            <div id="spockT1Size"  style="font-size:11px;color:var(--text-dim);margin-top:4px;">--</div>
+            <div id="spockT1Why"   style="font-size:10px;color:var(--text-dim);margin-top:6px;line-height:1.5;">--</div>
+          </div>
+          <div style="padding:14px;border-right:1px solid rgba(0,255,136,0.15);">
+            <div style="font-size:9px;letter-spacing:2px;color:#00ff88;margin-bottom:8px;">T2 &mdash; MAIN SELL</div>
+            <div id="spockT2Price" style="font-family:var(--font-mono);font-size:20px;font-weight:700;color:#00ff88;">--</div>
+            <div id="spockT2Size"  style="font-size:11px;color:var(--text-dim);margin-top:4px;">--</div>
+            <div id="spockT2Why"   style="font-size:10px;color:var(--text-dim);margin-top:6px;line-height:1.5;">--</div>
+          </div>
+          <div style="padding:14px;">
+            <div style="font-size:9px;letter-spacing:2px;color:#00ff88;margin-bottom:8px;">T3 &mdash; FINAL SELL</div>
+            <div id="spockT3Price" style="font-family:var(--font-mono);font-size:20px;font-weight:700;color:#00ff88;">--</div>
+            <div id="spockT3Size"  style="font-size:11px;color:var(--text-dim);margin-top:4px;">--</div>
+            <div id="spockT3Why"   style="font-size:10px;color:var(--text-dim);margin-top:6px;line-height:1.5;">--</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Stop loss + risk + market read -->
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:16px;">
+
+        <div style="background:rgba(255,51,85,0.06);border:1px solid rgba(255,51,85,0.3);padding:14px;border-radius:1px;">
+          <div style="font-size:9px;letter-spacing:2px;color:#ff3355;margin-bottom:8px;">&#9632; STOP LOSS</div>
+          <div id="spockStop" style="font-family:var(--font-mono);font-size:22px;font-weight:900;color:#ff3355;">--</div>
+          <div id="spockStopNote" style="font-size:10px;color:var(--text-dim);margin-top:6px;line-height:1.5;">Cut here. No negotiation.</div>
+        </div>
+
+        <div style="background:rgba(255,100,0,0.05);border:1px solid rgba(255,100,0,0.25);padding:14px;border-radius:1px;">
+          <div style="font-size:9px;letter-spacing:2px;color:#ff6d00;margin-bottom:8px;">&#9888; BIGGEST RISK</div>
+          <div id="spockRisk" style="font-size:11px;color:var(--text-primary);line-height:1.6;">--</div>
+        </div>
+
+        <div style="background:rgba(0,229,255,0.04);border:1px solid rgba(0,229,255,0.2);padding:14px;border-radius:1px;">
+          <div style="font-size:9px;letter-spacing:2px;color:#00e5ff;margin-bottom:8px;">&#128200; MARKET READ</div>
+          <div id="spockMarket" style="font-size:11px;color:var(--text-primary);line-height:1.6;">--</div>
+        </div>
+
+      </div>
+
+      <!-- Watch for -->
+      <div style="background:rgba(255,179,0,0.04);border:1px solid rgba(255,179,0,0.2);padding:14px;border-radius:1px;">
+        <div style="font-size:9px;letter-spacing:2px;color:var(--gold);margin-bottom:8px;">&#128064; WATCH FOR</div>
+        <div id="spockWatch" style="font-size:11px;color:var(--text-primary);line-height:1.8;">--</div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- UNUSUAL OPTIONS ACTIVITY PANEL — full width -->
   <div class="panel" id="uoa-panel" style="grid-column:1/-1;border:2px solid rgba(180,100,255,0.35);background:rgba(10,5,20,0.98);">
     <div class="panel-title" onclick="togglePanel('uoa-panel')" style="cursor:pointer;" title="Click to collapse" style="color:#b388ff;margin-bottom:18px;">
       🔍 Unusual Options Activity — Whale &amp; Sweep Detection
