@@ -9210,13 +9210,13 @@ function parseSellPlan(sellPlanText) {
     else if(/T3|FINAL/i.test(line)) tIdx = 2;
     if(tIdx >= 0) {
       // Extract price: look for $XXX.XX
-      var priceMatch = line.match(/$(\d+\.?\d*)/);
-      if(priceMatch) targets[tIdx].price = '$' + priceMatch[1];
+      var priceMatch = line.match(/[0-9]+\.?[0-9]*/);
+      if(priceMatch) targets[tIdx].price = '$' + priceMatch[0];
       // Extract size: look for XX%
-      var sizeMatch  = line.match(/(\d+)%\s+of\s+position/i) || line.match(/sell\s+(\d+)%/i);
+      var sizeMatch  = line.match(/([0-9]+)% of position/i) || line.match(/sell ([0-9]+)%/i);
       if(sizeMatch)  targets[tIdx].size  = 'Sell ' + sizeMatch[1] + '% of position';
       // Extract reason after "reason:"
-      var reasonMatch = line.match(/reason:\s*(.+)/i);
+      var reasonMatch = line.match(/reason: *(.*)/i);
       if(reasonMatch) targets[tIdx].why = reasonMatch[1];
     }
   }
@@ -9271,7 +9271,7 @@ function renderSpockAnalysis(d) {
 
   // Stop loss
   var stopText = sections['STOP LOSS'] || '';
-  var stopPrice = (stopText.match(/$(\d+\.?\d*)/) || [])[1];
+  var stopPrice = (stopText.match(/[0-9]+\.?[0-9]*/) || [])[1];
   setText('spockStop', stopPrice ? '$' + stopPrice : '--');
   var stopNote  = stopText.replace(/$\d+\.?\d*/, '').trim();
   setText('spockStopNote', stopNote || 'Cut here. No negotiation.');
