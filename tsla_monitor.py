@@ -8953,271 +8953,316 @@ setTimeout(function(){ loadNHL(false); }, 5000);
 // -------------------------------------------------------
 // SPOCK 2.0 -- Frontend JS
 
-// ALGO RADAR -- Frontend JS
+// =========================================================
+// ALGO RADAR + SPOCK 2.0  --  Frontend JS
+// Clean rewrite: no template literals, no regex ambiguity
 // =========================================================
 
+// ---- ALGO RADAR ------------------------------------------
+
 function updateAlgoRadar(s) {
-  var ft  = (s.darthvader && s.darthvader.features) ? s.darthvader.features : {};
-  var ofi = parseFloat(ft.ofi_ratio  || 0);
-  var agg = parseFloat(ft.aggression || 0);
-  var abs = parseFloat(ft.absorption || 0);
-  var vac = parseFloat(ft.vacuum     || 0);
-  var vel = parseFloat(ft.trend_score|| 0);
+  var ft  = (s && s.darthvader && s.darthvader.features) ? s.darthvader.features : {};
+  var ofi = parseFloat(ft.ofi_ratio   || 0);
+  var agg = parseFloat(ft.aggression  || 0);
+  var ab  = parseFloat(ft.absorption  || 0);
+  var vac = parseFloat(ft.vacuum      || 0);
+  var vel = parseFloat(ft.trend_score || 0);
 
-  var G = '#00ff88', R = '#ff3355', A = '#ffb300', P = '#b388ff', C = '#00e5ff';
+  var G = '#00ff88', R = '#ff3355', A = '#ffb300', P = '#b388ff';
 
-  // OFI
-  var ofiColor = ofi > 2 ? G : ofi < -2 ? R : ofi > 0.5 ? '#80ff88' : ofi < -0.5 ? '#ff8090' : '#555';
-  var ofiFill  = Math.min(100, Math.max(0, 50 + ofi * 8));
-  setAlgoGauge('algoOfi', ofi.toFixed(2)+'x', ofiFill, ofiColor,
-    ofi > 2 ? 'BUY PROGRAM' : ofi < -2 ? 'SELL PROGRAM' : ofi > 0.5 ? 'BUY LEAN' : ofi < -0.5 ? 'SELL LEAN' : 'NEUTRAL');
+  // OFI gauge
+  var ofiColor  = ofi > 2 ? G : ofi < -2 ? R : '#555555';
+  var ofiFill   = Math.min(100, Math.max(0, 50 + ofi * 8));
+  var ofiLabel  = ofi > 2 ? 'BUY PROGRAM' : ofi < -2 ? 'SELL PROGRAM' :
+                  ofi > 0.5 ? 'BUY LEAN' : ofi < -0.5 ? 'SELL LEAN' : 'NEUTRAL';
+  setAlgoGauge('algoOfi',   ofi.toFixed(2) + 'x', ofiFill,  ofiColor,  ofiLabel);
 
-  // Aggression
-  var aggColor = agg > 0.25 ? G : agg < -0.25 ? R : '#555';
-  var aggFill  = Math.min(100, Math.max(0, 50 + agg * 150));
-  setAlgoGauge('algoAggr', agg.toFixed(3), aggFill, aggColor,
-    agg > 0.4 ? 'STRONG BUYERS' : agg > 0.25 ? 'BUYING AGGR' : agg < -0.4 ? 'STRONG SELLERS' : agg < -0.25 ? 'SELLING AGGR' : 'PASSIVE');
+  // Aggression gauge
+  var aggColor  = agg > 0.25 ? G : agg < -0.25 ? R : '#555555';
+  var aggFill   = Math.min(100, Math.max(0, 50 + agg * 150));
+  var aggLabel  = agg > 0.4 ? 'STRONG BUYERS' : agg > 0.25 ? 'BUYING AGGR' :
+                  agg < -0.4 ? 'STRONG SELLERS' : agg < -0.25 ? 'SELLING AGGR' : 'PASSIVE';
+  setAlgoGauge('algoAggr',  agg.toFixed(3),        aggFill,  aggColor,  aggLabel);
 
-  // Absorption
-  var absColor = abs > 2 ? A : abs > 1.5 ? '#ffcc44' : '#555';
-  var absFill  = Math.min(100, abs * 20);
-  setAlgoGauge('algoAbsor', abs.toFixed(2), absFill, absColor,
-    abs > 3 ? 'HEAVY ABSORB' : abs > 2 ? 'ABSORBING' : abs > 1.5 ? 'MILD ABSORB' : 'PASSIVE');
+  // Absorption gauge
+  var abColor   = ab > 2 ? A : ab > 1.5 ? '#ffcc44' : '#555555';
+  var abFill    = Math.min(100, ab * 20);
+  var abLabel   = ab > 3 ? 'HEAVY ABSORB' : ab > 2 ? 'ABSORBING' : ab > 1.5 ? 'MILD ABSORB' : 'PASSIVE';
+  setAlgoGauge('algoAbsor', ab.toFixed(2),          abFill,   abColor,   abLabel);
 
-  // Vacuum
-  var vacColor = vac > 3 ? P : vac > 1.5 ? '#cc88ff' : '#555';
-  var vacFill  = Math.min(100, vac * 15);
-  setAlgoGauge('algoVac', vac.toFixed(2), vacFill, vacColor,
-    vac > 3 ? 'DANGER VACUUM' : vac > 1.5 ? 'THINNING' : 'NORMAL');
+  // Vacuum gauge
+  var vacColor  = vac > 3 ? P : vac > 1.5 ? '#cc88ff' : '#555555';
+  var vacFill   = Math.min(100, vac * 15);
+  var vacLabel  = vac > 3 ? 'DANGER VACUUM' : vac > 1.5 ? 'THINNING' : 'NORMAL';
+  setAlgoGauge('algoVac',   vac.toFixed(2),          vacFill,  vacColor,  vacLabel);
 
-  // Velocity
-  var velColor = vel >= 7 ? G : vel <= -7 ? R : vel > 3 ? '#80ff88' : vel < -3 ? '#ff8090' : '#555';
-  var velFill  = Math.min(100, Math.max(0, 50 + vel * 5));
-  setAlgoGauge('algoVel', Math.round(vel)+'/10', velFill, velColor,
-    vel >= 9 ? 'IGNITION' : vel >= 7 ? 'MOMENTUM UP' : vel <= -9 ? 'COLLAPSE' : vel <= -7 ? 'MOMENTUM DOWN' : vel > 3 ? 'LEAN UP' : vel < -3 ? 'LEAN DOWN' : 'NEUTRAL');
+  // Velocity gauge
+  var velColor  = vel >= 7 ? G : vel <= -7 ? R : vel > 3 ? '#80ff88' : vel < -3 ? '#ff8090' : '#555555';
+  var velFill   = Math.min(100, Math.max(0, 50 + vel * 5));
+  var velLabel  = vel >= 9 ? 'IGNITION' : vel >= 7 ? 'MOMENTUM UP' :
+                  vel <= -9 ? 'COLLAPSE' : vel <= -7 ? 'MOMENTUM DOWN' :
+                  vel > 3 ? 'LEAN UP' : vel < -3 ? 'LEAN DOWN' : 'NEUTRAL';
+  setAlgoGauge('algoVel',   Math.round(vel) + '/10', velFill,  velColor,  velLabel);
 
-  // Live indicator
-  var ind = document.getElementById('algoLiveIndicator');
-  var anyFiring = Math.abs(ofi) > 2 || Math.abs(agg) > 0.25 || abs > 2 || vac > 3 || Math.abs(vel) >= 7;
-  if(ind) { ind.style.background = anyFiring ? G : '#555'; ind.style.boxShadow = anyFiring ? '0 0 6px '+G : 'none'; }
-
+  // Live dot
+  var anyFiring = Math.abs(ofi) > 2 || Math.abs(agg) > 0.25 || ab > 2 || vac > 3 || Math.abs(vel) >= 7;
+  var dot = document.getElementById('algoLiveIndicator');
+  if (dot) {
+    dot.style.background  = anyFiring ? G : '#444444';
+    dot.style.boxShadow   = anyFiring ? '0 0 6px ' + G : 'none';
+  }
   var stEl = document.getElementById('algoStatusText');
-  if(stEl) stEl.textContent = anyFiring ? 'SIGNAL FIRING' : 'Scanning...';
-  if(stEl) stEl.style.color  = anyFiring ? G : 'var(--text-dim)';
+  if (stEl) {
+    stEl.textContent = anyFiring ? 'SIGNAL FIRING' : 'Scanning...';
+    stEl.style.color = anyFiring ? G : 'var(--text-dim)';
+  }
 
-  // Alert from backend
-  var alert = s.algo_alert;
-  renderAlgoAlert(alert);
+  // Render alert banner from backend
+  renderAlgoAlert(s.algo_alert || null);
 
-  // History
-  if(s.algo_history && s.algo_history.length) renderAlgoHistory(s.algo_history);
+  // Render history
+  if (s.algo_history && s.algo_history.length) {
+    renderAlgoHistory(s.algo_history);
+  }
 }
 
 function setAlgoGauge(prefix, val, fillPct, color, label) {
-  var valEl   = document.getElementById(prefix+'Val');
-  var fillEl  = document.getElementById(prefix+'BarFill');
-  var labelEl = document.getElementById(prefix+'Label');
-  if(valEl)   { valEl.textContent = val;   valEl.style.color   = color; }
-  if(fillEl)  { fillEl.style.width = fillPct+'%'; fillEl.style.background = color; }
-  if(labelEl) { labelEl.textContent = label; labelEl.style.color = color; }
+  var vEl = document.getElementById(prefix + 'Val');
+  var fEl = document.getElementById(prefix + 'BarFill');
+  var lEl = document.getElementById(prefix + 'Label');
+  if (vEl) { vEl.textContent = val;   vEl.style.color = color; }
+  if (fEl) { fEl.style.width = fillPct + '%'; fEl.style.background = color; }
+  if (lEl) { lEl.textContent = label; lEl.style.color = color; }
 }
 
 function renderAlgoAlert(alert) {
   var banner = document.getElementById('algoAlertBanner');
-  if(!banner) return;
-  if(!alert) { banner.style.display='none'; return; }
+  if (!banner) { return; }
+  if (!alert || !alert.label) { banner.style.display = 'none'; return; }
 
-  var G = '#00ff88', R = '#ff3355';
-  var isBuy  = alert.direction === 'BUY';
-  var color  = isBy ? G : R;
-  var bg     = isBy ? 'rgba(0,255,136,0.07)' : 'rgba(255,51,85,0.07)';
-  var border = isBy ? 'rgba(0,255,136,0.3)'  : 'rgba(255,51,85,0.3)';
+  var isBuy  = (alert.direction === 'BUY');
+  var color  = isBuy ? '#00ff88' : '#ff3355';
+  var bg     = isBuy ? 'rgba(0,255,136,0.07)' : 'rgba(255,51,85,0.07)';
+  var border = isBuy ? 'rgba(0,255,136,0.3)'  : 'rgba(255,51,85,0.3)';
 
-  // Reassign (fix typo above)
-  var isBuy2 = alert.direction === 'BUY';
-  color  = isBuy2 ? G : R;
-  bg     = isBuy2 ? 'rgba(0,255,136,0.07)' : 'rgba(255,51,85,0.07)';
-  border = isBuy2 ? 'rgba(0,255,136,0.3)'  : 'rgba(255,51,85,0.3)';
+  banner.style.display      = 'block';
+  banner.style.background   = bg;
+  banner.style.borderTop    = '1px solid ' + border;
+  banner.style.borderBottom = '1px solid ' + border;
 
-  banner.style.display     = 'block';
-  banner.style.background  = bg;
-  banner.style.borderTop   = '1px solid ' + border;
-  banner.style.borderBottom= '1px solid ' + border;
+  var iconEl  = document.getElementById('algoAlertIcon');
+  var lblEl   = document.getElementById('algoAlertLabel');
+  var detEl   = document.getElementById('algoAlertDetail');
+  var priceEl = document.getElementById('algoAlertPrice');
+  var timeEl  = document.getElementById('algoAlertTime');
 
-  var icon  = document.getElementById('algoAlertIcon');
-  var lbl   = document.getElementById('algoAlertLabel');
-  var det   = document.getElementById('algoAlertDetail');
-  var price = document.getElementById('algoAlertPrice');
-  var time  = document.getElementById('algoAlertTime');
-
-  if(icon)  icon.textContent  = isBuy2 ? '\u25b2' : '\u25bc';
-  if(icon)  icon.style.color  = color;
-  if(lbl)   { lbl.textContent = alert.label || '--'; lbl.style.color = color; }
-  if(det)   det.textContent   = alert.detail || '--';
-  if(price) { price.textContent = '$'+(alert.price||'--'); price.style.color = color; }
-  if(time)  time.textContent  = alert.timestamp || '--';
+  if (iconEl)  { iconEl.textContent = isBuy ? '\u25b2' : '\u25bc'; iconEl.style.color = color; }
+  if (lblEl)   { lblEl.textContent  = alert.label   || '--'; lblEl.style.color = color; }
+  if (detEl)   { detEl.textContent  = alert.detail  || '--'; }
+  if (priceEl) { priceEl.textContent = '$' + (alert.price || '--'); priceEl.style.color = color; }
+  if (timeEl)  { timeEl.textContent  = alert.timestamp || '--'; }
 }
 
 function renderAlgoHistory(history) {
   var el = document.getElementById('algoHistory');
-  if(!el) return;
-  if(!history.length) return;
-
-  var G = '#00ff88', R = '#ff3355';
-  el.innerHTML = history.slice(0,8).map(function(a) {
-    var isBuy = a.direction === 'BUY';
-    var c = isBuy ? G : R;
+  if (!el || !history || !history.length) { return; }
+  var rows = '';
+  var limit = Math.min(history.length, 8);
+  for (var i = 0; i < limit; i++) {
+    var a     = history[i];
+    var isBuy = (a.direction === 'BUY');
+    var c     = isBuy ? '#00ff88' : '#ff3355';
     var arrow = isBuy ? '\u25b2' : '\u25bc';
-    return '<div style="display:flex;gap:10px;align-items:center;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.04);">'
-      + '<span style="color:'+c+';font-size:10px;">'+arrow+'</span>'
-      + '<span style="font-family:var(--font-mono);font-size:9px;color:'+c+';min-width:140px;">'+( a.label||'')+'</span>'
-      + '<span style="font-size:9px;color:var(--text-dim);flex:1;">'+( a.detail||'').slice(0,70)+'</span>'
-      + '<span style="font-family:var(--font-mono);font-size:9px;color:#fff;">$'+(a.price||'--')+'</span>'
-      + '<span style="font-size:8px;color:var(--text-dim);min-width:55px;text-align:right;">'+(a.timestamp||'')+'</span>'
-      + '</div>';
-  }).join('');
+    var lbl   = a.label   || '';
+    var det   = (a.detail || '').slice(0, 70);
+    var px    = '$' + (a.price || '--');
+    var ts    = a.timestamp || '';
+    rows += '<div style="display:flex;gap:10px;align-items:center;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.04);">'
+          + '<span style="color:' + c + ';font-size:10px;">' + arrow + '</span>'
+          + '<span style="font-family:var(--font-mono);font-size:9px;color:' + c + ';min-width:140px;">' + lbl + '</span>'
+          + '<span style="font-size:9px;color:var(--text-dim);flex:1;">' + det + '</span>'
+          + '<span style="font-family:var(--font-mono);font-size:9px;color:#fff;">' + px + '</span>'
+          + '<span style="font-size:8px;color:var(--text-dim);min-width:55px;text-align:right;">' + ts + '</span>'
+          + '</div>';
+  }
+  el.innerHTML = rows;
 }
 
 function askSpockAlgo() {
-  // Pre-fill trigger context and call Spock
-  var statusEl = document.getElementById('spockStatus');
-  if(statusEl) statusEl.textContent = 'Analyzing algo signal...';
-  askSpock();
-  // Scroll to Spock panel
   var panel = document.getElementById('spock-panel');
-  if(panel) panel.scrollIntoView({behavior:'smooth', block:'start'});
+  if (panel) { panel.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+  askSpock();
 }
 
-// SPOCK 2.0 - Position Intelligence JS
-// =========================================================
+// ---- SPOCK 2.0 -------------------------------------------
 
-// Live P&L preview as user types
 function updateSpockPreview() {
-  var shares = parseFloat(document.getElementById('spockShares') ? document.getElementById('spockShares').value : 0) || 0;
-  var entry  = parseFloat(document.getElementById('spockEntry')  ? document.getElementById('spockEntry').value  : 0) || 0;
-  var price  = parseFloat(document.querySelector('[id="lastPrice"]') ? document.querySelector('[id="lastPrice"]').textContent.replace('$','') : 0) || 0;
-  var pnlEl  = document.getElementById('spockPnlPreview');
-  var pctEl  = document.getElementById('spockPnlPct');
-  if(!pnlEl) return;
-  if(shares > 0 && entry > 0 && price > 0) {
-    var pnl    = (price - entry) * shares;
-    var pct    = ((price / entry) - 1) * 100;
-    var color  = pnl >= 0 ? '#00ff88' : '#ff3355';
-    pnlEl.textContent  = (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2);
-    pnlEl.style.color  = color;
-    pctEl.textContent  = (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%  |  ' + shares + ' shares @ $' + entry;
-    pctEl.style.color  = color;
+  var sharesEl = document.getElementById('spockShares');
+  var entryEl  = document.getElementById('spockEntry');
+  var pnlEl    = document.getElementById('spockPnlPreview');
+  var pctEl    = document.getElementById('spockPnlPct');
+  if (!pnlEl) { return; }
+
+  var shares = sharesEl ? parseFloat(sharesEl.value) || 0 : 0;
+  var entry  = entryEl  ? parseFloat(entryEl.value)  || 0 : 0;
+
+  // Get current price from page
+  var priceEl = document.getElementById('lastPrice');
+  var price   = priceEl ? parseFloat(priceEl.textContent.replace('$', '')) || 0 : 0;
+
+  if (shares > 0 && entry > 0 && price > 0) {
+    var pnl   = (price - entry) * shares;
+    var pct   = ((price / entry) - 1) * 100;
+    var color = pnl >= 0 ? '#00ff88' : '#ff3355';
+    var sign  = pnl >= 0 ? '+' : '';
+    pnlEl.textContent = sign + '$' + pnl.toFixed(2);
+    pnlEl.style.color = color;
+    pctEl.textContent = sign + pct.toFixed(2) + '%  |  ' + shares + ' shares @ $' + entry;
+    pctEl.style.color = color;
   } else {
     pnlEl.textContent = 'Enter position';
     pnlEl.style.color = 'var(--text-dim)';
-    pctEl.textContent = '--';
+    if (pctEl) { pctEl.textContent = '--'; pctEl.style.color = 'var(--text-dim)'; }
   }
 }
 
-// Wire up live preview
-(function() {
-  function wireInputs() {
-    var ids = ['spockShares','spockEntry','spockPortfolio'];
+// Wire up live preview inputs
+(function wireSpockInputs() {
+  var ids = ['spockShares', 'spockEntry', 'spockPortfolio'];
+  function attach() {
     ids.forEach(function(id) {
       var el = document.getElementById(id);
-      if(el) el.addEventListener('input', updateSpockPreview);
+      if (el && !el._spockWired) {
+        el.addEventListener('input', updateSpockPreview);
+        el._spockWired = true;
+      }
     });
   }
-  wireInputs();
-  setTimeout(wireInputs, 2000);
-})();
+  attach();
+  setTimeout(attach, 1500);
+}());
 
 function askSpock() {
-  var portfolio = parseFloat(document.getElementById('spockPortfolio') ? document.getElementById('spockPortfolio').value : 100000) || 100000;
-  var shares    = parseFloat(document.getElementById('spockShares')    ? document.getElementById('spockShares').value    : 0)      || 0;
-  var entry     = parseFloat(document.getElementById('spockEntry')     ? document.getElementById('spockEntry').value     : 0)      || 0;
-  var btn       = document.getElementById('spockBtn');
-  var status    = document.getElementById('spockStatus');
+  var portEl   = document.getElementById('spockPortfolio');
+  var sharesEl = document.getElementById('spockShares');
+  var entryEl  = document.getElementById('spockEntry');
+  var btn      = document.getElementById('spockBtn');
+  var statusEl = document.getElementById('spockStatus');
 
-  if(shares <= 0 || entry <= 0) {
-    if(status) { status.textContent = 'Enter shares and entry price first'; status.style.color = '#ff3355'; }
-    setTimeout(function(){ if(status){ status.textContent='Ready'; status.style.color='var(--text-dim)'; } }, 3000);
+  var portfolio = portEl   ? (parseFloat(portEl.value)   || 100000) : 100000;
+  var shares    = sharesEl ? (parseFloat(sharesEl.value) || 0)      : 0;
+  var entry     = entryEl  ? (parseFloat(entryEl.value)  || 0)      : 0;
+
+  if (shares <= 0 || entry <= 0) {
+    if (statusEl) {
+      statusEl.textContent = 'Enter shares and entry price first';
+      statusEl.style.color = '#ff3355';
+    }
+    setTimeout(function() {
+      if (statusEl) { statusEl.textContent = 'Ready'; statusEl.style.color = 'var(--text-dim)'; }
+    }, 3000);
     return;
   }
 
-  document.getElementById('spockLoading').style.display = 'block';
-  document.getElementById('spockEmpty').style.display   = 'none';
-  document.getElementById('spockOutput').style.display  = 'none';
-  if(btn)    { btn.disabled = true; btn.style.opacity = '0.6'; btn.textContent = 'ANALYZING...'; }
-  if(status) { status.textContent = 'Calling Claude API...'; status.style.color = '#00e5ff'; }
+  // Show loading
+  var loadEl  = document.getElementById('spockLoading');
+  var emptyEl = document.getElementById('spockEmpty');
+  var outEl   = document.getElementById('spockOutput');
+  if (loadEl)  { loadEl.style.display  = 'block'; }
+  if (emptyEl) { emptyEl.style.display = 'none';  }
+  if (outEl)   { outEl.style.display   = 'none';  }
+  if (btn)     { btn.disabled = true; btn.style.opacity = '0.6'; btn.textContent = 'ANALYZING...'; }
+  if (statusEl){ statusEl.textContent = 'Calling Claude API...'; statusEl.style.color = '#00e5ff'; }
 
   fetch('/api/spock', {
     method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ trigger:'manual', portfolio:portfolio, shares:shares, entry_price:entry })
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ trigger: 'manual', portfolio: portfolio, shares: shares, entry_price: entry })
   })
-  .then(function(r){ return r.json(); })
-  .then(function(d){
-    if(d.error) {
-      if(status) { status.textContent = 'Error: ' + d.error; status.style.color='#ff3355'; }
-      document.getElementById('spockLoading').style.display = 'none';
-      document.getElementById('spockEmpty').style.display   = 'block';
+  .then(function(r) { return r.json(); })
+  .then(function(d) {
+    if (d.error) {
+      if (statusEl) { statusEl.textContent = 'Error: ' + d.error; statusEl.style.color = '#ff3355'; }
+      if (loadEl)  { loadEl.style.display  = 'none';  }
+      if (emptyEl) { emptyEl.style.display = 'block'; }
     } else {
       renderSpockAnalysis(d);
-      if(status) { status.textContent = 'Updated ' + (d.timestamp||''); status.style.color='#00ff88'; }
+      if (statusEl) { statusEl.textContent = 'Updated ' + (d.timestamp || ''); statusEl.style.color = '#00ff88'; }
     }
   })
-  .catch(function(e){
-    if(status) { status.textContent = 'Network error: ' + e.message; status.style.color='#ff3355'; }
-    document.getElementById('spockLoading').style.display = 'none';
-    document.getElementById('spockEmpty').style.display   = 'block';
+  .catch(function(err) {
+    if (statusEl) { statusEl.textContent = 'Network error: ' + err.message; statusEl.style.color = '#ff3355'; }
+    if (loadEl)  { loadEl.style.display  = 'none';  }
+    if (emptyEl) { emptyEl.style.display = 'block'; }
   })
-  .finally(function(){
-    if(btn){ btn.disabled=false; btn.style.opacity='1'; btn.textContent='ANALYZE POSITION'; }
+  .finally(function() {
+    if (btn) { btn.disabled = false; btn.style.opacity = '1'; btn.textContent = 'ANALYZE POSITION'; }
   });
 }
 
-function parseSpockSections(txt) {
-  var sections = {};
-  var lines    = txt.split('\n');
-  var current  = null;
-  var buffer   = [];
-
-  // Patterns that mark section headers
-  var headers  = ['ACTION','CONFIDENCE','POSITION SAFETY','SELL PLAN','STOP LOSS','BIGGEST RISK','MARKET READ','WATCH FOR'];
-
-  for(var i = 0; i < lines.length; i++) {
-    var line = lines[i].trim();
-    var matched = false;
-    for(var h = 0; h < headers.length; h++) {
-      if(line.toUpperCase().startsWith(headers[h] + ':')) {
-        if(current) sections[current] = buffer.join('\n').trim();
-        current = headers[h];
-        buffer  = [line.split(':').slice(1).join(':').trim()];
-        matched = true;
-        break;
+function spockExtract(txt, label) {
+  // Extract section content following a label like "SITUATION:"
+  var lines   = txt.split('\n');
+  var result  = [];
+  var found   = false;
+  var labelUp = label.toUpperCase();
+  // List of all possible section headers to detect end of section
+  var headers = ['ACTION', 'CONFIDENCE', 'POSITION SAFETY', 'SELL PLAN',
+                 'STOP LOSS', 'BIGGEST RISK', 'MARKET READ', 'WATCH FOR'];
+  for (var i = 0; i < lines.length; i++) {
+    var trimmed = lines[i].trim();
+    var trimUp  = trimmed.toUpperCase();
+    if (!found) {
+      if (trimUp.indexOf(labelUp + ':') === 0) {
+        found = true;
+        var rest = trimmed.slice(label.length + 1).trim();
+        if (rest) { result.push(rest); }
       }
+    } else {
+      // Check if this line starts a new section header
+      var isHeader = false;
+      for (var h = 0; h < headers.length; h++) {
+        if (trimUp.indexOf(headers[h] + ':') === 0) { isHeader = true; break; }
+      }
+      if (isHeader) { break; }
+      result.push(trimmed);
     }
-    if(!matched && current) buffer.push(line);
   }
-  if(current) sections[current] = buffer.join('\n').trim();
-  return sections;
+  return result.join('\n').trim() || '--';
 }
 
-function parseSellPlan(sellPlanText) {
-  var targets = [{},{},{}];
-  var lines   = sellPlanText.split('\n');
-  for(var i = 0; i < lines.length; i++) {
-    var line = lines[i].trim();
-    var tIdx = -1;
-    if(/T1|FIRST/i.test(line)) tIdx = 0;
-    else if(/T2|MAIN/i.test(line)) tIdx = 1;
-    else if(/T3|FINAL/i.test(line)) tIdx = 2;
-    if(tIdx >= 0) {
-      // Extract price: look for $XXX.XX
-      var priceMatch = line.match(/[0-9]+\.?[0-9]*/);
-      if(priceMatch) targets[tIdx].price = '$' + priceMatch[0];
-      // Extract size: look for XX%
-      var sizeMatch  = line.match(/([0-9]+)% of position/i) || line.match(/sell ([0-9]+)%/i);
-      if(sizeMatch)  targets[tIdx].size  = 'Sell ' + sizeMatch[1] + '% of position';
-      // Extract reason after "reason:"
-      var reasonMatch = line.match(/reason: *(.*)/i);
-      if(reasonMatch) targets[tIdx].why = reasonMatch[1];
+function spockFmtBullets(txt) {
+  // Replace bullet chars at line start with styled arrow
+  return (txt || '--').replace(/(\n|^)[-*] /g, '$1&#9658; ');
+}
+
+function spockExtractPrice(txt) {
+  // Pull first number sequence from a string (for price/stop values)
+  var m = txt.match(/[0-9]+\\.?[0-9]*/);
+  return m ? m[0] : null;
+}
+
+function spockParseSellPlan(txt) {
+  // Returns array of 3 target objects: {price, size, why}
+  var targets = [{}, {}, {}];
+  var lines   = txt.split('\n');
+  for (var i = 0; i < lines.length; i++) {
+    var line   = lines[i].trim();
+    var lineUp = line.toUpperCase();
+    var tIdx   = -1;
+    if (lineUp.indexOf('T1') >= 0 || lineUp.indexOf('FIRST') >= 0) { tIdx = 0; }
+    else if (lineUp.indexOf('T2') >= 0 || lineUp.indexOf('MAIN') >= 0)  { tIdx = 1; }
+    else if (lineUp.indexOf('T3') >= 0 || lineUp.indexOf('FINAL') >= 0) { tIdx = 2; }
+    if (tIdx >= 0) {
+      // Price: first number after '$' or just first number
+      var priceM = line.match(/\\$([0-9]+\\.?[0-9]*)/);
+      if (priceM) { targets[tIdx].price = '$' + priceM[1]; }
+      // Size: pattern like "40%" or "40% of position"
+      var sizeM  = line.match(/([0-9]+)%/);
+      if (sizeM) { targets[tIdx].size = 'Sell ' + sizeM[1] + '% of position'; }
+      // Reason: text after "reason:"
+      var rIdx = lineUp.indexOf('REASON:');
+      if (rIdx >= 0) { targets[tIdx].why = line.slice(rIdx + 7).trim(); }
     }
   }
   return targets;
@@ -9225,97 +9270,117 @@ function parseSellPlan(sellPlanText) {
 
 function renderSpockAnalysis(d) {
   var actionColors = {
-    'BUY':'#00ff88', 'ADD':'#00ff88',
-    'HOLD':'#00e5ff', 'WAIT':'#ffb300',
-    'REDUCE':'#ff6d00', 'EXIT':'#ff3355', 'HEDGE':'#b388ff'
+    'BUY':    '#00ff88', 'ADD':    '#00ff88',
+    'HOLD':   '#00e5ff', 'WAIT':   '#ffb300',
+    'REDUCE': '#ff6d00', 'EXIT':   '#ff3355',
+    'HEDGE':  '#b388ff'
   };
-  var confColors = { 'HIGH':'#00ff88', 'MEDIUM':'#ffb300', 'LOW':'#ff3355' };
+  var confColors = { 'HIGH': '#00ff88', 'MEDIUM': '#ffb300', 'LOW': '#ff3355' };
 
-  var txt      = d.full_text || '';
-  var sections = parseSpockSections(txt);
+  var txt = d.full_text || '';
 
-  // Action + confidence
-  var action   = (d.action || sections['ACTION'] || '').replace(/^[\[\]]/g,'').trim().toUpperCase();
-  var aEl = document.getElementById('spockAction');
-  if(aEl) { aEl.textContent = action; aEl.style.color = actionColors[action] || '#00e5ff'; }
+  // Action
+  var action  = ((d.action || spockExtract(txt, 'ACTION')).replace(/[\\[\\]]/g, '')).trim().toUpperCase();
+  var aEl     = document.getElementById('spockAction');
+  if (aEl) { aEl.textContent = action; aEl.style.color = actionColors[action] || '#00e5ff'; }
 
-  var conf = ((d.confidence || sections['CONFIDENCE'] || '').replace(/^[\[\]]/g,'')).trim().toUpperCase();
+  // Confidence
+  var conf = ((d.confidence || spockExtract(txt, 'CONFIDENCE')).replace(/[\\[\\]]/g, '')).trim().toUpperCase();
   var cEl  = document.getElementById('spockConf');
-  if(cEl) { cEl.textContent = conf; cEl.style.color = confColors[conf] || '#00e5ff'; }
+  if (cEl) { cEl.textContent = conf; cEl.style.color = confColors[conf] || '#00e5ff'; }
 
   // Position safety
-  var safety    = sections['POSITION SAFETY'] || '';
-  var safeEl    = document.getElementById('spockSafe');
-  var isSafe    = /yes|safe|hold/i.test(safety.split('\n')[0]);
-  if(safeEl) {
+  var safety  = spockExtract(txt, 'POSITION SAFETY');
+  var safeEl  = document.getElementById('spockSafe');
+  if (safeEl) {
+    var firstLine = safety.split('\n')[0].toUpperCase();
+    var isSafe    = firstLine.indexOf('YES') >= 0 || firstLine.indexOf('SAFE') >= 0;
     safeEl.textContent = isSafe ? 'YES' : 'NO';
     safeEl.style.color = isSafe ? '#00ff88' : '#ff3355';
   }
 
   // Meta
-  setText('spockTrigger', 'Triggered: ' + (d.trigger||'manual'));
-  setText('spockTime',    'At ' + (d.timestamp||'') + '  |  Price: $' + (d.price||''));
+  var trigEl = document.getElementById('spockTrigger');
+  var timeEl = document.getElementById('spockTime');
+  if (trigEl) { trigEl.textContent = 'Triggered: ' + (d.trigger || 'manual'); }
+  if (timeEl) { timeEl.textContent = 'At ' + (d.timestamp || '') + '  |  Price: $' + (d.price || ''); }
 
   // Sell plan
-  var sellText = sections['SELL PLAN'] || '';
-  var targets  = parseSellPlan(sellText);
-  var tIds     = [['spockT1Price','spockT1Size','spockT1Why'],
-                  ['spockT2Price','spockT2Size','spockT2Why'],
-                  ['spockT3Price','spockT3Size','spockT3Why']];
-  tIds.forEach(function(ids, i) {
-    var t = targets[i] || {};
-    setText(ids[0], t.price || '--');
-    setText(ids[1], t.size  || '--');
-    setText(ids[2], t.why   || '--');
-  });
+  var sellText = spockExtract(txt, 'SELL PLAN');
+  var targets  = spockParseSellPlan(sellText);
+  var tDefs = [
+    ['spockT1Price', 'spockT1Size', 'spockT1Why'],
+    ['spockT2Price', 'spockT2Size', 'spockT2Why'],
+    ['spockT3Price', 'spockT3Size', 'spockT3Why']
+  ];
+  for (var ti = 0; ti < 3; ti++) {
+    var t   = targets[ti] || {};
+    var ids = tDefs[ti];
+    var pEl = document.getElementById(ids[0]);
+    var sEl = document.getElementById(ids[1]);
+    var wEl = document.getElementById(ids[2]);
+    if (pEl) { pEl.textContent = t.price || '--'; }
+    if (sEl) { sEl.textContent = t.size  || '--'; }
+    if (wEl) { wEl.textContent = t.why   || '--'; }
+  }
 
   // Stop loss
-  var stopText = sections['STOP LOSS'] || '';
-  var stopPrice = (stopText.match(/[0-9]+\.?[0-9]*/) || [])[1];
-  setText('spockStop', stopPrice ? '$' + stopPrice : '--');
-  var stopNote  = stopText.replace(/$\d+\.?\d*/, '').trim();
-  setText('spockStopNote', stopNote || 'Cut here. No negotiation.');
+  var stopTxt   = spockExtract(txt, 'STOP LOSS');
+  var stopPrice = spockExtractPrice(stopTxt);
+  var stopEl    = document.getElementById('spockStop');
+  var stopNote  = document.getElementById('spockStopNote');
+  if (stopEl)   { stopEl.textContent   = stopPrice ? '$' + stopPrice : '--'; }
+  if (stopNote) { stopNote.textContent = stopTxt.replace(/[0-9]+\\.?[0-9]*/,'').replace(/\\$/g,'').trim() || 'Cut here. No negotiation.'; }
 
   // Risk, market read, watch for
-  function fmtBullets(t) {
-    return (t || '--').replace(/\n[*\u2022-] /gm, '\n&#9658; ').replace(/^[*\u2022-] /, '&#9658; ');
-  }
-  setHTML('spockRisk',   fmtBullets(sections['BIGGEST RISK'] || '--'));
-  setHTML('spockMarket', fmtBullets(sections['MARKET READ']  || '--'));
-  setHTML('spockWatch',  fmtBullets(sections['WATCH FOR']    || '--'));
+  var riskEl   = document.getElementById('spockRisk');
+  var mktEl    = document.getElementById('spockMarket');
+  var watchEl  = document.getElementById('spockWatch');
+  if (riskEl)  { riskEl.innerHTML  = spockFmtBullets(spockExtract(txt, 'BIGGEST RISK')); }
+  if (mktEl)   { mktEl.innerHTML   = spockFmtBullets(spockExtract(txt, 'MARKET READ')); }
+  if (watchEl) { watchEl.innerHTML = spockFmtBullets(spockExtract(txt, 'WATCH FOR')); }
 
-  // Show output
-  document.getElementById('spockLoading').style.display = 'none';
-  document.getElementById('spockEmpty').style.display   = 'none';
-  document.getElementById('spockOutput').style.display  = 'block';
+  // Show output panels
+  var loadEl  = document.getElementById('spockLoading');
+  var emptyEl = document.getElementById('spockEmpty');
+  var outEl   = document.getElementById('spockOutput');
+  if (loadEl)  { loadEl.style.display  = 'none';  }
+  if (emptyEl) { emptyEl.style.display = 'none';  }
+  if (outEl)   { outEl.style.display   = 'block'; }
 }
 
-function setText(id, val) {
+function spockSetText(id, val) {
   var el = document.getElementById(id);
-  if(el) el.textContent = val || '--';
+  if (el) { el.textContent = val || '--'; }
 }
-function setHTML(id, val) {
+
+function spockSetHTML(id, val) {
   var el = document.getElementById(id);
-  if(el) el.innerHTML = val || '--';
+  if (el) { el.innerHTML = val || '--'; }
 }
 
 // Poll for auto-triggered analyses every 15s
 function pollSpockStatus() {
   fetch('/api/spock/status')
-  .then(function(r){ return r.json(); })
-  .then(function(d){
-    if(!d.has_analysis || !d.analysis) return;
+  .then(function(r) { return r.json(); })
+  .then(function(d) {
+    if (!d.has_analysis || !d.analysis) { return; }
     var badge  = document.getElementById('spockTriggerBadge');
-    var tmEl   = document.getElementById('spockTime');
-    var lastTs = tmEl ? tmEl.textContent : '';
+    var timeEl = document.getElementById('spockTime');
+    var lastTs = timeEl ? timeEl.textContent : '';
     var newTs  = d.analysis.timestamp || '';
-    if(newTs && !lastTs.includes(newTs)) {
-      if(badge){ badge.textContent='NEW: '+(d.last_trigger||'AUTO'); badge.style.display='inline-block'; }
+    if (newTs && lastTs.indexOf(newTs) < 0) {
+      if (badge) {
+        badge.textContent    = 'NEW: ' + (d.last_trigger || 'AUTO');
+        badge.style.display  = 'inline-block';
+      }
       renderSpockAnalysis(d.analysis);
-      setTimeout(function(){ if(badge) badge.style.display='none'; }, 10000);
+      setTimeout(function() {
+        if (badge) { badge.style.display = 'none'; }
+      }, 10000);
     }
   })
-  .catch(function(){});
+  .catch(function() {});
 }
 
 setInterval(pollSpockStatus, 15000);
