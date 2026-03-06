@@ -29,7 +29,7 @@ import pandas as pd
 import numpy as np
 
 def _yf_history(symbol, retries=3, **kwargs):
-    """yfinance with retry; never injects session objects (breaks yfinance 0.2.x+)."""
+    """yfinance with retry. Never injects session objects (breaks 0.2.x+ curl_cffi)."""
     for attempt in range(retries):
         try:
             df = yf.Ticker(symbol).history(**kwargs)
@@ -4380,15 +4380,20 @@ def run_analysis():
         for _attempt in range(3):
             try:
                 hist = _yf_history(TICKER, period="6mo", interval="1d")
-                if not hist.empty:
+                if hist is not None and not hist.empty:
                     break
-                print(f"  ⚠️ yfinance returned empty data (attempt {_attempt+1}/3)")
-                time.sleep(2)
+                print(f"  ⚠️ yfinance empty data (attempt {_attempt+1}/3)")
+                hist = None
+                time.sleep(3)
             except Exception as _ye:
-                print(f"  ⚠️ yfinance fetch error (attempt {_attempt+1}/3): {_ye}")
-                time.sleep(2)
+                print(f"  ⚠️ yfinance error (attempt {_attempt+1}/3): {str(_ye)[:120]}")
+                hist = None
+                time.sleep(3 + _attempt * 2)
         if hist is None or hist.empty:
-            print(f"[FATAL] Could not fetch {TICKER} data after 3 attempts", flush=True)
+            print(f"[FATAL] Could not fetch {TICKER} data after 3 attempts — dashboard will retry next cycle", flush=True)
+            state.update({"signal": "WAIT", "price": state.get("price", 0),
+                          "market_state": "DATA UNAVAILABLE", "last_updated": datetime.now().strftime("%H:%M:%S"),
+                          "signal_strength": 0})
             return
         closes  = hist["Close"]
         volumes = hist["Volume"]
@@ -5092,7 +5097,7 @@ def api_debug():
 
 @app.route("/api/spock", methods=["GET", "POST"])
 def api_spock():
-    """Spock AI — fires in background thread, returns immediately."""
+    """Spock AI — fires background thread, returns immediately."""
     from flask import request as freq
     import threading as _thr
     data        = freq.get_json(silent=True) or {}
