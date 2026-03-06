@@ -26,9 +26,12 @@ from datetime import datetime, timedelta
 import requests
 import yfinance as yf
 import pandas as pd
+import numpy as np
 
-# ── yfinance retry helper — lets yfinance manage its own curl_cffi session ──
-# Do NOT pass session= to yf.Ticker — newer yfinance rejects requests.Session
+# ── yfinance retry helper ────────────────────────────────────────────────────
+# IMPORTANT: Do NOT pass session= to yf.Ticker on yfinance 0.2.x+
+# Newer versions use curl_cffi internally and reject requests.Session objects.
+# Just let yfinance manage its own connection and retry on failure.
 def _yf_history(symbol, retries=3, **kwargs):
     """Fetch yfinance history with retry. Never injects a session object."""
     for attempt in range(retries):
@@ -39,12 +42,11 @@ def _yf_history(symbol, retries=3, **kwargs):
             if attempt < retries - 1:
                 time.sleep(2 + attempt * 2)
         except Exception as e:
-            msg = str(e)
-            print(f"  ⚠️ yfinance fetch {symbol} (attempt {attempt+1}/{retries}): {msg[:120]}")
+            print(f"  ⚠️ yfinance {symbol} attempt {attempt+1}/{retries}: {str(e)[:100]}")
             if attempt < retries - 1:
                 time.sleep(3 + attempt * 3)
     return None
-import numpy as np
+# ────────────────────────────────────────────────────────────────────────────
 from flask import Flask, jsonify, render_template_string, request
 from dotenv import load_dotenv
 try:
@@ -7109,7 +7111,7 @@ function updateUI(s) {
     chart.data.labels = s.price_history.map(p=>p.date.slice(5));
     chart.data.datasets[0].data = s.price_history.map(p=>p.price);
     // Annotations drawn AFTER data so y-axis range is correct
-    updateChartAnnotations(s);
+    if(typeof updateChartAnnotations === "function") updateChartAnnotations(s);
     chart.resize();
     chart.update('none');
   }
@@ -7227,22 +7229,22 @@ function updateUI(s) {
 
   document.getElementById('lastUpdated').textContent = s.last_updated ? 'Updated '+s.last_updated : '-';
 
-  // -- SPY / Macro Panel --
-    // -- All Panels --
-  renderExitPanel(s.exit_data || {});
-  renderUOAPanel(s.uoa_data || {});
-  const pv = parseFloat(document.getElementById('portfolioInput')?.value || 100000);
-  renderEntryPanel(s.entry_data || {}, pv);
-  renderPeakPanel(s.peak_data || {});
-  renderCTAPanel(s.sizing || {}, s.price || 0);
-  renderExtPanel(s.ext_data || {});
-  updateAlgoRadar(s);
-  renderNewsPanel(s.news_data || {});
-  renderSPYPanel(s.spy_data || {});
-  renderMMPanel(s.mm_data || {}, s.dark_pool || {}, s.price || 0);
-  renderInstModels(s.institutional_models || {}, s.indicators || {});
-  // DarthVader 1.0
-  if(s.darthvader) renderDarthVader(s.darthvader);
+  // ── Render each data panel independently so one failure never blocks others ──
+  const _panels = [
+    () => renderExitPanel(s.exit_data || {}),
+    () => renderUOAPanel(s.uoa_data || {}),
+    () => { const pv = parseFloat(document.getElementById('portfolioInput')?.value || 100000); renderEntryPanel(s.entry_data || {}, pv); },
+    () => renderPeakPanel(s.peak_data || {}),
+    () => renderCTAPanel(s.sizing || {}, s.price || 0),
+    () => renderExtPanel(s.ext_data || {}),
+    () => updateAlgoRadar(s),
+    () => renderNewsPanel(s.news_data || {}),
+    () => renderSPYPanel(s.spy_data || {}),
+    () => renderMMPanel(s.mm_data || {}, s.dark_pool || {}, s.price || 0),
+    () => renderInstModels(s.institutional_models || {}, s.indicators || {}),
+    () => { if(s.darthvader) renderDarthVader(s.darthvader); },
+  ];
+  _panels.forEach((fn, i) => { try { fn(); } catch(e) { console.warn('Panel ' + i + ' error:', e.message); } });
 }
 
 
@@ -8109,14 +8111,14 @@ function renderMMPanel(mm, dp, price) {
   // -- GEX Chart --
   if(mm.gex_by_strike?.length) {
     const gs = mm.gex_by_strike;
-    if(gexChart) { gexChart.data.labels = gs.map(g => '$' + g.strike);
+    if(typeof gexChart !== "undefined" && gexChart) { gexChart.data.labels = gs.map(g => '$' + g.strike);
     gexChart.data.datasets[0].data = gs.map(g => g.gex);
     gexChart.data.datasets[0].backgroundColor = gs.map(g => g.color + 'bb');
     gexChart.update('none'); }
   }
 
   // -- OI Chart --
-  if(mm.oi_by_strike?.length) {
+  if(mm.oi_by_strike?.length && typeof oiChart !== "undefined" && oiChart) {
     const os = mm.oi_by_strike;
     oiChart.data.labels = os.map(o => '$' + o.strike);
     oiChart.data.datasets[0].data = os.map(o => o.call_oi);
@@ -8523,7 +8525,12 @@ function renderInstModels(m, ind) {
   ).join('');
 }
 
-async function fetchState() { try { updateUI(await (await fetch('/api/state')).json()); } catch(e){} }
+async function fetchState() {
+  try {
+    const data = await (await fetch('/api/state')).json();
+    try { updateUI(data); } catch(e) { console.error('updateUI error:', e); }
+  } catch(e) { console.warn('fetchState error:', e.message); }
+}
 async function manualRefresh() { await fetch('/api/refresh'); setTimeout(fetchState,2000); }
 showChartTab('price');
 fetchState();
