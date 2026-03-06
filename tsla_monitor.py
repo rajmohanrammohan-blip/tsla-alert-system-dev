@@ -6409,7 +6409,6 @@ DASHBOARD_HTML = """
   .bullish { color:var(--green); } .bearish { color:var(--red); } .neutral { color:var(--amber); }
   .dot-bull { background:var(--green); } .dot-bear { background:var(--red); } .dot-neut { background:var(--amber); }
 
-  .chart-panel { display:flex; flex-direction:column; height:420px; min-height:420px; }
 
   /* ── DV 2.0 Ticker Dropdown ── */
   #tickerDropdown { font-family:var(--font-mono); }
@@ -6492,464 +6491,11 @@ DASHBOARD_HTML = """
   #nhlHighScroll:hover, #nhlLowScroll:hover { animation-play-state: paused; }
 
 </style>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <script>
 function updateClock() { var el=document.getElementById('clock'); if(el) el.textContent = new Date().toLocaleTimeString('en-US',{hour12:false}); }
 setInterval(updateClock,1000); updateClock();
 
-// Register ChartAnnotation plugin when available
-function registerAnnotationPlugin() {
-  try {
-    if(typeof ChartAnnotation !== 'undefined') {
-      Chart.register(ChartAnnotation);
-    } else if(window['chartjs-plugin-annotation']) {
-      Chart.register(window['chartjs-plugin-annotation']);
-    }
-  } catch(e) { console.warn('ChartAnnotation:', e.message); }
-}
-registerAnnotationPlugin();
-document.addEventListener('DOMContentLoaded', registerAnnotationPlugin);
 
-const CHART_DEFAULTS = {
-  responsive:true, maintainAspectRatio:false,
-  plugins:{legend:{display:false}},
-  scales:{
-    x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:9},maxTicksLimit:10}},
-    y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:9},callback:v=>'$'+v.toFixed(0)}}
-  }
-};
-
-// -- Price Chart - with annotation support for all buy/sell levels --
-let chart = null;
-function initChart() {
-  if(chart) return;
-  if(typeof Chart === 'undefined') { setTimeout(initChart, 100); return; }
-  const _prc = document.getElementById('priceChart');
-  const ctx = _prc ? _prc.getContext('2d') : null;
-  if(!ctx) { setTimeout(initChart, 100); return; }
-  try { chart = new Chart(ctx, {
-  type:'line',
-  data:{labels:[],datasets:[{label:'TSLA',data:[],borderColor:'#00ff88',borderWidth:2,pointRadius:0,fill:true,
-    backgroundColor:(c)=>{const g=c.chart.ctx.createLinearGradient(0,0,0,300);g.addColorStop(0,'rgba(0,255,136,0.15)');g.addColorStop(1,'rgba(0,255,136,0)');return g;},tension:0.3}]},
-  options:{
-    ...CHART_DEFAULTS,
-    plugins:{
-      legend:{display:false},
-      // annotation plugin removedted dynamically by updateChartAnnotations()
-    }
-  }
-});
-
-// -- Ichimoku Chart --
-const _ich=document.getElementById('ichimokuChart'); const ichCtx=_ich?_ich.getContext('2d'):null;
-let ichimokuChart = null; if(ichCtx) ichimokuChart = new Chart(ichCtx, {
-  type:'line',
-  data:{labels:[],datasets:[
-    {label:'Close',     data:[], borderColor:'#fff',        borderWidth:2, pointRadius:0, tension:0.3, fill:false, order:1},
-    {label:'Tenkan',    data:[], borderColor:'#ff6688',     borderWidth:1, pointRadius:0, tension:0.3, fill:false, order:2},
-    {label:'Kijun',     data:[], borderColor:'#4488ff',     borderWidth:1, pointRadius:0, tension:0.3, fill:false, order:3},
-    {label:'Span A',    data:[], borderColor:'rgba(0,255,136,0.6)', borderWidth:1, pointRadius:0, tension:0.3,
-      fill:'+1', backgroundColor:'rgba(0,255,136,0.08)', order:4},
-    {label:'Span B',    data:[], borderColor:'rgba(255,51,85,0.6)',  borderWidth:1, pointRadius:0, tension:0.3,
-      fill:false, backgroundColor:'rgba(255,51,85,0.08)', order:5},
-  ]},
-  options:{
-    ...CHART_DEFAULTS,
-    plugins:{legend:{display:true, labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:20}}},
-  }
-});
-
-// -- HMM Chart --
-const _hmm=document.getElementById('hmmChart'); const hmmCtx=_hmm?_hmm.getContext('2d'):null;
-let hmmChart = null; if(hmmCtx) hmmChart = new Chart(hmmCtx, {
-  type:'bar',
-  data:{labels:[],datasets:[{label:'Daily Return (%)',data:[],backgroundColor:[],borderWidth:0,borderRadius:2}]},
-  options:{
-    responsive:true, maintainAspectRatio:false,
-    plugins:{legend:{display:false},
-      tooltip:{callbacks:{label:ctx=>`${ctx.parsed.y.toFixed(2)}% - ${ctx.dataset.regimes?ctx.dataset.regimes[ctx.dataIndex]:''}`}}},
-    scales:{
-      x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:12}},
-      y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:9},callback:v=>v.toFixed(1)+'%'}}
-    }
-  }
-}); } catch(e) { console.error('Chart init failed:', e.message, e.stack); }
-}
-initChart();
-setTimeout(initChart, 500);
-
-// -- UOA Heatmap Chart --
-const _uoa=document.getElementById('uoaHeatmapChart'); const uoaHeatCtx=_uoa?_uoa.getContext('2d'):null;
-let uoaHeatChart = null; if(uoaHeatCtx) uoaHeatChart = new Chart(uoaHeatCtx, {
-  type:'bar',
-  data:{ labels:[], datasets:[
-    { label:'Call Premium ($K)', data:[], backgroundColor:'rgba(0,255,136,0.7)', borderWidth:0, borderRadius:2, stack:'s' },
-    { label:'Put Premium ($K)',  data:[], backgroundColor:'rgba(255,51,85,0.7)',  borderWidth:0, borderRadius:2, stack:'s' },
-  ]},
-  options:{ responsive:true, maintainAspectRatio:false,
-    plugins:{ legend:{ display:true, labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:12}}},
-    scales:{
-      x:{ stacked:true, grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:16}},
-      y:{ stacked:true, position:'right', grid:{color:'#1e2540'},
-          ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>v>=1000?(v/1000).toFixed(0)+'K':'$'+v}}
-    }
-  }
-});
-
-// -- Volatility Chart --
-const _vol=document.getElementById('volChart'); const volCtx=_vol?_vol.getContext('2d'):null;
-let volChart = null; if(volCtx) volChart = new Chart(volCtx, {
-  type:'line',
-  data:{ labels:[], datasets:[
-    { label:'Realised Vol %', data:[], borderColor:'#00ff88', borderWidth:2,
-      backgroundColor:'rgba(0,255,136,0.08)', fill:true, pointRadius:0, tension:0.4 }
-  ]},
-  options:{ responsive:true, maintainAspectRatio:false,
-    plugins:{ legend:{display:false} },
-    scales:{
-      x:{ grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:10}},
-      y:{ position:'right', grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>v.toFixed(0)+'%'}}
-    }
-  }
-});
-
-// -- Intraday Chart --
-const _intra=document.getElementById('intradayChart'); const intradayCtx=_intra?_intra.getContext('2d'):null;
-let intradayChart = null; if(intradayCtx) intradayChart = new Chart(intradayCtx, {
-  type:'line',
-  data:{ labels:[], datasets:[
-    { label:'Price', data:[], borderColor:'#40c4ff', borderWidth:1.5,
-      pointRadius:0, fill:false, tension:0,
-      segment:{ borderColor: ctx => {
-        const raw = ctx.chart.data.datasets[0]._sessionColors;
-        return raw ? raw[ctx.p1DataIndex] : '#40c4ff';
-      }}
-    }
-  ]},
-  options:{ responsive:true, maintainAspectRatio:false,
-    plugins:{ legend:{display:false},
-      annotation:{ annotations:{
-        regStart:{ type:'line', scaleID:'x', value:0, borderColor:'rgba(0,255,136,0.3)', borderWidth:1, label:{content:'Open',display:false}},
-        regEnd:  { type:'line', scaleID:'x', value:0, borderColor:'rgba(255,193,7,0.3)',  borderWidth:1, label:{content:'Close',display:false}},
-      }}
-    },
-    scales:{
-      x:{ grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:12}},
-      y:{ position:'right', grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>'$'+v.toFixed(0)}}
-    }
-  }
-});
-
-
-// -- SPY Price Chart --
-const _spy=document.getElementById('spyChart'); const spyCtx=_spy?_spy.getContext('2d'):null;
-let spyChart = null; if(spyCtx) spyChart = new Chart(spyCtx, {
-  type:'line',
-  data:{ labels:[], datasets:[
-    { label:'SPY',  data:[], borderColor:'#29b6f6', borderWidth:2, pointRadius:0, fill:false, tension:0.3 },
-    { label:'EMA20',data:[], borderColor:'rgba(255,193,7,0.7)', borderWidth:1, pointRadius:0, fill:false, borderDash:[4,4] },
-    { label:'EMA50', data:[], borderColor:'rgba(255,100,50,0.7)', borderWidth:1, pointRadius:0, fill:false, borderDash:[4,4] },
-  ]},
-  options:{ responsive:true, maintainAspectRatio:false,
-    plugins:{ legend:{ display:true, labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:16}}},
-    scales:{
-      x:{ grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:10}},
-      y:{ position:'right', grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>'$'+v.toFixed(0)}}
-    }
-  }
-});
-
-// -- Relative Strength Chart --
-const _rs=document.getElementById('rsChart'); const rsCtx=_rs?_rs.getContext('2d'):null;
-let rsChart = null; if(rsCtx) rsChart = new Chart(rsCtx, {
-  type:'line',
-  data:{ labels:[], datasets:[
-    { label:'TSLA', data:[], borderColor:'#00ff88', borderWidth:2, pointRadius:0, fill:false, tension:0.3 },
-    { label:'SPY',  data:[], borderColor:'#29b6f6', borderWidth:2, pointRadius:0, fill:false, tension:0.3 },
-    { label:'QQQ',  data:[], borderColor:'#ffd600', borderWidth:1.5, pointRadius:0, fill:false, tension:0.3, borderDash:[4,4] },
-  ]},
-  options:{ responsive:true, maintainAspectRatio:false,
-    plugins:{ legend:{ display:true, labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:16}},
-      annotation:{annotations:[{type:'line',yMin:100,yMax:100,borderColor:'rgba(255,255,255,0.15)',borderWidth:1}]}
-    },
-    scales:{
-      x:{ grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:10}},
-      y:{ position:'right', grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>v.toFixed(0)}}
-    }
-  }
-});
-
-// -- GEX by Strike Chart --
-const _gex=document.getElementById('gexChart'); const gexCtx=_gex?_gex.getContext('2d'):null;
-let gexChart = null; if(gexCtx) gexChart = new Chart(gexCtx, {
-  type: 'bar',
-  data: { labels:[], datasets:[{ label:'GEX ($M)', data:[], backgroundColor:[], borderWidth:0, borderRadius:2 }]},
-  options:{ responsive:true, maintainAspectRatio:false,
-    plugins:{ legend:{display:false}, annotation:{} },
-    scales:{
-      x:{ grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:14} },
-      y:{ position:'right', grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},
-          callback:v=>v.toFixed(0)+'M'} }
-    }
-  }
-});
-
-// -- OI by Strike Chart --
-const _oi=document.getElementById('oiChart'); const oiCtx=_oi?_oi.getContext('2d'):null;
-let oiChart = null; if(oiCtx) oiChart = new Chart(oiCtx, {
-  type: 'bar',
-  data: { labels:[], datasets:[
-    { label:'Call OI', data:[], backgroundColor:'rgba(255,51,85,0.6)',  borderWidth:0, borderRadius:2 },
-    { label:'Put OI',  data:[], backgroundColor:'rgba(0,255,136,0.6)',  borderWidth:0, borderRadius:2 },
-  ]},
-  options:{ responsive:true, maintainAspectRatio:false,
-    plugins:{ legend:{ display:true, labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:16} }},
-    scales:{
-      x:{ grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:14} },
-      y:{ position:'right', grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},
-          callback:v=>v>=1e3?(v/1e3).toFixed(0)+'K':v} }
-    }
-  }
-});
-
-
-// -- VIX Chart --
-const _vix=document.getElementById('vixChart'); const vixCtx=_vix?_vix.getContext('2d'):null;
-let vixChart = null; if(vixCtx) vixChart = new Chart(vixCtx, {
-  type: 'line',
-  data: { labels:[], datasets:[
-    { label:'VIX', data:[], borderColor:'#ff6d00', backgroundColor:'rgba(255,109,0,0.08)', borderWidth:2, pointRadius:0, tension:0.3, fill:true },
-  ]},
-  options:{ responsive:true, maintainAspectRatio:false,
-    plugins:{ legend:{display:false},
-      annotation:{ annotations:{
-        fear25:{ type:'line', yMin:25, yMax:25, borderColor:'rgba(255,51,85,0.5)', borderWidth:1, borderDash:[4,4] },
-        fear18:{ type:'line', yMin:18, yMax:18, borderColor:'rgba(255,180,0,0.5)', borderWidth:1, borderDash:[4,4] },
-      }}
-    },
-    scales:{
-      x:{ grid:{color:'#1e2540'}, ticks:{color:'#4a5280', font:{family:'Share Tech Mono',size:8}, maxTicksLimit:10} },
-      y:{ position:'right', grid:{color:'#1e2540'}, ticks:{color:'#4a5280', font:{family:'Share Tech Mono',size:8}} }
-    }
-  }
-});
-
-// -- MACD Line Chart --
-const _ml=document.getElementById('macdLineChart'); const macdLineCtx=_ml?_ml.getContext('2d'):null;
-let macdLineChart = null; if(macdLineCtx) macdLineChart = new Chart(macdLineCtx, {
-  type: 'line',
-  data: { labels: [], datasets: [
-    { label:'MACD',   data:[], borderColor:'#00aaff', borderWidth:2, pointRadius:0, fill:false, tension:0.3 },
-    { label:'Signal', data:[], borderColor:'#ff8800', borderWidth:1, pointRadius:0, fill:false, tension:0.3 },
-  ]},
-  options: { ...CHART_DEFAULTS,
-    plugins:{ legend:{ display:true, labels:{ color:'#6070a0', font:{family:'Share Tech Mono',size:9}, boxWidth:20 }}},
-    scales:{ x:{ grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:10} },
-             y:{ position:'right', grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8}} }}
-  }
-});
-
-// -- MACD Histogram --
-const _mh=document.getElementById('macdHistChart'); const macdHistCtx=_mh?_mh.getContext('2d'):null;
-let macdHistChart = null; if(macdHistCtx) macdHistChart = new Chart(macdHistCtx, {
-  type: 'bar',
-  data: { labels:[], datasets:[{ label:'Histogram', data:[], backgroundColor:[], borderWidth:0, borderRadius:1 }]},
-  options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}},
-    scales:{ x:{ display:false },
-             y:{ position:'right', grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8}} }}
-  }
-});
-
-// -- Volume Bars Chart --
-const _vb=document.getElementById('volBarsChart'); const volBarsCtx=_vb?_vb.getContext('2d'):null;
-let volBarsChart = null; if(volBarsCtx) volBarsChart = new Chart(volBarsCtx, {
-  type: 'bar',
-  data: { labels:[], datasets:[{ label:'Volume', data:[], backgroundColor:[], borderWidth:0, borderRadius:1 }]},
-  options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}},
-    scales:{ x:{ grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:12} },
-             y:{ position:'right', grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},
-               callback:v => v>=1e6?(v/1e6).toFixed(0)+'M':v>=1e3?(v/1e3).toFixed(0)+'K':v }}
-    }
-  }
-});
-
-// -- Volume Profile (horizontal bar - price vs volume) --
-const _vp=document.getElementById('volProfileChart'); const volProfileCtx=_vp?_vp.getContext('2d'):null;
-let volProfileChart = null; if(volProfileCtx) volProfileChart = new Chart(volProfileCtx, {
-  type: 'bar',
-  data: { labels:[], datasets:[{ label:'Vol @ Price', data:[], backgroundColor:'rgba(201,168,76,0.5)', borderWidth:0, borderRadius:1 }]},
-  options: { responsive:true, maintainAspectRatio:false, indexAxis:'y',
-    plugins:{ legend:{display:false}, tooltip:{ callbacks:{ label: ctx=>'Vol: '+(ctx.parsed.x/1e6).toFixed(1)+'M' }}},
-    scales:{ x:{ grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:7},
-               callback:v => (v/1e6).toFixed(0)+'M'} },
-             y:{ grid:{display:false}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:7}} }}
-  }
-});
-
-// -- Chart Tab Switcher --
-
-function showChartTab(tab) {
-  const allTabs = ['price','ichimoku','hmm','macd','volume'];
-  allTabs.forEach(t => {
-    const chartId = 'chart' + t.charAt(0).toUpperCase() + t.slice(1);
-    const el = document.getElementById(chartId);
-    if(el) el.style.display = t===tab ? 'flex' : 'none';
-    const btn = document.getElementById('tab' + t.charAt(0).toUpperCase() + t.slice(1));
-    if(btn) {
-      btn.style.borderBottomColor = t===tab ? 'var(--green)' : 'transparent';
-      btn.style.color = t===tab ? 'var(--green)' : 'var(--text-dim)';
-    }
-  });
-}
-
-function setText(id,v){const e=document.getElementById(id);if(e)e.textContent=v;}
-
-function setDot(id,k){const e=document.getElementById(id);if(e)e.className='ind-dot dot-'+k.slice(0,4);}
-
-function colorClass(s){return s==='BUY'?'bullish':s==='SELL'?'bearish':'neutral';}
-
-function badgeClass(a){return a.includes('RECENT')?'badge-recent':a.includes('QUARTERLY')?'badge-quarter':'badge-old';}
-
-function regimeDot(r){return r==='BULLISH'?'bull':r==='BEARISH'?'bear':'neut';}
-
-
-// ---------------------------------------------------------------
-//  updateChartAnnotations(s)
-//  Draws every buy/sell/tranche/support/resistance/stop level
-//  directly onto the TSLA price chart as labelled horizontal lines.
-//
-//  Lines drawn:
-//    - BUY TRANCHES    - T1/T2/T3 entry prices (solid green)
-//    - SELL TRANCHES   - T1/T2/T3 exit prices  (solid red/orange/gold)
-//    - HARD STOP       - invalidation / stop loss (dashed red)
-//    - RESISTANCE      - historical ceiling levels (dashed orange)
-//    - SUPPORT         - historical floor levels   (dashed green dim)
-//    - MAX PAIN        - options max pain level    (dashed purple)
-// ---------------------------------------------------------------
-
-function updateChartAnnotations(s) {
-  if(!chart?.options?.plugins?.annotation) return;
-
-  const annotations = {};
-  let idx = 0;
-  const price = s.price || 0;
-
-  // Helper: make a horizontal annotation line + label
-  function hLine(key, yVal, color, label, dash, labelPos, labelBg) {
-    if(!yVal || isNaN(yVal)) return;
-    annotations[key] = {
-      type:        'line',
-      yMin:        yVal,
-      yMax:        yVal,
-      borderColor: color,
-      borderWidth: dash ? 1.5 : 2,
-      borderDash:  dash ? [5,4] : [],
-      label: {
-        display:         true,
-        content:         label,
-        position:        labelPos || 'start',
-        backgroundColor: labelBg  || color + '22',
-        color:           color,
-        font:            { family:'Share Tech Mono', size:9, weight:'bold' },
-        padding:         { x:6, y:3 },
-        borderRadius:    2,
-        xAdjust:         6,
-      }
-    };
-  }
-
-  // -- - BUY ENTRY TRANCHES --
-  const en = s.entry_data || {};
-  const tp = en.tranche_plan || [];
-  const entryColors = ['#00ff88','#69f0ae','#b9f6ca'];
-  tp.forEach((t,i) => {
-    if(t.price) hLine(
-      `buyT${i+1}`, t.price,
-      entryColors[i] || '#00ff88',
-      `- BUY T${i+1} ${t.pct_cap}% @ $${t.price}`,
-      false, 'start', '#00ff8811'
-    );
-  });
-
-  // Entry invalidation (hard stop for longs)
-  if(en.invalidation) hLine(
-    'entryStop', en.invalidation,
-    '#ff1744',
-    `- Invalidation $${en.invalidation}`,
-    true, 'end', '#ff174411'
-  );
-
-  // -- - SELL EXIT TRANCHES --
-  const ex = s.exit_data?.exit_analysis || {};
-  const st = ex.sell_tranches || [];
-  const sellColors = ['#ffd600','#ff6d00','#ff1744'];
-  st.forEach((t,i) => {
-    if(t.price) hLine(
-      `sellT${i+1}`, t.price,
-      sellColors[i] || '#ff6d00',
-      `- SELL T${i+1} ${t.pct_holding}% @ $${t.price} (+${t.gain_pct}%)`,
-      false, 'end', sellColors[i]+'11'
-    );
-    // Trailing stop for each tranche (dashed)
-    if(t.trailing_stop && t.trailing_stop < price) hLine(
-      `trailStop${i+1}`, t.trailing_stop,
-      '#ff174488',
-      `trail $${t.trailing_stop}`,
-      true, 'end', '#00000000'
-    );
-  });
-
-  // Hard stop loss
-  if(ex.stop_loss) hLine(
-    'hardStop', ex.stop_loss,
-    '#ff1744',
-    `- Stop $${ex.stop_loss}`,
-    true, 'start', '#ff174411'
-  );
-
-  // -- - RESISTANCE LEVELS (top 3 above price) --
-  const resAbove = (ex.resistance_above || s.exit_data?.resistance?.levels_above || []).slice(0,3);
-  resAbove.forEach((r,i) => {
-    hLine(
-      `res${i}`, r,
-      i === 0 ? '#ff9800' : '#ff980055',
-      i === 0 ? `- Resistance $${r}` : `$${r}`,
-      true, 'end', '#ff980008'
-    );
-  });
-
-  // -- - SUPPORT LEVELS (nearest 2 below price) --
-  const supBelow = (en.support_levels || []).slice(-2);
-  supBelow.forEach((s2,i) => {
-    hLine(
-      `sup${i}`, s2,
-      '#00ff8844',
-      `- Support $${s2}`,
-      true, 'start', '#00ff8808'
-    );
-  });
-
-  // -- - MAX PAIN --
-  const maxPain = s.mm_data?.max_pain;
-  if(maxPain) hLine(
-    'maxPain', maxPain,
-    '#ce93d8',
-    `- Max Pain $${maxPain}`,
-    true, 'end', '#ce93d811'
-  );
-
-  // -- Current price marker (always visible) --
-  if(price) hLine(
-    'currentPrice', price,
-    'rgba(255,255,255,0.3)',
-    `NOW $${price.toFixed(2)}`,
-    true, 'start', '#00000000'
-  );
-
-  // Apply to chart
-  chart.options.plugins.annotation.annotations = annotations;
-  chart.update('none');
-}
 
 // ---------------------------------------------------------------
 //  updateTickerBar(s)
@@ -7088,12 +6634,7 @@ function updateUI(s) {
 
   // -- Price Chart + Annotations --
   if(s.price_history?.length) {
-    chart.data.labels = s.price_history.map(p=>p.date.slice(5));
-    chart.data.datasets[0].data = s.price_history.map(p=>p.price);
     // Annotations drawn AFTER data so y-axis range is correct
-    updateChartAnnotations(s);
-    chart.resize();
-    chart.update('none');
   }
 
   // -- Live Ticker Bar --
@@ -7102,34 +6643,18 @@ function updateUI(s) {
   // -- MACD Charts --
   if(s.macd_history?.length) {
     const mh = s.macd_history;
-    macdLineChart.data.labels = mh.map(m=>m.date.slice(5));
-    macdLineChart.data.datasets[0].data = mh.map(m=>m.macd);
-    macdLineChart.data.datasets[1].data = mh.map(m=>m.signal);
-    macdLineChart.update('none');
-    macdHistChart.data.labels = mh.map(m=>m.date.slice(5));
-    macdHistChart.data.datasets[0].data = mh.map(m=>m.hist);
-    macdHistChart.data.datasets[0].backgroundColor = mh.map(m=>m.color+'cc');
-    macdHistChart.update('none');
   }
 
   // -- Volume Charts --
   if(s.vol_history?.length) {
     const vh = s.vol_history;
-    volBarsChart.data.labels = vh.map(v=>v.date.slice(5));
-    volBarsChart.data.datasets[0].data = vh.map(v=>v.volume);
-    volBarsChart.data.datasets[0].backgroundColor = vh.map(v=>v.color+'99');
-    volBarsChart.update('none');
   }
   if(s.vol_profile?.length) {
     const vp = s.vol_profile;
-    volProfileChart.data.labels = vp.map(v=>'$'+v.price_mid);
-    volProfileChart.data.datasets[0].data = vp.map(v=>v.volume);
     // Highlight the POC (Point of Control - highest volume price)
     const maxVol = Math.max(...vp.map(v=>v.volume));
-    volProfileChart.data.datasets[0].backgroundColor = vp.map(v=>
       v.volume === maxVol ? '#c9a84c' : 'rgba(201,168,76,0.35)'
     );
-    volProfileChart.update('none');
   }
 
   // -- Volume indicators --
@@ -7146,30 +6671,8 @@ function updateUI(s) {
   }
 
   // -- Ichimoku Cloud Chart --
-  if(typeof ichimokuChart!=='undefined' && ichimokuChart && ichi.history?.length) {
-    try {
-      var ih = ichi.history;
-      ichimokuChart.data.labels = ih.map(p=>p.date.slice(5));
-      ichimokuChart.data.datasets[0].data = ih.map(p=>p.close);
-      ichimokuChart.data.datasets[1].data = ih.map(p=>p.tenkan);
-      ichimokuChart.data.datasets[2].data = ih.map(p=>p.kijun);
-      ichimokuChart.data.datasets[3].data = ih.map(p=>p.span_a);
-      ichimokuChart.data.datasets[4].data = ih.map(p=>p.span_b);
-      ichimokuChart.update('none');
-    } catch(e) { console.warn('ichimokuChart:', e.message); }
-  }
 
   // -- HMM Regime Chart --
-  if(typeof hmmChart!=='undefined' && hmmChart && hmm.history?.length) {
-    try {
-      var hh = hmm.history;
-      hmmChart.data.labels = hh.map((h,i)=>i%5===0?i:'');
-      hmmChart.data.datasets[0].data = hh.map(h=>h.return);
-      hmmChart.data.datasets[0].backgroundColor = hh.map(h=>h.color+'99');
-      hmmChart.data.datasets[0].regimes = hh.map(h=>h.state);
-      hmmChart.update('none');
-    } catch(e) { console.warn('hmmChart:', e.message); }
-  }
 
   // -- Alert Log --
   // -- Alert log with richer display --
@@ -7342,13 +6845,6 @@ function renderUOAPanel(uoa) {
   }
 
   // -- Premium heatmap chart --
-  if(uoa.strike_heatmap?.length && typeof uoaHeatChart !== 'undefined') {
-    const hm = uoa.strike_heatmap;
-    uoaHeatChart.data.labels              = hm.map(h => '$'+h.strike);
-    uoaHeatChart.data.datasets[0].data   = hm.map(h => Math.round(h.call_premium/1000));
-    uoaHeatChart.data.datasets[1].data   = hm.map(h => -Math.round(h.put_premium/1000)); // negative for visual split
-    uoaHeatChart.update('none');
-  }
 
   // -- Add UOA to ticker bar (most active strike) --
   if(uoa.total_unusual > 0 || (uoa.whale_alerts||[]).length > 0) {
@@ -7728,9 +7224,6 @@ function renderCTAPanel(sz, price) {
   // Vol chart
   if(sz.vol_history?.length && volChart) {
     const vh = sz.vol_history;
-    volChart.data.labels = vh.map(v => v.date.slice(5));
-    volChart.data.datasets[0].data = vh.map(v => v.vol);
-    volChart.update('none');
   }
 }
 
@@ -7816,9 +7309,6 @@ function renderExtPanel(ext) {
 
   // Intraday chart
   if(ext.intraday_history?.length) {
-    intradayChart.data.labels = ext.intraday_history.map(b => b.dt);
-    intradayChart.data.datasets[0].data = ext.intraday_history;
-    intradayChart.update('none');
   }
 }
 
@@ -7996,21 +7486,8 @@ function renderSPYPanel(spy) {
   }
 
   // RS chart
-  if(spy.rs_history?.length && rsChart) {
-    const rsh = spy.rs_history;
-    rsChart.data.labels = rsh.map(r => r.date?.slice(5));
-    rsChart.data.datasets[0].data = rsh.map(r => r.tsla);
-    rsChart.data.datasets[1].data = rsh.map(r => r.spy);
-    rsChart.data.datasets[2].data = rsh.map(r => r.qqq || null);
-    rsChart.update('none');
-  }
 
   // VIX chart
-  if(false && spy.vix_history?.length && vixChart) { // vixChart removed
-    const vh = spy.vix_history;
-    vixChart.data.labels = vh.map(v => v.date?.slice(5));
-    vixChart.data.datasets[0].data = vh.map(v => v.vix);
-    vixChart.update('none');
   }
 
   // Macro reasons chips
@@ -8091,19 +7568,11 @@ function renderMMPanel(mm, dp, price) {
   // -- GEX Chart --
   if(mm.gex_by_strike?.length) {
     const gs = mm.gex_by_strike;
-    if(gexChart) { gexChart.data.labels = gs.map(g => '$' + g.strike);
-    gexChart.data.datasets[0].data = gs.map(g => g.gex);
-    gexChart.data.datasets[0].backgroundColor = gs.map(g => g.color + 'bb');
-    gexChart.update('none'); }
   }
 
   // -- OI Chart --
   if(mm.oi_by_strike?.length) {
     const os = mm.oi_by_strike;
-    oiChart.data.labels = os.map(o => '$' + o.strike);
-    oiChart.data.datasets[0].data = os.map(o => o.call_oi);
-    oiChart.data.datasets[1].data = os.map(o => o.put_oi);
-    oiChart.update('none');
   }
 
   // -- Dark Pool Levels --
@@ -8507,13 +7976,10 @@ function renderInstModels(m, ind) {
 
 async function fetchState() { try { updateUI(await (await fetch('/api/state')).json()); } catch(e){} }
 async function manualRefresh() { await fetch('/api/refresh'); setTimeout(fetchState,2000); }
-showChartTab('price');
 fetchState();
 setInterval(fetchState,10000);
 setTimeout(fetchState, 5000);
 setTimeout(fetchState, 15000);
-setTimeout(function(){ if(chart){ chart.resize(); chart.update(); } }, 300);
-setTimeout(function(){ if(chart){ chart.resize(); chart.update(); } }, 2000);
 
 
 // --------------------------------------------------------------
@@ -9686,29 +9152,7 @@ setTimeout(pollSpockStatus, 5000);
 
 
   <!-- CHART + NHL ROW — chart:3fr | NHL:340px -->
-  <div style="display:grid;grid-template-columns:3fr 340px;gap:1px;background:var(--border);">
-
-    <!-- LEFT: Chart -->
-    <div class="panel chart-panel" style="display:flex;flex-direction:column;min-height:400px;">
-      <div style="display:flex;gap:0;margin-bottom:12px;border-bottom:1px solid var(--border);">
-        <button id="tabPrice" onclick="showChartTab('price')" style="background:none;border:none;border-bottom:2px solid var(--green);color:var(--green);font-family:var(--font-mono);font-size:10px;letter-spacing:2px;padding:8px 16px;cursor:pointer;margin-bottom:-1px;">PRICE</button>
-        <button id="tabIchimoku" onclick="showChartTab('ichimoku')" style="background:none;border:none;border-bottom:2px solid transparent;color:var(--text-dim);font-family:var(--font-mono);font-size:10px;letter-spacing:2px;padding:8px 16px;cursor:pointer;margin-bottom:-1px;">ICHIMOKU CLOUD</button>
-        <button id="tabHMM" onclick="showChartTab('hmm')" style="background:none;border:none;border-bottom:2px solid transparent;color:var(--text-dim);font-family:var(--font-mono);font-size:10px;letter-spacing:2px;padding:8px 16px;cursor:pointer;margin-bottom:-1px;">HMM REGIMES</button>
-        <button id="tabMacd" onclick="showChartTab('macd')" style="background:none;border:none;border-bottom:2px solid transparent;color:var(--text-dim);font-family:var(--font-mono);font-size:10px;letter-spacing:2px;padding:8px 16px;cursor:pointer;margin-bottom:-1px;">MACD</button>
-        <button id="tabVolume" onclick="showChartTab('volume')" style="background:none;border:none;border-bottom:2px solid transparent;color:var(--text-dim);font-family:var(--font-mono);font-size:10px;letter-spacing:2px;padding:8px 16px;cursor:pointer;margin-bottom:-1px;">VOLUME</button>
-      </div>
-      <div id="chartPrice"    style="flex:1;position:relative;height:340px;min-height:340px;"><canvas id="priceChart" width="800" height="340" style="width:100%;display:block;"></canvas></div>
-      <div id="chartIchimoku" style="flex:1;position:relative;display:none;"><canvas id="ichimokuChart"></canvas></div>
-      <div id="chartHmm"      style="flex:1;position:relative;display:none;"><canvas id="hmmChart"></canvas></div>
-      <div id="chartMacd"     style="flex:1;position:relative;display:none;flex-direction:column;gap:4px;">
-        <canvas id="macdLineChart" style="flex:1;"></canvas>
-        <canvas id="macdHistChart" style="flex:0 0 80px;"></canvas>
-      </div>
-      <div id="chartVolume"   style="flex:1;position:relative;display:none;flex-direction:column;gap:4px;">
-        <canvas id="volBarsChart"   style="flex:1;"></canvas>
-        <canvas id="volProfileChart" style="flex:0 0 100px;"></canvas>
-      </div>
-    </div>
+  <div style="display:grid;grid-template-columns:1fr;gap:1px;background:var(--border);">
 
     <!-- RIGHT: Intraday New Highs / New Lows -->
     <div id="nhl-panel" style="background:var(--bg2);display:flex;flex-direction:column;overflow:hidden;">
@@ -10397,7 +9841,7 @@ setTimeout(pollSpockStatus, 5000);
       <!-- Strike premium heatmap (Chart.js bar) -->
       <div style="background:var(--bg3);border:1px solid var(--border);padding:14px;border-radius:2px;">
         <div style="font-size:9px;letter-spacing:2px;color:#b388ff;margin-bottom:8px;text-transform:uppercase;">💰 Premium by Strike — Call vs Put Flow</div>
-        <div style="position:relative;height:180px;"><canvas id="uoaHeatmapChart"></canvas></div>
+        
       </div>
 
       <!-- Flow reasons + legend -->
