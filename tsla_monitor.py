@@ -29,7 +29,7 @@ import pandas as pd
 import numpy as np
 
 def _yf_history(symbol, retries=3, **kwargs):
-    """yfinance with retry. Never injects session objects (breaks 0.2.x+ curl_cffi)."""
+    """yfinance retry — no session injection (breaks 0.2.x+ curl_cffi)."""
     for attempt in range(retries):
         try:
             df = yf.Ticker(symbol).history(**kwargs)
@@ -4382,17 +4382,18 @@ def run_analysis():
                 hist = _yf_history(TICKER, period="6mo", interval="1d")
                 if hist is not None and not hist.empty:
                     break
-                print(f"  ⚠️ yfinance empty data (attempt {_attempt+1}/3)")
+                print(f"  yfinance empty (attempt {_attempt+1}/3)")
                 hist = None
                 time.sleep(3)
             except Exception as _ye:
-                print(f"  ⚠️ yfinance error (attempt {_attempt+1}/3): {str(_ye)[:120]}")
+                print(f"  yfinance error (attempt {_attempt+1}/3): {str(_ye)[:120]}")
                 hist = None
                 time.sleep(3 + _attempt * 2)
         if hist is None or hist.empty:
-            print(f"[FATAL] Could not fetch {TICKER} data after 3 attempts — dashboard will retry next cycle", flush=True)
+            print(f"[FATAL] Could not fetch {TICKER} data — will retry next cycle", flush=True)
             state.update({"signal": "WAIT", "price": state.get("price", 0),
-                          "market_state": "DATA UNAVAILABLE", "last_updated": datetime.now().strftime("%H:%M:%S"),
+                          "market_state": "DATA UNAVAILABLE",
+                          "last_updated": datetime.now().strftime("%H:%M:%S"),
                           "signal_strength": 0})
             return
         closes  = hist["Close"]
@@ -7062,14 +7063,14 @@ function updateTickerBar(s) {
 
 function updateUI(s) {
   // -- Signal Badge --
-  const badge = document.getElementById('signalBadge');
+  var badge = document.getElementById('signalBadge');
   if(badge){badge.textContent=s.signal||'--';badge.className='signal-badge '+(s.signal||'');}
-  const _pv=document.getElementById('priceVal');
+  var _pv=document.getElementById('priceVal');
   if(_pv)_pv.textContent=s.price?'$'+s.price.toLocaleString('en-US',{minimumFractionDigits:2}):'-';
-  const pct=s.signal_strength||0;
-  const fill=document.getElementById('strengthFill');
+  var pct=s.signal_strength||0;
+  var fill=document.getElementById('strengthFill');
   if(fill){fill.style.width=pct+'%';fill.style.background=s.signal==='BUY'?'#00ff88':s.signal==='SELL'?'#ff3355':'#ffb300';}
-  const _sv=document.getElementById('strengthVal');if(_sv)_sv.textContent=pct;
+  var _sv=document.getElementById('strengthVal');if(_sv)_sv.textContent=pct;
   // WhatsApp status badge
   const waEl = document.getElementById('waStatus');
   if(waEl) {
@@ -7116,22 +7117,22 @@ function updateUI(s) {
   setText('ind-hmm-next', hmm.next_regime ? hmm.next_regime+' ('+hmm.next_prob+'% prob)' : '-');
 
   // -- Price Chart + Annotations --
-  if(s.price_history?.length && chart) {
+  if(s.price_history && s.price_history.length && chart) {
     try {
       chart.data.labels = s.price_history.map(p=>p.date.slice(5));
       chart.data.datasets[0].data = s.price_history.map(p=>p.price);
       updateChartAnnotations(s);
       chart.update('none');
-    } catch(e) { console.warn('priceChart:', e.message); }
+    } catch(e) { console.warn('priceChart: ' + e.message); }
   }
 
   // -- Live Ticker Bar --
   updateTickerBar(s);
 
   // -- MACD Charts --
-  if(s.macd_history?.length && macdLineChart && macdHistChart) {
+  if(s.macd_history && s.macd_history.length && macdLineChart && macdHistChart) {
     try {
-      const mh = s.macd_history;
+      var mh = s.macd_history;
       macdLineChart.data.labels = mh.map(m=>m.date.slice(5));
       macdLineChart.data.datasets[0].data = mh.map(m=>m.macd);
       macdLineChart.data.datasets[1].data = mh.map(m=>m.signal);
@@ -7140,30 +7141,30 @@ function updateUI(s) {
       macdHistChart.data.datasets[0].data = mh.map(m=>m.hist);
       macdHistChart.data.datasets[0].backgroundColor = mh.map(m=>m.color+'cc');
       macdHistChart.update('none');
-    } catch(e) { console.warn('macdCharts:', e.message); }
+    } catch(e) { console.warn('macdCharts: ' + e.message); }
   }
 
   // -- Volume Charts --
-  if(s.vol_history?.length && volBarsChart) {
+  if(s.vol_history && s.vol_history.length && volBarsChart) {
     try {
-      const vh = s.vol_history;
+      var vh = s.vol_history;
       volBarsChart.data.labels = vh.map(v=>v.date.slice(5));
       volBarsChart.data.datasets[0].data = vh.map(v=>v.volume);
       volBarsChart.data.datasets[0].backgroundColor = vh.map(v=>v.color+'99');
       volBarsChart.update('none');
-    } catch(e) { console.warn('volBarsChart:', e.message); }
+    } catch(e) { console.warn('volBarsChart: ' + e.message); }
   }
-  if(s.vol_profile?.length && volProfileChart) {
+  if(s.vol_profile && s.vol_profile.length && volProfileChart) {
     try {
-      const vp = s.vol_profile;
+      var vp = s.vol_profile;
       volProfileChart.data.labels = vp.map(v=>'$'+v.price_mid);
       volProfileChart.data.datasets[0].data = vp.map(v=>v.volume);
-      const maxVol = Math.max(...vp.map(v=>v.volume));
+      var maxVol = Math.max.apply(null, vp.map(v=>v.volume));
       volProfileChart.data.datasets[0].backgroundColor = vp.map(v=>
         v.volume === maxVol ? '#c9a84c' : 'rgba(201,168,76,0.35)'
       );
       volProfileChart.update('none');
-    } catch(e) { console.warn('volProfileChart:', e.message); }
+    } catch(e) { console.warn('volProfileChart: ' + e.message); }
   }
 
   // -- Volume indicators --
@@ -7237,26 +7238,26 @@ function updateUI(s) {
   }
 
   // -- Institutional --
-  const _il=document.getElementById('instList');
-  if(_il)_il.innerHTML=s.institutional?.length
+  var _il=document.getElementById('instList');
+  if(_il)_il.innerHTML=s.institutional&&s.institutional.length
     ? s.institutional.map(i=>`<div class="inst-item"><div class="inst-name">${i.institution}</div><div class="inst-meta">Form ${i.form} - Filed ${i.date}</div><span class="inst-badge ${badgeClass(i.action)}">${i.action}</span></div>`).join('')
     : '<div class="no-alerts">Loading 13F data...</div>';
-  const _lu=document.getElementById('lastUpdated');if(_lu)_lu.textContent=s.last_updated?'Updated '+s.last_updated:'-';
+  var _lu=document.getElementById('lastUpdated');if(_lu)_lu.textContent=s.last_updated?'Updated '+s.last_updated:'-';
 
   [
-    ()=>renderExitPanel(s.exit_data||{}),
-    ()=>renderUOAPanel(s.uoa_data||{}),
-    ()=>{const pv=parseFloat(document.getElementById('portfolioInput')?.value||'100000')||100000;renderEntryPanel(s.entry_data||{},pv);},
-    ()=>renderPeakPanel(s.peak_data||{}),
-    ()=>renderCTAPanel(s.sizing||{},s.price||0),
-    ()=>renderExtPanel(s.ext_data||{}),
-    ()=>updateAlgoRadar(s),
-    ()=>renderNewsPanel(s.news_data||{}),
-    ()=>renderSPYPanel(s.spy_data||{}),
-    ()=>renderMMPanel(s.mm_data||{},s.dark_pool||{},s.price||0),
-    ()=>renderInstModels(s.institutional_models||{},s.indicators||{}),
-    ()=>{if(s.darthvader)renderDarthVader(s.darthvader);},
-  ].forEach((fn,i)=>{try{fn();}catch(e){console.warn('Panel['+i+']:',e.message);}});
+    function(){renderExitPanel(s.exit_data||{});},
+    function(){renderUOAPanel(s.uoa_data||{});},
+    function(){var pv=parseFloat((document.getElementById('portfolioInput')||{}).value||'100000')||100000;renderEntryPanel(s.entry_data||{},pv);},
+    function(){renderPeakPanel(s.peak_data||{});},
+    function(){renderCTAPanel(s.sizing||{},s.price||0);},
+    function(){renderExtPanel(s.ext_data||{});},
+    function(){updateAlgoRadar(s);},
+    function(){renderNewsPanel(s.news_data||{});},
+    function(){renderSPYPanel(s.spy_data||{});},
+    function(){renderMMPanel(s.mm_data||{},s.dark_pool||{},s.price||0);},
+    function(){renderInstModels(s.institutional_models||{},s.indicators||{});},
+    function(){if(s.darthvader)renderDarthVader(s.darthvader);},
+  ].forEach(function(fn,i){try{fn();}catch(e){console.warn('Panel['+i+']: '+e.message);}});
 }
 
 
@@ -7847,12 +7848,12 @@ function renderExtPanel(ext) {
     : '<div style="font-size:10px;color:var(--text-dim);">No extended hours signals</div>';
 
   // Intraday chart
-  if(ext.intraday_history?.length && intradayChart) {
+  if(ext.intraday_history && ext.intraday_history.length && intradayChart) {
     try {
       intradayChart.data.labels = ext.intraday_history.map(b => b.dt);
       intradayChart.data.datasets[0].data = ext.intraday_history;
       intradayChart.update('none');
-    } catch(e) { console.warn('intradayChart:', e.message); }
+    } catch(e) { console.warn('intradayChart: ' + e.message); }
   }
 }
 
@@ -8043,10 +8044,10 @@ function renderSPYPanel(spy) {
   if(false && spy.vix_history?.length && vixChart) { // vixChart removed
     const vh = spy.vix_history;
     if(vixChart) { try {
-      vixChart.data.labels = vh.map(v => v.date?.slice(5));
+      vixChart.data.labels = vh.map(v => v.date ? v.date.slice(5) : '');
       vixChart.data.datasets[0].data = vh.map(v => v.vix);
       vixChart.update('none');
-    } catch(e) { console.warn('vixChart:', e.message); } }
+    } catch(e) { console.warn('vixChart: ' + e.message); } }
   }
 
   // Macro reasons chips
@@ -8141,7 +8142,7 @@ function renderMMPanel(mm, dp, price) {
       oiChart.data.datasets[0].data = os.map(o => o.call_oi);
       oiChart.data.datasets[1].data = os.map(o => o.put_oi);
       oiChart.update('none');
-    } catch(e) { console.warn('oiChart:', e.message); } }
+    } catch(e) { console.warn('oiChart: ' + e.message); } }
   }
 
   // -- Dark Pool Levels --
@@ -8545,11 +8546,11 @@ function renderInstModels(m, ind) {
 
 async function fetchState() {
   try {
-    const resp = await fetch('/api/state');
-    if(!resp.ok){ console.warn('fetchState HTTP', resp.status); return; }
-    const data = await resp.json();
-    try { updateUI(data); } catch(e) { console.error('updateUI:', e.message, e.stack?.split('\n')[1]); }
-  } catch(e) { console.warn('fetchState:', e.message); }
+    var resp = await fetch('/api/state');
+    if(!resp.ok){ console.warn('fetchState HTTP ' + resp.status); return; }
+    var data = await resp.json();
+    try { updateUI(data); } catch(e) { console.error('updateUI error: ' + e.message); }
+  } catch(e) { console.warn('fetchState: ' + e.message); }
 }
 async function manualRefresh() { await fetch('/api/refresh'); setTimeout(fetchState,2000); }
 showChartTab('price');
@@ -9382,12 +9383,12 @@ var _spockPoll = null;
 function _pollSpock(n) {
   if (_spockPoll) clearTimeout(_spockPoll);
   var btn     = document.getElementById('spockAnalyzeBtn');
-  var statusEl= document.getElementById('spockStatus');
+  var statusEl = document.getElementById('spockStatus');
   var loadEl  = document.getElementById('spockLoading');
   var emptyEl = document.getElementById('spockEmpty');
   if (n > 20) {
     fetch('/api/spock/reset').catch(function(){});
-    if (statusEl) { statusEl.textContent = 'Timed out — try again'; statusEl.style.color = '#ff3355'; }
+    if (statusEl) { statusEl.textContent = 'Timed out - try again'; statusEl.style.color = '#ff3355'; }
     if (loadEl)  { loadEl.style.display = 'none'; }
     if (emptyEl) { emptyEl.style.display = 'block'; }
     if (btn) { btn.disabled = false; btn.style.opacity = '1'; btn.textContent = 'ANALYZE POSITION'; }
