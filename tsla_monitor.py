@@ -29,7 +29,7 @@ import pandas as pd
 import numpy as np
 
 def _yf_history(symbol, retries=3, **kwargs):
-    """yfinance with retry. No session injection — breaks yfinance 0.2.x+ curl_cffi."""
+    """yfinance with retry; never injects session objects (breaks yfinance 0.2.x+)."""
     for attempt in range(retries):
         try:
             df = yf.Ticker(symbol).history(**kwargs)
@@ -5092,20 +5092,17 @@ def api_debug():
 
 @app.route("/api/spock", methods=["GET", "POST"])
 def api_spock():
-    """Spock AI endpoint — fires in background thread, returns immediately."""
+    """Spock AI — fires in background thread, returns immediately."""
     from flask import request as freq
-    import threading
+    import threading as _thr
     data        = freq.get_json(silent=True) or {}
     trigger     = data.get("trigger", "manual")
     portfolio   = int(data.get("portfolio", 100000))
     shares      = float(data.get("shares", 0))
     entry_price = float(data.get("entry_price", 0))
-
     if _spock_cache["running"]:
         return jsonify({"status": "running", "message": "Spock is already analyzing..."})
-
-    # Fire in background — never block the HTTP connection
-    threading.Thread(
+    _thr.Thread(
         target=call_spock,
         kwargs={"trigger": trigger, "portfolio": portfolio,
                 "shares": shares, "entry_price": entry_price},
@@ -5140,9 +5137,9 @@ def api_spock_status():
 
 @app.route("/api/spock/reset")
 def api_spock_reset():
-    """Force-clears the running flag if Spock got stuck."""
+    """Force-clears stuck running flag."""
     _spock_cache["running"] = False
-    return jsonify({"status": "reset", "running": False})
+    return jsonify({"status": "reset"})
 
 @app.route("/api/refresh")
 def api_refresh():
@@ -6465,7 +6462,7 @@ DASHBOARD_HTML = """
   .panel-collapse-btn { cursor:pointer; float:right; color:var(--text-dim); font-size:10px; 
     padding:0 6px; letter-spacing:1px; }
   .panel-collapse-btn:hover { color:var(--text); }
-  canvas#priceChart { flex:1; width:100% !important; display:block; }
+  canvas#priceChart { flex:1; width:100%; height:300px !important; }
   @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:0.3;} }
   #aiOutputArea .ai-section { margin-bottom:8px; }
   #aiOutputArea .ai-label { color:#b388ff; font-weight:700; letter-spacing:1px; }
@@ -6559,15 +6556,10 @@ function initChart() {
   data:{labels:[],datasets:[{label:'TSLA',data:[],borderColor:'#00ff88',borderWidth:2,pointRadius:0,fill:true,
     backgroundColor:(c)=>{const g=c.chart.ctx.createLinearGradient(0,0,0,300);g.addColorStop(0,'rgba(0,255,136,0.15)');g.addColorStop(1,'rgba(0,255,136,0)');return g;},tension:0.3}]},
   options:{
-    responsive:true,
-    maintainAspectRatio:false,
+    ...CHART_DEFAULTS,
     plugins:{
       legend:{display:false},
-      annotation:{annotations:{}}
-    },
-    scales:{
-      x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:9},maxTicksLimit:10}},
-      y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:9},callback:v=>'$'+v.toFixed(2)}}
+      // annotation plugin removedted dynamically by updateChartAnnotations()
     }
   }
 });
@@ -6610,35 +6602,214 @@ let hmmChart = null; if(hmmCtx) hmmChart = new Chart(hmmCtx, {
 initChart();
 setTimeout(initChart, 500);
 
-// ── Secondary chart vars — null until initAllCharts() ──────────────────────────
-let uoaHeatChart=null, volChart=null, intradayChart=null;
-let spyChart=null, rsChart=null, gexChart=null, oiChart=null;
-let vixChart=null, macdLineChart=null, macdHistChart=null;
-let volBarsChart=null, volProfileChart=null;
+// -- UOA Heatmap Chart --
+const _uoa=document.getElementById('uoaHeatmapChart'); const uoaHeatCtx=_uoa?_uoa.getContext('2d'):null;
+let uoaHeatChart = null; if(uoaHeatCtx) uoaHeatChart = new Chart(uoaHeatCtx, {
+  type:'bar',
+  data:{ labels:[], datasets:[
+    { label:'Call Premium ($K)', data:[], backgroundColor:'rgba(0,255,136,0.7)', borderWidth:0, borderRadius:2, stack:'s' },
+    { label:'Put Premium ($K)',  data:[], backgroundColor:'rgba(255,51,85,0.7)',  borderWidth:0, borderRadius:2, stack:'s' },
+  ]},
+  options:{ responsive:true, maintainAspectRatio:false,
+    plugins:{ legend:{ display:true, labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:12}}},
+    scales:{
+      x:{ stacked:true, grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:16}},
+      y:{ stacked:true, position:'right', grid:{color:'#1e2540'},
+          ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>v>=1000?(v/1000).toFixed(0)+'K':'$'+v}}
+    }
+  }
+});
 
-function _mkctx(id){const el=document.getElementById(id);return el?el.getContext('2d'):null;}
+// -- Volatility Chart --
+const _vol=document.getElementById('volChart'); const volCtx=_vol?_vol.getContext('2d'):null;
+let volChart = null; if(volCtx) volChart = new Chart(volCtx, {
+  type:'line',
+  data:{ labels:[], datasets:[
+    { label:'Realised Vol %', data:[], borderColor:'#00ff88', borderWidth:2,
+      backgroundColor:'rgba(0,255,136,0.08)', fill:true, pointRadius:0, tension:0.4 }
+  ]},
+  options:{ responsive:true, maintainAspectRatio:false,
+    plugins:{ legend:{display:false} },
+    scales:{
+      x:{ grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:10}},
+      y:{ position:'right', grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>v.toFixed(0)+'%'}}
+    }
+  }
+});
 
-function initAllCharts(){
-  if(typeof Chart==='undefined'){setTimeout(initAllCharts,150);return;}
-  try{
-    if(!uoaHeatChart){const u=_mkctx('uoaHeatmapChart');if(u)uoaHeatChart=new Chart(u,{type:'bar',data:{labels:[],datasets:[{label:'Call Premium ($K)',data:[],backgroundColor:'rgba(0,255,136,0.7)',borderWidth:0,borderRadius:2,stack:'s'},{label:'Put Premium ($K)',data:[],backgroundColor:'rgba(255,51,85,0.7)',borderWidth:0,borderRadius:2,stack:'s'}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:true,labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:12}}},scales:{x:{stacked:true,grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:16}},y:{stacked:true,position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>v>=1000?(v/1000).toFixed(0)+'K':'$'+v}}}}});}
-    if(!volChart){const v=_mkctx('volChart');if(v)volChart=new Chart(v,{type:'line',data:{labels:[],datasets:[{label:'Realised Vol %',data:[],borderColor:'#00ff88',borderWidth:2,backgroundColor:'rgba(0,255,136,0.08)',fill:true,pointRadius:0,tension:0.4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:10}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>v.toFixed(0)+'%'}}}}});}
-    if(!intradayChart){const it=_mkctx('intradayChart');if(it)intradayChart=new Chart(it,{type:'line',data:{labels:[],datasets:[{label:'Price',data:[],borderColor:'#40c4ff',borderWidth:1.5,pointRadius:0,fill:false,tension:0,segment:{borderColor:c=>{const raw=c.chart.data.datasets[0]._sessionColors;return raw?raw[c.p1DataIndex]:'#40c4ff';}}}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},annotation:{annotations:{regStart:{type:'line',scaleID:'x',value:0,borderColor:'rgba(0,255,136,0.3)',borderWidth:1},regEnd:{type:'line',scaleID:'x',value:0,borderColor:'rgba(255,193,7,0.3)',borderWidth:1}}}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:12}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>'$'+v.toFixed(0)}}}}});}
-    if(!spyChart){const sp=_mkctx('spyChart');if(sp)spyChart=new Chart(sp,{type:'line',data:{labels:[],datasets:[{label:'SPY',data:[],borderColor:'#29b6f6',borderWidth:2,pointRadius:0,fill:false,tension:0.3},{label:'EMA20',data:[],borderColor:'rgba(255,193,7,0.7)',borderWidth:1,pointRadius:0,fill:false,borderDash:[4,4]},{label:'EMA50',data:[],borderColor:'rgba(255,100,50,0.7)',borderWidth:1,pointRadius:0,fill:false,borderDash:[4,4]}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:true,labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:16}}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:10}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>'$'+v.toFixed(0)}}}}});}
-    if(!rsChart){const rs=_mkctx('rsChart');if(rs)rsChart=new Chart(rs,{type:'line',data:{labels:[],datasets:[{label:'TSLA',data:[],borderColor:'#00ff88',borderWidth:2,pointRadius:0,fill:false,tension:0.3},{label:'SPY',data:[],borderColor:'#29b6f6',borderWidth:2,pointRadius:0,fill:false,tension:0.3},{label:'QQQ',data:[],borderColor:'#ffd600',borderWidth:1.5,pointRadius:0,fill:false,tension:0.3,borderDash:[4,4]}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:true,labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:16}},annotation:{annotations:[{type:'line',yMin:100,yMax:100,borderColor:'rgba(255,255,255,0.15)',borderWidth:1}]}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:10}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>v.toFixed(0)}}}}});}
-    if(!gexChart){const gx=_mkctx('gexChart');if(gx)gexChart=new Chart(gx,{type:'bar',data:{labels:[],datasets:[{label:'GEX ($M)',data:[],backgroundColor:[],borderWidth:0,borderRadius:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:14}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>v.toFixed(0)+'M'}}}}});}
-    if(!oiChart){const oi=_mkctx('oiChart');if(oi)oiChart=new Chart(oi,{type:'bar',data:{labels:[],datasets:[{label:'Call OI',data:[],backgroundColor:'rgba(255,51,85,0.6)',borderWidth:0,borderRadius:2},{label:'Put OI',data:[],backgroundColor:'rgba(0,255,136,0.6)',borderWidth:0,borderRadius:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:true,labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:16}}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:14}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>v>=1e3?(v/1e3).toFixed(0)+'K':v}}}}});}
-    if(!vixChart){const vx=_mkctx('vixChart');if(vx)vixChart=new Chart(vx,{type:'line',data:{labels:[],datasets:[{label:'VIX',data:[],borderColor:'#ff6d00',backgroundColor:'rgba(255,109,0,0.08)',borderWidth:2,pointRadius:0,tension:0.3,fill:true}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},annotation:{annotations:{fear25:{type:'line',yMin:25,yMax:25,borderColor:'rgba(255,51,85,0.5)',borderWidth:1,borderDash:[4,4]},fear18:{type:'line',yMin:18,yMax:18,borderColor:'rgba(255,180,0,0.5)',borderWidth:1,borderDash:[4,4]}}}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:10}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8}}}}}});}
-    if(!macdLineChart){const ml=_mkctx('macdLineChart');if(ml)macdLineChart=new Chart(ml,{type:'line',data:{labels:[],datasets:[{label:'MACD',data:[],borderColor:'#00aaff',borderWidth:2,pointRadius:0,fill:false,tension:0.3},{label:'Signal',data:[],borderColor:'#ff8800',borderWidth:1,pointRadius:0,fill:false,tension:0.3}]},options:{...CHART_DEFAULTS,plugins:{legend:{display:true,labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:20}}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:10}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8}}}}}});}
-    if(!macdHistChart){const mh=_mkctx('macdHistChart');if(mh)macdHistChart=new Chart(mh,{type:'bar',data:{labels:[],datasets:[{label:'Histogram',data:[],backgroundColor:[],borderWidth:0,borderRadius:1}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{display:false},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8}}}}}});}
-    if(!volBarsChart){const vb=_mkctx('volBarsChart');if(vb)volBarsChart=new Chart(vb,{type:'bar',data:{labels:[],datasets:[{label:'Volume',data:[],backgroundColor:[],borderWidth:0,borderRadius:1}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:12}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>v>=1e6?(v/1e6).toFixed(0)+'M':v>=1e3?(v/1e3).toFixed(0)+'K':v}}}}});}
-    if(!volProfileChart){const vp=_mkctx('volProfileChart');if(vp)volProfileChart=new Chart(vp,{type:'bar',data:{labels:[],datasets:[{label:'Vol @ Price',data:[],backgroundColor:'rgba(201,168,76,0.5)',borderWidth:0,borderRadius:1}]},options:{responsive:true,maintainAspectRatio:false,indexAxis:'y',plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>'Vol: '+(c.parsed.x/1e6).toFixed(1)+'M'}}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:7},callback:v=>(v/1e6).toFixed(0)+'M'}},y:{grid:{display:false},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:7}}}}}});}
-    console.log('[Charts] All secondary charts initialized');
-  }catch(e){console.error('[Charts] Secondary init error:',e.message);setTimeout(initAllCharts,500);}
-}
-initAllCharts();
-setTimeout(initAllCharts,800);
-setTimeout(initAllCharts,2000);
+// -- Intraday Chart --
+const _intra=document.getElementById('intradayChart'); const intradayCtx=_intra?_intra.getContext('2d'):null;
+let intradayChart = null; if(intradayCtx) intradayChart = new Chart(intradayCtx, {
+  type:'line',
+  data:{ labels:[], datasets:[
+    { label:'Price', data:[], borderColor:'#40c4ff', borderWidth:1.5,
+      pointRadius:0, fill:false, tension:0,
+      segment:{ borderColor: ctx => {
+        const raw = ctx.chart.data.datasets[0]._sessionColors;
+        return raw ? raw[ctx.p1DataIndex] : '#40c4ff';
+      }}
+    }
+  ]},
+  options:{ responsive:true, maintainAspectRatio:false,
+    plugins:{ legend:{display:false},
+      annotation:{ annotations:{
+        regStart:{ type:'line', scaleID:'x', value:0, borderColor:'rgba(0,255,136,0.3)', borderWidth:1, label:{content:'Open',display:false}},
+        regEnd:  { type:'line', scaleID:'x', value:0, borderColor:'rgba(255,193,7,0.3)',  borderWidth:1, label:{content:'Close',display:false}},
+      }}
+    },
+    scales:{
+      x:{ grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:12}},
+      y:{ position:'right', grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>'$'+v.toFixed(0)}}
+    }
+  }
+});
+
+
+// -- SPY Price Chart --
+const _spy=document.getElementById('spyChart'); const spyCtx=_spy?_spy.getContext('2d'):null;
+let spyChart = null; if(spyCtx) spyChart = new Chart(spyCtx, {
+  type:'line',
+  data:{ labels:[], datasets:[
+    { label:'SPY',  data:[], borderColor:'#29b6f6', borderWidth:2, pointRadius:0, fill:false, tension:0.3 },
+    { label:'EMA20',data:[], borderColor:'rgba(255,193,7,0.7)', borderWidth:1, pointRadius:0, fill:false, borderDash:[4,4] },
+    { label:'EMA50', data:[], borderColor:'rgba(255,100,50,0.7)', borderWidth:1, pointRadius:0, fill:false, borderDash:[4,4] },
+  ]},
+  options:{ responsive:true, maintainAspectRatio:false,
+    plugins:{ legend:{ display:true, labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:16}}},
+    scales:{
+      x:{ grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:10}},
+      y:{ position:'right', grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>'$'+v.toFixed(0)}}
+    }
+  }
+});
+
+// -- Relative Strength Chart --
+const _rs=document.getElementById('rsChart'); const rsCtx=_rs?_rs.getContext('2d'):null;
+let rsChart = null; if(rsCtx) rsChart = new Chart(rsCtx, {
+  type:'line',
+  data:{ labels:[], datasets:[
+    { label:'TSLA', data:[], borderColor:'#00ff88', borderWidth:2, pointRadius:0, fill:false, tension:0.3 },
+    { label:'SPY',  data:[], borderColor:'#29b6f6', borderWidth:2, pointRadius:0, fill:false, tension:0.3 },
+    { label:'QQQ',  data:[], borderColor:'#ffd600', borderWidth:1.5, pointRadius:0, fill:false, tension:0.3, borderDash:[4,4] },
+  ]},
+  options:{ responsive:true, maintainAspectRatio:false,
+    plugins:{ legend:{ display:true, labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:16}},
+      annotation:{annotations:[{type:'line',yMin:100,yMax:100,borderColor:'rgba(255,255,255,0.15)',borderWidth:1}]}
+    },
+    scales:{
+      x:{ grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:10}},
+      y:{ position:'right', grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>v.toFixed(0)}}
+    }
+  }
+});
+
+// -- GEX by Strike Chart --
+const _gex=document.getElementById('gexChart'); const gexCtx=_gex?_gex.getContext('2d'):null;
+let gexChart = null; if(gexCtx) gexChart = new Chart(gexCtx, {
+  type: 'bar',
+  data: { labels:[], datasets:[{ label:'GEX ($M)', data:[], backgroundColor:[], borderWidth:0, borderRadius:2 }]},
+  options:{ responsive:true, maintainAspectRatio:false,
+    plugins:{ legend:{display:false}, annotation:{} },
+    scales:{
+      x:{ grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:14} },
+      y:{ position:'right', grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},
+          callback:v=>v.toFixed(0)+'M'} }
+    }
+  }
+});
+
+// -- OI by Strike Chart --
+const _oi=document.getElementById('oiChart'); const oiCtx=_oi?_oi.getContext('2d'):null;
+let oiChart = null; if(oiCtx) oiChart = new Chart(oiCtx, {
+  type: 'bar',
+  data: { labels:[], datasets:[
+    { label:'Call OI', data:[], backgroundColor:'rgba(255,51,85,0.6)',  borderWidth:0, borderRadius:2 },
+    { label:'Put OI',  data:[], backgroundColor:'rgba(0,255,136,0.6)',  borderWidth:0, borderRadius:2 },
+  ]},
+  options:{ responsive:true, maintainAspectRatio:false,
+    plugins:{ legend:{ display:true, labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:16} }},
+    scales:{
+      x:{ grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:14} },
+      y:{ position:'right', grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},
+          callback:v=>v>=1e3?(v/1e3).toFixed(0)+'K':v} }
+    }
+  }
+});
+
+
+// -- VIX Chart --
+const _vix=document.getElementById('vixChart'); const vixCtx=_vix?_vix.getContext('2d'):null;
+let vixChart = null; if(vixCtx) vixChart = new Chart(vixCtx, {
+  type: 'line',
+  data: { labels:[], datasets:[
+    { label:'VIX', data:[], borderColor:'#ff6d00', backgroundColor:'rgba(255,109,0,0.08)', borderWidth:2, pointRadius:0, tension:0.3, fill:true },
+  ]},
+  options:{ responsive:true, maintainAspectRatio:false,
+    plugins:{ legend:{display:false},
+      annotation:{ annotations:{
+        fear25:{ type:'line', yMin:25, yMax:25, borderColor:'rgba(255,51,85,0.5)', borderWidth:1, borderDash:[4,4] },
+        fear18:{ type:'line', yMin:18, yMax:18, borderColor:'rgba(255,180,0,0.5)', borderWidth:1, borderDash:[4,4] },
+      }}
+    },
+    scales:{
+      x:{ grid:{color:'#1e2540'}, ticks:{color:'#4a5280', font:{family:'Share Tech Mono',size:8}, maxTicksLimit:10} },
+      y:{ position:'right', grid:{color:'#1e2540'}, ticks:{color:'#4a5280', font:{family:'Share Tech Mono',size:8}} }
+    }
+  }
+});
+
+// -- MACD Line Chart --
+const _ml=document.getElementById('macdLineChart'); const macdLineCtx=_ml?_ml.getContext('2d'):null;
+let macdLineChart = null; if(macdLineCtx) macdLineChart = new Chart(macdLineCtx, {
+  type: 'line',
+  data: { labels: [], datasets: [
+    { label:'MACD',   data:[], borderColor:'#00aaff', borderWidth:2, pointRadius:0, fill:false, tension:0.3 },
+    { label:'Signal', data:[], borderColor:'#ff8800', borderWidth:1, pointRadius:0, fill:false, tension:0.3 },
+  ]},
+  options: { ...CHART_DEFAULTS,
+    plugins:{ legend:{ display:true, labels:{ color:'#6070a0', font:{family:'Share Tech Mono',size:9}, boxWidth:20 }}},
+    scales:{ x:{ grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:10} },
+             y:{ position:'right', grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8}} }}
+  }
+});
+
+// -- MACD Histogram --
+const _mh=document.getElementById('macdHistChart'); const macdHistCtx=_mh?_mh.getContext('2d'):null;
+let macdHistChart = null; if(macdHistCtx) macdHistChart = new Chart(macdHistCtx, {
+  type: 'bar',
+  data: { labels:[], datasets:[{ label:'Histogram', data:[], backgroundColor:[], borderWidth:0, borderRadius:1 }]},
+  options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}},
+    scales:{ x:{ display:false },
+             y:{ position:'right', grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8}} }}
+  }
+});
+
+// -- Volume Bars Chart --
+const _vb=document.getElementById('volBarsChart'); const volBarsCtx=_vb?_vb.getContext('2d'):null;
+let volBarsChart = null; if(volBarsCtx) volBarsChart = new Chart(volBarsCtx, {
+  type: 'bar',
+  data: { labels:[], datasets:[{ label:'Volume', data:[], backgroundColor:[], borderWidth:0, borderRadius:1 }]},
+  options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}},
+    scales:{ x:{ grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:12} },
+             y:{ position:'right', grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},
+               callback:v => v>=1e6?(v/1e6).toFixed(0)+'M':v>=1e3?(v/1e3).toFixed(0)+'K':v }}
+    }
+  }
+});
+
+// -- Volume Profile (horizontal bar - price vs volume) --
+const _vp=document.getElementById('volProfileChart'); const volProfileCtx=_vp?_vp.getContext('2d'):null;
+let volProfileChart = null; if(volProfileCtx) volProfileChart = new Chart(volProfileCtx, {
+  type: 'bar',
+  data: { labels:[], datasets:[{ label:'Vol @ Price', data:[], backgroundColor:'rgba(201,168,76,0.5)', borderWidth:0, borderRadius:1 }]},
+  options: { responsive:true, maintainAspectRatio:false, indexAxis:'y',
+    plugins:{ legend:{display:false}, tooltip:{ callbacks:{ label: ctx=>'Vol: '+(ctx.parsed.x/1e6).toFixed(1)+'M' }}},
+    scales:{ x:{ grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:7},
+               callback:v => (v/1e6).toFixed(0)+'M'} },
+             y:{ grid:{display:false}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:7}} }}
+  }
+});
+
 // -- Chart Tab Switcher --
 
 function showChartTab(tab) {
@@ -6940,49 +7111,54 @@ function updateUI(s) {
   setText('ind-hmm-next', hmm.next_regime ? hmm.next_regime+' ('+hmm.next_prob+'% prob)' : '-');
 
   // -- Price Chart + Annotations --
-  if(s.price_history?.length) {
-    chart.data.labels = s.price_history.map(p=>p.date.slice(5));
-    chart.data.datasets[0].data = s.price_history.map(p=>p.price);
-    // Annotations drawn AFTER data so y-axis range is correct
-    updateChartAnnotations(s);
-    chart.resize();
-    chart.update('none');
+  if(s.price_history?.length && chart) {
+    try {
+      chart.data.labels = s.price_history.map(p=>p.date.slice(5));
+      chart.data.datasets[0].data = s.price_history.map(p=>p.price);
+      updateChartAnnotations(s);
+      chart.update('none');
+    } catch(e) { console.warn('priceChart:', e.message); }
   }
 
   // -- Live Ticker Bar --
   updateTickerBar(s);
 
   // -- MACD Charts --
-  if(s.macd_history?.length) {
-    const mh = s.macd_history;
-    macdLineChart.data.labels = mh.map(m=>m.date.slice(5));
-    macdLineChart.data.datasets[0].data = mh.map(m=>m.macd);
-    macdLineChart.data.datasets[1].data = mh.map(m=>m.signal);
-    macdLineChart.update('none');
-    macdHistChart.data.labels = mh.map(m=>m.date.slice(5));
-    macdHistChart.data.datasets[0].data = mh.map(m=>m.hist);
-    macdHistChart.data.datasets[0].backgroundColor = mh.map(m=>m.color+'cc');
-    macdHistChart.update('none');
+  if(s.macd_history?.length && macdLineChart && macdHistChart) {
+    try {
+      const mh = s.macd_history;
+      macdLineChart.data.labels = mh.map(m=>m.date.slice(5));
+      macdLineChart.data.datasets[0].data = mh.map(m=>m.macd);
+      macdLineChart.data.datasets[1].data = mh.map(m=>m.signal);
+      macdLineChart.update('none');
+      macdHistChart.data.labels = mh.map(m=>m.date.slice(5));
+      macdHistChart.data.datasets[0].data = mh.map(m=>m.hist);
+      macdHistChart.data.datasets[0].backgroundColor = mh.map(m=>m.color+'cc');
+      macdHistChart.update('none');
+    } catch(e) { console.warn('macdCharts:', e.message); }
   }
 
   // -- Volume Charts --
-  if(s.vol_history?.length) {
-    const vh = s.vol_history;
-    volBarsChart.data.labels = vh.map(v=>v.date.slice(5));
-    volBarsChart.data.datasets[0].data = vh.map(v=>v.volume);
-    volBarsChart.data.datasets[0].backgroundColor = vh.map(v=>v.color+'99');
-    volBarsChart.update('none');
+  if(s.vol_history?.length && volBarsChart) {
+    try {
+      const vh = s.vol_history;
+      volBarsChart.data.labels = vh.map(v=>v.date.slice(5));
+      volBarsChart.data.datasets[0].data = vh.map(v=>v.volume);
+      volBarsChart.data.datasets[0].backgroundColor = vh.map(v=>v.color+'99');
+      volBarsChart.update('none');
+    } catch(e) { console.warn('volBarsChart:', e.message); }
   }
-  if(s.vol_profile?.length) {
-    const vp = s.vol_profile;
-    volProfileChart.data.labels = vp.map(v=>'$'+v.price_mid);
-    volProfileChart.data.datasets[0].data = vp.map(v=>v.volume);
-    // Highlight the POC (Point of Control - highest volume price)
-    const maxVol = Math.max(...vp.map(v=>v.volume));
-    volProfileChart.data.datasets[0].backgroundColor = vp.map(v=>
-      v.volume === maxVol ? '#c9a84c' : 'rgba(201,168,76,0.35)'
-    );
-    volProfileChart.update('none');
+  if(s.vol_profile?.length && volProfileChart) {
+    try {
+      const vp = s.vol_profile;
+      volProfileChart.data.labels = vp.map(v=>'$'+v.price_mid);
+      volProfileChart.data.datasets[0].data = vp.map(v=>v.volume);
+      const maxVol = Math.max(...vp.map(v=>v.volume));
+      volProfileChart.data.datasets[0].backgroundColor = vp.map(v=>
+        v.volume === maxVol ? '#c9a84c' : 'rgba(201,168,76,0.35)'
+      );
+      volProfileChart.update('none');
+    } catch(e) { console.warn('volProfileChart:', e.message); }
   }
 
   // -- Volume indicators --
@@ -7666,10 +7842,12 @@ function renderExtPanel(ext) {
     : '<div style="font-size:10px;color:var(--text-dim);">No extended hours signals</div>';
 
   // Intraday chart
-  if(ext.intraday_history?.length) {
-    intradayChart.data.labels = ext.intraday_history.map(b => b.dt);
-    intradayChart.data.datasets[0].data = ext.intraday_history;
-    intradayChart.update('none');
+  if(ext.intraday_history?.length && intradayChart) {
+    try {
+      intradayChart.data.labels = ext.intraday_history.map(b => b.dt);
+      intradayChart.data.datasets[0].data = ext.intraday_history;
+      intradayChart.update('none');
+    } catch(e) { console.warn('intradayChart:', e.message); }
   }
 }
 
@@ -7859,9 +8037,11 @@ function renderSPYPanel(spy) {
   // VIX chart
   if(false && spy.vix_history?.length && vixChart) { // vixChart removed
     const vh = spy.vix_history;
-    vixChart.data.labels = vh.map(v => v.date?.slice(5));
-    vixChart.data.datasets[0].data = vh.map(v => v.vix);
-    vixChart.update('none');
+    if(vixChart) { try {
+      vixChart.data.labels = vh.map(v => v.date?.slice(5));
+      vixChart.data.datasets[0].data = vh.map(v => v.vix);
+      vixChart.update('none');
+    } catch(e) { console.warn('vixChart:', e.message); } }
   }
 
   // Macro reasons chips
@@ -7951,10 +8131,12 @@ function renderMMPanel(mm, dp, price) {
   // -- OI Chart --
   if(mm.oi_by_strike?.length) {
     const os = mm.oi_by_strike;
-    oiChart.data.labels = os.map(o => '$' + o.strike);
-    oiChart.data.datasets[0].data = os.map(o => o.call_oi);
-    oiChart.data.datasets[1].data = os.map(o => o.put_oi);
-    oiChart.update('none');
+    if(oiChart) { try {
+      oiChart.data.labels = os.map(o => '$' + o.strike);
+      oiChart.data.datasets[0].data = os.map(o => o.call_oi);
+      oiChart.data.datasets[1].data = os.map(o => o.put_oi);
+      oiChart.update('none');
+    } catch(e) { console.warn('oiChart:', e.message); } }
   }
 
   // -- Dark Pool Levels --
@@ -8358,11 +8540,11 @@ function renderInstModels(m, ind) {
 
 async function fetchState() {
   try {
-    const resp=await fetch('/api/state');
-    if(!resp.ok){console.warn('fetchState HTTP',resp.status);return;}
-    const data=await resp.json();
-    try{updateUI(data);}catch(e){console.error('updateUI:',e);}
-  }catch(e){console.warn('fetchState:',e.message);}
+    const resp = await fetch('/api/state');
+    if(!resp.ok){ console.warn('fetchState HTTP', resp.status); return; }
+    const data = await resp.json();
+    try { updateUI(data); } catch(e) { console.error('updateUI:', e.message, e.stack?.split('\n')[1]); }
+  } catch(e) { console.warn('fetchState:', e.message); }
 }
 async function manualRefresh() { await fetch('/api/refresh'); setTimeout(fetchState,2000); }
 showChartTab('price');
@@ -8766,29 +8948,15 @@ function selectTicker(sym) {
 }
 
 async function switchTicker(sym) {
+  // Tell the backend to switch the active ticker
   try {
     var r = await fetch('/api/switch_ticker?ticker=' + sym);
     var d = await r.json();
     console.log('Ticker switched to', sym, d);
-  } catch(e) { console.warn('switchTicker error:', e); }
-  // Clear all chart data
-  [chart,ichimokuChart,hmmChart,macdLineChart,macdHistChart,volBarsChart,
-   volProfileChart,intradayChart,spyChart,rsChart,gexChart,oiChart,
-   vixChart,volChart,uoaHeatChart].forEach(function(c){
-    if(!c) return;
-    try{c.data.labels=[];c.data.datasets.forEach(function(ds){ds.data=[];});c.update('none');}catch(e){}
-  });
-  // Reset SPOCK
-  var spockOut=document.getElementById('spockOutput');
-  var spockEmpty=document.getElementById('spockEmpty');
-  if(spockOut) spockOut.style.display='none';
-  if(spockEmpty) spockEmpty.style.display='block';
-  var statusEl=document.getElementById('spockStatus');
-  if(statusEl) statusEl.textContent='Switched to '+sym+' — click Analyze to assess';
-  // Cancel any pending poll
-  if(_spockPollHandle) clearTimeout(_spockPollHandle);
-  // Reset stuck running flag
-  fetch('/api/spock/reset').catch(function(){});
+  } catch(e) {
+    console.warn('switchTicker error:', e);
+  }
+  // Refresh all data panels
   manualRefresh();
   setTimeout(function(){ loadDarthVader(); }, 2000);
 }
@@ -9193,10 +9361,9 @@ function askSpock() {
     body: JSON.stringify({ trigger: 'manual', portfolio: portfolio, shares: shares, entry_price: entry })
   })
   .then(function(r) { return r.json(); })
-  .then(function(d) {
-    // Backend returns immediately — start polling for result
-    if (statusEl) { statusEl.textContent = 'Thinking... (polling for result)'; statusEl.style.color = '#00e5ff'; }
-    pollForSpockResult(0);
+  .then(function() {
+    if (statusEl) { statusEl.textContent = 'Thinking... (0s)'; statusEl.style.color = '#00e5ff'; }
+    _pollSpock(0);
   })
   .catch(function(err) {
     if (statusEl) { statusEl.textContent = 'Network error: ' + err.message; statusEl.style.color = '#ff3355'; }
@@ -9206,52 +9373,40 @@ function askSpock() {
   });
 }
 
-var _spockPollHandle = null;
-function pollForSpockResult(attempt) {
-  if (_spockPollHandle) clearTimeout(_spockPollHandle);
-  if (attempt > 20) { // 40s max wait
-    var btn = document.getElementById('spockAnalyzeBtn');
-    var statusEl = document.getElementById('spockStatus');
-    var loadEl = document.getElementById('spockLoading');
-    var emptyEl = document.getElementById('spockEmpty');
-    if (statusEl) { statusEl.textContent = 'Timed out — click Analyze to retry'; statusEl.style.color = '#ff3355'; }
+var _spockPoll = null;
+function _pollSpock(n) {
+  if (_spockPoll) clearTimeout(_spockPoll);
+  var btn     = document.getElementById('spockAnalyzeBtn');
+  var statusEl= document.getElementById('spockStatus');
+  var loadEl  = document.getElementById('spockLoading');
+  var emptyEl = document.getElementById('spockEmpty');
+  if (n > 20) {
+    fetch('/api/spock/reset').catch(function(){});
+    if (statusEl) { statusEl.textContent = 'Timed out — try again'; statusEl.style.color = '#ff3355'; }
     if (loadEl)  { loadEl.style.display = 'none'; }
     if (emptyEl) { emptyEl.style.display = 'block'; }
     if (btn) { btn.disabled = false; btn.style.opacity = '1'; btn.textContent = 'ANALYZE POSITION'; }
-    // Auto-reset stuck running flag
-    fetch('/api/spock/reset').catch(function(){});
     return;
   }
   fetch('/api/spock/status')
     .then(function(r) { return r.json(); })
     .then(function(d) {
-      var btn = document.getElementById('spockAnalyzeBtn');
-      var statusEl = document.getElementById('spockStatus');
-      var loadEl = document.getElementById('spockLoading');
-      var emptyEl = document.getElementById('spockEmpty');
       if (d.running) {
-        // Still thinking — keep polling
-        if (statusEl) statusEl.textContent = 'Thinking... (' + (attempt * 2) + 's)';
-        _spockPollHandle = setTimeout(function(){ pollForSpockResult(attempt + 1); }, 2000);
+        if (statusEl) statusEl.textContent = 'Thinking... (' + (n * 2) + 's)';
+        _spockPoll = setTimeout(function(){ _pollSpock(n + 1); }, 2000);
       } else if (d.has_analysis && d.analysis) {
-        // Got result!
         renderSpockAnalysis(d.analysis);
         if (statusEl) { statusEl.textContent = 'Updated ' + (d.analysis.timestamp || ''); statusEl.style.color = '#00ff88'; }
         if (btn) { btn.disabled = false; btn.style.opacity = '1'; btn.textContent = 'ANALYZE POSITION'; }
+      } else if (n < 4) {
+        _spockPoll = setTimeout(function(){ _pollSpock(n + 1); }, 2000);
       } else {
-        // Not running but no result yet — wait one more cycle
-        if (attempt < 3) {
-          _spockPollHandle = setTimeout(function(){ pollForSpockResult(attempt + 1); }, 2000);
-        } else {
-          if (loadEl)  { loadEl.style.display = 'none'; }
-          if (emptyEl) { emptyEl.style.display = 'block'; }
-          if (btn) { btn.disabled = false; btn.style.opacity = '1'; btn.textContent = 'ANALYZE POSITION'; }
-        }
+        if (loadEl)  { loadEl.style.display = 'none'; }
+        if (emptyEl) { emptyEl.style.display = 'block'; }
+        if (btn) { btn.disabled = false; btn.style.opacity = '1'; btn.textContent = 'ANALYZE POSITION'; }
       }
     })
-    .catch(function() {
-      _spockPollHandle = setTimeout(function(){ pollForSpockResult(attempt + 1); }, 2000);
-    });
+    .catch(function() { _spockPoll = setTimeout(function(){ _pollSpock(n + 1); }, 2000); });
 }
 
 function spockExtract(txt, label) {
