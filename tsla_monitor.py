@@ -27,18 +27,6 @@ import requests
 import yfinance as yf
 import pandas as pd
 import numpy as np
-
-def _yf_history(symbol, retries=3, **kwargs):
-    """yfinance retry — no session injection (breaks 0.2.x+ curl_cffi)."""
-    for attempt in range(retries):
-        try:
-            df = yf.Ticker(symbol).history(**kwargs)
-            if df is not None and not df.empty: return df
-            if attempt < retries - 1: time.sleep(2 + attempt * 2)
-        except Exception as e:
-            print(f"  yfinance {symbol} attempt {attempt+1}/{retries}: {str(e)[:100]}")
-            if attempt < retries - 1: time.sleep(3 + attempt * 3)
-    return None
 from flask import Flask, jsonify, render_template_string, request
 from dotenv import load_dotenv
 try:
@@ -964,19 +952,19 @@ def calculate_spy_analysis(tsla_closes, tsla_price):
     }
     try:
         print("  🌍 Fetching SPY, QQQ, VIX, TLT...")
-        spy_hist = _yf_history("SPY",  period="6mo", interval="1d")
-        qqq_hist = _yf_history("QQQ",  period="6mo", interval="1d")
-        vix_hist = _yf_history("^VIX", period="6mo", interval="1d")
-        tlt_hist = _yf_history("TLT",  period="3mo", interval="1d")
-        if spy_hist is None or spy_hist.empty:
+        spy_hist = yf.Ticker("SPY").history(period="6mo", interval="1d", auto_adjust=True)
+        qqq_hist = yf.Ticker("QQQ").history(period="6mo", interval="1d", auto_adjust=True)
+        vix_hist = yf.Ticker("^VIX").history(period="6mo", interval="1d", auto_adjust=True)
+        tlt_hist = yf.Ticker("TLT").history(period="3mo", interval="1d", auto_adjust=True)
+        if spy_hist.empty:
             print("  ⚠️ SPY hist empty - using fallback", flush=True)
             # Don't return - try to populate what we can from other tickers
             spy_closes = None
         else:
             spy_closes = spy_hist["Close"]
-        qqq_closes = qqq_hist["Close"] if qqq_hist is not None and not qqq_hist.empty else None
-        vix_closes = vix_hist["Close"] if vix_hist is not None and not vix_hist.empty else None
-        tlt_closes = tlt_hist["Close"] if tlt_hist is not None and not tlt_hist.empty else None
+        qqq_closes = qqq_hist["Close"] if not qqq_hist.empty else None
+        vix_closes = vix_hist["Close"] if not vix_hist.empty else None
+        tlt_closes = tlt_hist["Close"] if not tlt_hist.empty else None
         spy_price  = round(float(spy_closes.iloc[-1]), 2)
         result["spy_price"] = spy_price
         spy_chg = round((float(spy_closes.iloc[-1]) / float(spy_closes.iloc[-2]) - 1) * 100, 2) if len(spy_closes) > 1 else 0
@@ -3059,14 +3047,14 @@ def calculate_extended_hours(ticker_symbol):
         result["current_et_time"] = now_et.strftime("%H:%M ET")
 
         # ── Fetch 5-day 1-minute data WITH pre/post market ──
-        hist_1m = _yf_history(ticker_symbol, period="5d", interval="1m", prepost=True)
-        hist_5m = _yf_history(ticker_symbol, period="5d", interval="5m", prepost=True)
+        hist_1m = tkr.history(period="5d", interval="1m", prepost=True)
+        hist_5m = tkr.history(period="5d", interval="5m", prepost=True)
 
-        if (hist_1m is None or hist_1m.empty) and (hist_5m is None or hist_5m.empty):
+        if hist_1m.empty and hist_5m.empty:
             result["ext_signal"] = "NO INTRADAY DATA"
             return result
 
-        hist = hist_1m if (hist_1m is not None and not hist_1m.empty) else hist_5m
+        hist = hist_1m if not hist_1m.empty else hist_5m
 
         # ── Get last regular session close ──
         hist_day = tkr.history(period="10d", interval="1d")
@@ -4379,22 +4367,16 @@ def run_analysis():
         hist = None
         for _attempt in range(3):
             try:
-                hist = _yf_history(TICKER, period="6mo", interval="1d")
-                if hist is not None and not hist.empty:
+                hist = yf.Ticker(TICKER).history(period="6mo", interval="1d", auto_adjust=True)
+                if not hist.empty:
                     break
-                print(f"  yfinance empty (attempt {_attempt+1}/3)")
-                hist = None
-                time.sleep(3)
+                print(f"  ⚠️ yfinance returned empty data (attempt {_attempt+1}/3)")
+                time.sleep(2)
             except Exception as _ye:
-                print(f"  yfinance error (attempt {_attempt+1}/3): {str(_ye)[:120]}")
-                hist = None
-                time.sleep(3 + _attempt * 2)
+                print(f"  ⚠️ yfinance fetch error (attempt {_attempt+1}/3): {_ye}")
+                time.sleep(2)
         if hist is None or hist.empty:
-            print(f"[FATAL] Could not fetch {TICKER} data — will retry next cycle", flush=True)
-            state.update({"signal": "WAIT", "price": state.get("price", 0),
-                          "market_state": "DATA UNAVAILABLE",
-                          "last_updated": datetime.now().strftime("%H:%M:%S"),
-                          "signal_strength": 0})
+            print(f"[FATAL] Could not fetch {TICKER} data after 3 attempts", flush=True)
             return
         closes  = hist["Close"]
         volumes = hist["Volume"]
@@ -5098,23 +5080,17 @@ def api_debug():
 
 @app.route("/api/spock", methods=["GET", "POST"])
 def api_spock():
-    """Spock AI — fires background thread, returns immediately."""
+    """Spock AI endpoint — manual trigger or fetch cached result."""
     from flask import request as freq
-    import threading as _thr
     data        = freq.get_json(silent=True) or {}
     trigger     = data.get("trigger", "manual")
     portfolio   = int(data.get("portfolio", 100000))
     shares      = float(data.get("shares", 0))
     entry_price = float(data.get("entry_price", 0))
-    if _spock_cache["running"]:
-        return jsonify({"status": "running", "message": "Spock is already analyzing..."})
-    _thr.Thread(
-        target=call_spock,
-        kwargs={"trigger": trigger, "portfolio": portfolio,
-                "shares": shares, "entry_price": entry_price},
-        daemon=True
-    ).start()
-    return jsonify({"status": "started", "message": "Spock is analyzing..."})
+    ticker_req  = data.get("ticker", state.get("ticker", "TSLA")).upper()
+    result = call_spock(trigger=trigger, portfolio=portfolio,
+                        shares=shares, entry_price=entry_price, ticker=ticker_req)
+    return jsonify(result)
 
 
 @app.route("/api/algo_alerts")
@@ -5140,12 +5116,6 @@ def api_spock_status():
         "running":      _spock_cache["running"],
         "last_trigger": _spock_cache["last_trigger"],
     })
-
-@app.route("/api/spock/reset")
-def api_spock_reset():
-    """Force-clears stuck running flag."""
-    _spock_cache["running"] = False
-    return jsonify({"status": "reset"})
 
 @app.route("/api/refresh")
 def api_refresh():
@@ -5200,9 +5170,10 @@ def health(): return jsonify({"status": "ok"}), 200
 #  SPOCK 2.0 — AI TRADING CO-PILOT (Claude-powered, server-side)
 # ═══════════════════════════════════════════════════════════════
 
-def build_spock_prompt(portfolio=100000, shares=0, entry_price=0):
+def build_spock_prompt(portfolio=100000, shares=0, entry_price=0, ticker_override=None):
     """Assembles full market snapshot into Spock's prompt."""
     s         = state
+    if ticker_override: s = dict(s); s["ticker"] = ticker_override.upper()
     dv        = s.get("darthvader", {})
     dv_state  = dv.get("tsla_state", {})
     risk      = dv.get("risk_mode", "UNKNOWN")
@@ -5310,7 +5281,8 @@ Portfolio: ${portfolio:,}
 Watching for entry. Assess whether current conditions warrant opening a position.
 If yes: what price, how many shares, what stop loss."""
 
-    prompt = f"""You are SPOCK — a ruthlessly logical AI trading co-pilot for an active TSLA trader.
+    ticker_name = s.get("ticker", "TSLA")
+    prompt = f"""You are SPOCK — a ruthlessly logical AI trading co-pilot for an active {ticker_name} trader.
 You have access to a sophisticated multi-layer quant system (DarthVader 2.0).
 Be precise. Be direct. Give exact prices and percentages. No vague answers.
 The trader is relying on you for actionable guidance.
@@ -5394,7 +5366,7 @@ WATCH FOR:
 
     return prompt
 
-def call_spock(trigger="manual", portfolio=100000, shares=0, entry_price=0):
+def call_spock(trigger="manual", portfolio=100000, shares=0, entry_price=0, ticker=None):
     """Call Claude API server-side and cache the result."""
     import time, urllib.request, json as _json
 
@@ -5414,7 +5386,7 @@ def call_spock(trigger="manual", portfolio=100000, shares=0, entry_price=0):
 
     _spock_cache["running"] = True
     try:
-        prompt = build_spock_prompt(portfolio, shares, entry_price)
+        prompt = build_spock_prompt(portfolio, shares, entry_price, ticker_override=ticker)
 
         payload = _json.dumps({
             "model": "claude-sonnet-4-6",
@@ -5433,7 +5405,7 @@ def call_spock(trigger="manual", portfolio=100000, shares=0, entry_price=0):
             method="POST"
         )
 
-        with urllib.request.urlopen(req, timeout=25) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             data = _json.loads(resp.read())
 
         text = data["content"][0]["text"].strip()
@@ -5780,9 +5752,9 @@ def calculate_new_highs_lows():
     def _scan_one(tkr):
         try:
             import yfinance as yf
-            df = yf.Ticker(tkr).history(period="1d", interval="1m")
+            df = yf.Ticker(tkr).history(period="1d", interval="1m", auto_adjust=True)
             if df is None or df.empty or len(df) < 5:
-                df = yf.Ticker(tkr).history(period="1d", interval="5m")
+                df = yf.Ticker(tkr).history(period="1d", interval="5m", auto_adjust=True)
             if df is None or df.empty or len(df) < 3:
                 return None
 
@@ -6570,43 +6542,53 @@ function initChart() {
   }
 });
 
-// -- Ichimoku Chart --
-const _ich=document.getElementById('ichimokuChart'); const ichCtx=_ich?_ich.getContext('2d'):null;
-let ichimokuChart = null; if(ichCtx) ichimokuChart = new Chart(ichCtx, {
-  type:'line',
-  data:{labels:[],datasets:[
-    {label:'Close',     data:[], borderColor:'#fff',        borderWidth:2, pointRadius:0, tension:0.3, fill:false, order:1},
-    {label:'Tenkan',    data:[], borderColor:'#ff6688',     borderWidth:1, pointRadius:0, tension:0.3, fill:false, order:2},
-    {label:'Kijun',     data:[], borderColor:'#4488ff',     borderWidth:1, pointRadius:0, tension:0.3, fill:false, order:3},
-    {label:'Span A',    data:[], borderColor:'rgba(0,255,136,0.6)', borderWidth:1, pointRadius:0, tension:0.3,
-      fill:'+1', backgroundColor:'rgba(0,255,136,0.08)', order:4},
-    {label:'Span B',    data:[], borderColor:'rgba(255,51,85,0.6)',  borderWidth:1, pointRadius:0, tension:0.3,
-      fill:false, backgroundColor:'rgba(255,51,85,0.08)', order:5},
-  ]},
-  options:{
-    ...CHART_DEFAULTS,
-    plugins:{legend:{display:true, labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:20}}},
-  }
-});
-
-// -- HMM Chart --
-const _hmm=document.getElementById('hmmChart'); const hmmCtx=_hmm?_hmm.getContext('2d'):null;
-let hmmChart = null; if(hmmCtx) hmmChart = new Chart(hmmCtx, {
-  type:'bar',
-  data:{labels:[],datasets:[{label:'Daily Return (%)',data:[],backgroundColor:[],borderWidth:0,borderRadius:2}]},
-  options:{
-    responsive:true, maintainAspectRatio:false,
-    plugins:{legend:{display:false},
-      tooltip:{callbacks:{label:ctx=>`${ctx.parsed.y.toFixed(2)}% - ${ctx.dataset.regimes?ctx.dataset.regimes[ctx.dataIndex]:''}`}}},
-    scales:{
-      x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:12}},
-      y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:9},callback:v=>v.toFixed(1)+'%'}}
-    }
-  }
-}); } catch(e) { console.error('Chart init failed:', e.message, e.stack); }
+} catch(e) { console.error('Chart init failed:', e.message); }
 }
 initChart();
 setTimeout(initChart, 500);
+
+// -- Ichimoku + HMM: deferred so Chart.js CDN is ready --
+var ichimokuChart = null;
+var hmmChart = null;
+function initIchiHmm() {
+  if (typeof Chart === 'undefined') { setTimeout(initIchiHmm, 200); return; }
+  if (!ichimokuChart) {
+    var _ich = document.getElementById('ichimokuChart');
+    if (_ich) try {
+      ichimokuChart = new Chart(_ich.getContext('2d'), {
+        type:'line',
+        data:{labels:[],datasets:[
+          {label:'Close',  data:[], borderColor:'#fff',                borderWidth:2, pointRadius:0, tension:0.3, fill:false, order:1},
+          {label:'Tenkan', data:[], borderColor:'#ff6688',             borderWidth:1, pointRadius:0, tension:0.3, fill:false, order:2},
+          {label:'Kijun',  data:[], borderColor:'#4488ff',             borderWidth:1, pointRadius:0, tension:0.3, fill:false, order:3},
+          {label:'Span A', data:[], borderColor:'rgba(0,255,136,0.6)', borderWidth:1, pointRadius:0, tension:0.3, fill:'+1', backgroundColor:'rgba(0,255,136,0.08)', order:4},
+          {label:'Span B', data:[], borderColor:'rgba(255,51,85,0.6)', borderWidth:1, pointRadius:0, tension:0.3, fill:false, order:5}
+        ]},
+        options:{...CHART_DEFAULTS, plugins:{legend:{display:true, labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:20}}}}
+      });
+    } catch(e) { console.warn('ichimokuChart:', e.message); }
+  }
+  if (!hmmChart) {
+    var _hmm = document.getElementById('hmmChart');
+    if (_hmm) try {
+      hmmChart = new Chart(_hmm.getContext('2d'), {
+        type:'bar',
+        data:{labels:[],datasets:[{label:'Daily Return (%)',data:[],backgroundColor:[],borderWidth:0,borderRadius:2}]},
+        options:{
+          responsive:true, maintainAspectRatio:false,
+          plugins:{legend:{display:false}, tooltip:{callbacks:{label:function(c){return c.parsed.y.toFixed(2)+'% - '+(c.dataset.regimes?c.dataset.regimes[c.dataIndex]:'');} }}},
+          scales:{
+            x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:12}},
+            y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:9},callback:function(v){return v.toFixed(1)+'%';}}}
+          }
+        }
+      });
+    } catch(e) { console.warn('hmmChart:', e.message); }
+  }
+}
+initIchiHmm();
+setTimeout(initIchiHmm, 600);
+setTimeout(initIchiHmm, 1500);
 
 // -- UOA Heatmap Chart --
 const _uoa=document.getElementById('uoaHeatmapChart'); const uoaHeatCtx=_uoa?_uoa.getContext('2d'):null;
@@ -7063,14 +7045,14 @@ function updateTickerBar(s) {
 
 function updateUI(s) {
   // -- Signal Badge --
-  var badge = document.getElementById('signalBadge');
-  if(badge){badge.textContent=s.signal||'--';badge.className='signal-badge '+(s.signal||'');}
-  var _pv=document.getElementById('priceVal');
-  if(_pv)_pv.textContent=s.price?'$'+s.price.toLocaleString('en-US',{minimumFractionDigits:2}):'-';
-  var pct=s.signal_strength||0;
-  var fill=document.getElementById('strengthFill');
-  if(fill){fill.style.width=pct+'%';fill.style.background=s.signal==='BUY'?'#00ff88':s.signal==='SELL'?'#ff3355':'#ffb300';}
-  var _sv=document.getElementById('strengthVal');if(_sv)_sv.textContent=pct;
+  const badge = document.getElementById('signalBadge');
+  badge.textContent = s.signal; badge.className = 'signal-badge '+s.signal;
+  document.getElementById('priceVal').textContent = s.price ? '$'+s.price.toLocaleString('en-US',{minimumFractionDigits:2}) : '-';
+  const pct = s.signal_strength||0;
+  const fill = document.getElementById('strengthFill');
+  fill.style.width = pct+'%';
+  fill.style.background = s.signal==='BUY'?'#00ff88':s.signal==='SELL'?'#ff3355':'#ffb300';
+  document.getElementById('strengthVal').textContent = pct;
   // WhatsApp status badge
   const waEl = document.getElementById('waStatus');
   if(waEl) {
@@ -7117,54 +7099,49 @@ function updateUI(s) {
   setText('ind-hmm-next', hmm.next_regime ? hmm.next_regime+' ('+hmm.next_prob+'% prob)' : '-');
 
   // -- Price Chart + Annotations --
-  if(s.price_history && s.price_history.length && chart) {
-    try {
-      chart.data.labels = s.price_history.map(p=>p.date.slice(5));
-      chart.data.datasets[0].data = s.price_history.map(p=>p.price);
-      updateChartAnnotations(s);
-      chart.update('none');
-    } catch(e) { console.warn('priceChart: ' + e.message); }
+  if(s.price_history?.length) {
+    chart.data.labels = s.price_history.map(p=>p.date.slice(5));
+    chart.data.datasets[0].data = s.price_history.map(p=>p.price);
+    // Annotations drawn AFTER data so y-axis range is correct
+    updateChartAnnotations(s);
+    chart.resize();
+    chart.update('none');
   }
 
   // -- Live Ticker Bar --
   updateTickerBar(s);
 
   // -- MACD Charts --
-  if(s.macd_history && s.macd_history.length && macdLineChart && macdHistChart) {
-    try {
-      var mh = s.macd_history;
-      macdLineChart.data.labels = mh.map(m=>m.date.slice(5));
-      macdLineChart.data.datasets[0].data = mh.map(m=>m.macd);
-      macdLineChart.data.datasets[1].data = mh.map(m=>m.signal);
-      macdLineChart.update('none');
-      macdHistChart.data.labels = mh.map(m=>m.date.slice(5));
-      macdHistChart.data.datasets[0].data = mh.map(m=>m.hist);
-      macdHistChart.data.datasets[0].backgroundColor = mh.map(m=>m.color+'cc');
-      macdHistChart.update('none');
-    } catch(e) { console.warn('macdCharts: ' + e.message); }
+  if(s.macd_history?.length) {
+    const mh = s.macd_history;
+    macdLineChart.data.labels = mh.map(m=>m.date.slice(5));
+    macdLineChart.data.datasets[0].data = mh.map(m=>m.macd);
+    macdLineChart.data.datasets[1].data = mh.map(m=>m.signal);
+    macdLineChart.update('none');
+    macdHistChart.data.labels = mh.map(m=>m.date.slice(5));
+    macdHistChart.data.datasets[0].data = mh.map(m=>m.hist);
+    macdHistChart.data.datasets[0].backgroundColor = mh.map(m=>m.color+'cc');
+    macdHistChart.update('none');
   }
 
   // -- Volume Charts --
-  if(s.vol_history && s.vol_history.length && volBarsChart) {
-    try {
-      var vh = s.vol_history;
-      volBarsChart.data.labels = vh.map(v=>v.date.slice(5));
-      volBarsChart.data.datasets[0].data = vh.map(v=>v.volume);
-      volBarsChart.data.datasets[0].backgroundColor = vh.map(v=>v.color+'99');
-      volBarsChart.update('none');
-    } catch(e) { console.warn('volBarsChart: ' + e.message); }
+  if(s.vol_history?.length) {
+    const vh = s.vol_history;
+    volBarsChart.data.labels = vh.map(v=>v.date.slice(5));
+    volBarsChart.data.datasets[0].data = vh.map(v=>v.volume);
+    volBarsChart.data.datasets[0].backgroundColor = vh.map(v=>v.color+'99');
+    volBarsChart.update('none');
   }
-  if(s.vol_profile && s.vol_profile.length && volProfileChart) {
-    try {
-      var vp = s.vol_profile;
-      volProfileChart.data.labels = vp.map(v=>'$'+v.price_mid);
-      volProfileChart.data.datasets[0].data = vp.map(v=>v.volume);
-      var maxVol = Math.max.apply(null, vp.map(v=>v.volume));
-      volProfileChart.data.datasets[0].backgroundColor = vp.map(v=>
-        v.volume === maxVol ? '#c9a84c' : 'rgba(201,168,76,0.35)'
-      );
-      volProfileChart.update('none');
-    } catch(e) { console.warn('volProfileChart: ' + e.message); }
+  if(s.vol_profile?.length) {
+    const vp = s.vol_profile;
+    volProfileChart.data.labels = vp.map(v=>'$'+v.price_mid);
+    volProfileChart.data.datasets[0].data = vp.map(v=>v.volume);
+    // Highlight the POC (Point of Control - highest volume price)
+    const maxVol = Math.max(...vp.map(v=>v.volume));
+    volProfileChart.data.datasets[0].backgroundColor = vp.map(v=>
+      v.volume === maxVol ? '#c9a84c' : 'rgba(201,168,76,0.35)'
+    );
+    volProfileChart.update('none');
   }
 
   // -- Volume indicators --
@@ -7181,7 +7158,7 @@ function updateUI(s) {
   }
 
   // -- Ichimoku Cloud Chart --
-  if(typeof ichimokuChart!=='undefined' && ichimokuChart && ichi.history?.length) {
+  if(ichimokuChart && ichi.history?.length) {
     try {
       var ih = ichi.history;
       ichimokuChart.data.labels = ih.map(p=>p.date.slice(5));
@@ -7195,7 +7172,7 @@ function updateUI(s) {
   }
 
   // -- HMM Regime Chart --
-  if(typeof hmmChart!=='undefined' && hmmChart && hmm.history?.length) {
+  if(hmmChart && hmm.history?.length) {
     try {
       var hh = hmm.history;
       hmmChart.data.labels = hh.map((h,i)=>i%5===0?i:'');
@@ -7238,26 +7215,28 @@ function updateUI(s) {
   }
 
   // -- Institutional --
-  var _il=document.getElementById('instList');
-  if(_il)_il.innerHTML=s.institutional&&s.institutional.length
+  document.getElementById('instList').innerHTML = s.institutional?.length
     ? s.institutional.map(i=>`<div class="inst-item"><div class="inst-name">${i.institution}</div><div class="inst-meta">Form ${i.form} - Filed ${i.date}</div><span class="inst-badge ${badgeClass(i.action)}">${i.action}</span></div>`).join('')
     : '<div class="no-alerts">Loading 13F data...</div>';
-  var _lu=document.getElementById('lastUpdated');if(_lu)_lu.textContent=s.last_updated?'Updated '+s.last_updated:'-';
 
-  [
-    function(){renderExitPanel(s.exit_data||{});},
-    function(){renderUOAPanel(s.uoa_data||{});},
-    function(){var pv=parseFloat((document.getElementById('portfolioInput')||{}).value||'100000')||100000;renderEntryPanel(s.entry_data||{},pv);},
-    function(){renderPeakPanel(s.peak_data||{});},
-    function(){renderCTAPanel(s.sizing||{},s.price||0);},
-    function(){renderExtPanel(s.ext_data||{});},
-    function(){updateAlgoRadar(s);},
-    function(){renderNewsPanel(s.news_data||{});},
-    function(){renderSPYPanel(s.spy_data||{});},
-    function(){renderMMPanel(s.mm_data||{},s.dark_pool||{},s.price||0);},
-    function(){renderInstModels(s.institutional_models||{},s.indicators||{});},
-    function(){if(s.darthvader)renderDarthVader(s.darthvader);},
-  ].forEach(function(fn,i){try{fn();}catch(e){console.warn('Panel['+i+']: '+e.message);}});
+  document.getElementById('lastUpdated').textContent = s.last_updated ? 'Updated '+s.last_updated : '-';
+
+  // -- SPY / Macro Panel --
+    // -- All Panels --
+  renderExitPanel(s.exit_data || {});
+  renderUOAPanel(s.uoa_data || {});
+  const pv = parseFloat(document.getElementById('portfolioInput')?.value || 100000);
+  renderEntryPanel(s.entry_data || {}, pv);
+  renderPeakPanel(s.peak_data || {});
+  renderCTAPanel(s.sizing || {}, s.price || 0);
+  renderExtPanel(s.ext_data || {});
+  updateAlgoRadar(s);
+  renderNewsPanel(s.news_data || {});
+  renderSPYPanel(s.spy_data || {});
+  renderMMPanel(s.mm_data || {}, s.dark_pool || {}, s.price || 0);
+  renderInstModels(s.institutional_models || {}, s.indicators || {});
+  // DarthVader 1.0
+  if(s.darthvader) renderDarthVader(s.darthvader);
 }
 
 
@@ -7375,7 +7354,7 @@ function renderUOAPanel(uoa) {
   }
 
   // -- Premium heatmap chart --
-  if(uoa.strike_heatmap?.length && typeof uoaHeatChart !== 'undefined') {
+  if(uoa.strike_heatmap && uoa.strike_heatmap.length && uoaHeatChart) {
     const hm = uoa.strike_heatmap;
     uoaHeatChart.data.labels              = hm.map(h => '$'+h.strike);
     uoaHeatChart.data.datasets[0].data   = hm.map(h => Math.round(h.call_premium/1000));
@@ -7848,12 +7827,10 @@ function renderExtPanel(ext) {
     : '<div style="font-size:10px;color:var(--text-dim);">No extended hours signals</div>';
 
   // Intraday chart
-  if(ext.intraday_history && ext.intraday_history.length && intradayChart) {
-    try {
-      intradayChart.data.labels = ext.intraday_history.map(b => b.dt);
-      intradayChart.data.datasets[0].data = ext.intraday_history;
-      intradayChart.update('none');
-    } catch(e) { console.warn('intradayChart: ' + e.message); }
+  if(ext.intraday_history?.length) {
+    intradayChart.data.labels = ext.intraday_history.map(b => b.dt);
+    intradayChart.data.datasets[0].data = ext.intraday_history;
+    intradayChart.update('none');
   }
 }
 
@@ -8043,11 +8020,9 @@ function renderSPYPanel(spy) {
   // VIX chart
   if(false && spy.vix_history?.length && vixChart) { // vixChart removed
     const vh = spy.vix_history;
-    if(vixChart) { try {
-      vixChart.data.labels = vh.map(v => v.date ? v.date.slice(5) : '');
-      vixChart.data.datasets[0].data = vh.map(v => v.vix);
-      vixChart.update('none');
-    } catch(e) { console.warn('vixChart: ' + e.message); } }
+    vixChart.data.labels = vh.map(v => v.date?.slice(5));
+    vixChart.data.datasets[0].data = vh.map(v => v.vix);
+    vixChart.update('none');
   }
 
   // Macro reasons chips
@@ -8137,12 +8112,10 @@ function renderMMPanel(mm, dp, price) {
   // -- OI Chart --
   if(mm.oi_by_strike?.length) {
     const os = mm.oi_by_strike;
-    if(oiChart) { try {
-      oiChart.data.labels = os.map(o => '$' + o.strike);
-      oiChart.data.datasets[0].data = os.map(o => o.call_oi);
-      oiChart.data.datasets[1].data = os.map(o => o.put_oi);
-      oiChart.update('none');
-    } catch(e) { console.warn('oiChart: ' + e.message); } }
+    oiChart.data.labels = os.map(o => '$' + o.strike);
+    oiChart.data.datasets[0].data = os.map(o => o.call_oi);
+    oiChart.data.datasets[1].data = os.map(o => o.put_oi);
+    oiChart.update('none');
   }
 
   // -- Dark Pool Levels --
@@ -8544,14 +8517,7 @@ function renderInstModels(m, ind) {
   ).join('');
 }
 
-async function fetchState() {
-  try {
-    var resp = await fetch('/api/state');
-    if(!resp.ok){ console.warn('fetchState HTTP ' + resp.status); return; }
-    var data = await resp.json();
-    try { updateUI(data); } catch(e) { console.error('updateUI error: ' + e.message); }
-  } catch(e) { console.warn('fetchState: ' + e.message); }
-}
+async function fetchState() { try { updateUI(await (await fetch('/api/state')).json()); } catch(e){} }
 async function manualRefresh() { await fetch('/api/refresh'); setTimeout(fetchState,2000); }
 showChartTab('price');
 fetchState();
@@ -9364,55 +9330,27 @@ function askSpock() {
   fetch('/api/spock', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ trigger: 'manual', portfolio: portfolio, shares: shares, entry_price: entry })
+    body: JSON.stringify({ trigger: 'manual', portfolio: portfolio, shares: shares, entry_price: entry, ticker: _currentTicker })
   })
   .then(function(r) { return r.json(); })
-  .then(function() {
-    if (statusEl) { statusEl.textContent = 'Thinking... (0s)'; statusEl.style.color = '#00e5ff'; }
-    _pollSpock(0);
+  .then(function(d) {
+    if (d.error) {
+      if (statusEl) { statusEl.textContent = 'Error: ' + d.error; statusEl.style.color = '#ff3355'; }
+      if (loadEl)  { loadEl.style.display  = 'none';  }
+      if (emptyEl) { emptyEl.style.display = 'block'; }
+    } else {
+      renderSpockAnalysis(d);
+      if (statusEl) { statusEl.textContent = 'Updated ' + (d.timestamp || ''); statusEl.style.color = '#00ff88'; }
+    }
   })
   .catch(function(err) {
     if (statusEl) { statusEl.textContent = 'Network error: ' + err.message; statusEl.style.color = '#ff3355'; }
-    if (loadEl)  { loadEl.style.display = 'none'; }
+    if (loadEl)  { loadEl.style.display  = 'none';  }
     if (emptyEl) { emptyEl.style.display = 'block'; }
+  })
+  .finally(function() {
     if (btn) { btn.disabled = false; btn.style.opacity = '1'; btn.textContent = 'ANALYZE POSITION'; }
   });
-}
-
-var _spockPoll = null;
-function _pollSpock(n) {
-  if (_spockPoll) clearTimeout(_spockPoll);
-  var btn     = document.getElementById('spockAnalyzeBtn');
-  var statusEl = document.getElementById('spockStatus');
-  var loadEl  = document.getElementById('spockLoading');
-  var emptyEl = document.getElementById('spockEmpty');
-  if (n > 20) {
-    fetch('/api/spock/reset').catch(function(){});
-    if (statusEl) { statusEl.textContent = 'Timed out - try again'; statusEl.style.color = '#ff3355'; }
-    if (loadEl)  { loadEl.style.display = 'none'; }
-    if (emptyEl) { emptyEl.style.display = 'block'; }
-    if (btn) { btn.disabled = false; btn.style.opacity = '1'; btn.textContent = 'ANALYZE POSITION'; }
-    return;
-  }
-  fetch('/api/spock/status')
-    .then(function(r) { return r.json(); })
-    .then(function(d) {
-      if (d.running) {
-        if (statusEl) statusEl.textContent = 'Thinking... (' + (n * 2) + 's)';
-        _spockPoll = setTimeout(function(){ _pollSpock(n + 1); }, 2000);
-      } else if (d.has_analysis && d.analysis) {
-        renderSpockAnalysis(d.analysis);
-        if (statusEl) { statusEl.textContent = 'Updated ' + (d.analysis.timestamp || ''); statusEl.style.color = '#00ff88'; }
-        if (btn) { btn.disabled = false; btn.style.opacity = '1'; btn.textContent = 'ANALYZE POSITION'; }
-      } else if (n < 4) {
-        _spockPoll = setTimeout(function(){ _pollSpock(n + 1); }, 2000);
-      } else {
-        if (loadEl)  { loadEl.style.display = 'none'; }
-        if (emptyEl) { emptyEl.style.display = 'block'; }
-        if (btn) { btn.disabled = false; btn.style.opacity = '1'; btn.textContent = 'ANALYZE POSITION'; }
-      }
-    })
-    .catch(function() { _spockPoll = setTimeout(function(){ _pollSpock(n + 1); }, 2000); });
 }
 
 function spockExtract(txt, label) {
