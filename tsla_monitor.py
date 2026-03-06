@@ -5092,21 +5092,26 @@ def api_debug():
 
 @app.route("/api/spock", methods=["GET", "POST"])
 def api_spock():
-    """Spock AI endpoint — manual trigger or fetch cached result."""
+    """Spock AI endpoint — fires in background thread, returns immediately."""
     from flask import request as freq
-    data       = freq.get_json(silent=True) or {}
-    trigger    = data.get("trigger", "manual")
-    portfolio  = int(data.get("portfolio", 100000))
-    shares     = float(data.get("shares", 0))
-    entry_price= float(data.get("entry_price", 0))
+    import threading
+    data        = freq.get_json(silent=True) or {}
+    trigger     = data.get("trigger", "manual")
+    portfolio   = int(data.get("portfolio", 100000))
+    shares      = float(data.get("shares", 0))
+    entry_price = float(data.get("entry_price", 0))
 
-    req_ticker = data.get("ticker", TICKER)
-    if req_ticker and req_ticker != TICKER:
-        # Frontend switched tickers - update SPOCK context
-        pass
-    result = call_spock(trigger=trigger, portfolio=portfolio,
-                        shares=shares, entry_price=entry_price)
-    return jsonify(result)
+    if _spock_cache["running"]:
+        return jsonify({"status": "running", "message": "Spock is already analyzing..."})
+
+    # Fire in background — never block the HTTP connection
+    threading.Thread(
+        target=call_spock,
+        kwargs={"trigger": trigger, "portfolio": portfolio,
+                "shares": shares, "entry_price": entry_price},
+        daemon=True
+    ).start()
+    return jsonify({"status": "started", "message": "Spock is analyzing..."})
 
 
 @app.route("/api/algo_alerts")
@@ -5132,6 +5137,12 @@ def api_spock_status():
         "running":      _spock_cache["running"],
         "last_trigger": _spock_cache["last_trigger"],
     })
+
+@app.route("/api/spock/reset")
+def api_spock_reset():
+    """Force-clears the running flag if Spock got stuck."""
+    _spock_cache["running"] = False
+    return jsonify({"status": "reset", "running": False})
 
 @app.route("/api/refresh")
 def api_refresh():
@@ -5296,7 +5307,7 @@ Portfolio: ${portfolio:,}
 Watching for entry. Assess whether current conditions warrant opening a position.
 If yes: what price, how many shares, what stop loss."""
 
-    prompt = f"""You are SPOCK — a ruthlessly logical AI trading co-pilot for an active trader.
+    prompt = f"""You are SPOCK — a ruthlessly logical AI trading co-pilot for an active TSLA trader.
 You have access to a sophisticated multi-layer quant system (DarthVader 2.0).
 Be precise. Be direct. Give exact prices and percentages. No vague answers.
 The trader is relying on you for actionable guidance.
@@ -5419,7 +5430,7 @@ def call_spock(trigger="manual", portfolio=100000, shares=0, entry_price=0):
             method="POST"
         )
 
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=25) as resp:
             data = _json.loads(resp.read())
 
         text = data["content"][0]["text"].strip()
@@ -6454,7 +6465,7 @@ DASHBOARD_HTML = """
   .panel-collapse-btn { cursor:pointer; float:right; color:var(--text-dim); font-size:10px; 
     padding:0 6px; letter-spacing:1px; }
   .panel-collapse-btn:hover { color:var(--text); }
-  canvas#priceChart { flex:1; width:100%; height:300px !important; }
+  canvas#priceChart { flex:1; width:100% !important; display:block; }
   @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:0.3;} }
   #aiOutputArea .ai-section { margin-bottom:8px; }
   #aiOutputArea .ai-label { color:#b388ff; font-weight:700; letter-spacing:1px; }
@@ -6548,10 +6559,15 @@ function initChart() {
   data:{labels:[],datasets:[{label:'TSLA',data:[],borderColor:'#00ff88',borderWidth:2,pointRadius:0,fill:true,
     backgroundColor:(c)=>{const g=c.chart.ctx.createLinearGradient(0,0,0,300);g.addColorStop(0,'rgba(0,255,136,0.15)');g.addColorStop(1,'rgba(0,255,136,0)');return g;},tension:0.3}]},
   options:{
-    ...CHART_DEFAULTS,
+    responsive:true,
+    maintainAspectRatio:false,
     plugins:{
       legend:{display:false},
-      // annotation plugin removedted dynamically by updateChartAnnotations()
+      annotation:{annotations:{}}
+    },
+    scales:{
+      x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:9},maxTicksLimit:10}},
+      y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:9},callback:v=>'$'+v.toFixed(2)}}
     }
   }
 });
@@ -6594,7 +6610,7 @@ let hmmChart = null; if(hmmCtx) hmmChart = new Chart(hmmCtx, {
 initChart();
 setTimeout(initChart, 500);
 
-// ── Chart variables — all null until initAllCharts() fires ────────────────────
+// ── Secondary chart vars — null until initAllCharts() ──────────────────────────
 let uoaHeatChart=null, volChart=null, intradayChart=null;
 let spyChart=null, rsChart=null, gexChart=null, oiChart=null;
 let vixChart=null, macdLineChart=null, macdHistChart=null;
@@ -6605,47 +6621,20 @@ function _mkctx(id){const el=document.getElementById(id);return el?el.getContext
 function initAllCharts(){
   if(typeof Chart==='undefined'){setTimeout(initAllCharts,150);return;}
   try{
-    const u=_mkctx('uoaHeatmapChart');
-    if(u) uoaHeatChart=new Chart(u,{type:'bar',data:{labels:[],datasets:[{label:'Call Premium ($K)',data:[],backgroundColor:'rgba(0,255,136,0.7)',borderWidth:0,borderRadius:2,stack:'s'},{label:'Put Premium ($K)',data:[],backgroundColor:'rgba(255,51,85,0.7)',borderWidth:0,borderRadius:2,stack:'s'}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:true,labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:12}}},scales:{x:{stacked:true,grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:16}},y:{stacked:true,position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>v>=1000?(v/1000).toFixed(0)+'K':'$'+v}}}}});
-
-    const v=_mkctx('volChart');
-    if(v) volChart=new Chart(v,{type:'line',data:{labels:[],datasets:[{label:'Realised Vol %',data:[],borderColor:'#00ff88',borderWidth:2,backgroundColor:'rgba(0,255,136,0.08)',fill:true,pointRadius:0,tension:0.4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:10}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>v.toFixed(0)+'%'}}}}});
-
-    const it=_mkctx('intradayChart');
-    if(it) intradayChart=new Chart(it,{type:'line',data:{labels:[],datasets:[{label:'Price',data:[],borderColor:'#40c4ff',borderWidth:1.5,pointRadius:0,fill:false,tension:0,segment:{borderColor:c=>{const raw=c.chart.data.datasets[0]._sessionColors;return raw?raw[c.p1DataIndex]:'#40c4ff';}}}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},annotation:{annotations:{regStart:{type:'line',scaleID:'x',value:0,borderColor:'rgba(0,255,136,0.3)',borderWidth:1},regEnd:{type:'line',scaleID:'x',value:0,borderColor:'rgba(255,193,7,0.3)',borderWidth:1}}}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:12}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>'$'+v.toFixed(0)}}}}});
-
-    const sp=_mkctx('spyChart');
-    if(sp) spyChart=new Chart(sp,{type:'line',data:{labels:[],datasets:[{label:'SPY',data:[],borderColor:'#29b6f6',borderWidth:2,pointRadius:0,fill:false,tension:0.3},{label:'EMA20',data:[],borderColor:'rgba(255,193,7,0.7)',borderWidth:1,pointRadius:0,fill:false,borderDash:[4,4]},{label:'EMA50',data:[],borderColor:'rgba(255,100,50,0.7)',borderWidth:1,pointRadius:0,fill:false,borderDash:[4,4]}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:true,labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:16}}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:10}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>'$'+v.toFixed(0)}}}}});
-
-    const rs=_mkctx('rsChart');
-    if(rs) rsChart=new Chart(rs,{type:'line',data:{labels:[],datasets:[{label:'TSLA',data:[],borderColor:'#00ff88',borderWidth:2,pointRadius:0,fill:false,tension:0.3},{label:'SPY',data:[],borderColor:'#29b6f6',borderWidth:2,pointRadius:0,fill:false,tension:0.3},{label:'QQQ',data:[],borderColor:'#ffd600',borderWidth:1.5,pointRadius:0,fill:false,tension:0.3,borderDash:[4,4]}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:true,labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:16}},annotation:{annotations:[{type:'line',yMin:100,yMax:100,borderColor:'rgba(255,255,255,0.15)',borderWidth:1}]}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:10}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>v.toFixed(0)}}}}});
-
-    const gx=_mkctx('gexChart');
-    if(gx) gexChart=new Chart(gx,{type:'bar',data:{labels:[],datasets:[{label:'GEX ($M)',data:[],backgroundColor:[],borderWidth:0,borderRadius:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:14}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>v.toFixed(0)+'M'}}}}});
-
-    const oi=_mkctx('oiChart');
-    if(oi) oiChart=new Chart(oi,{type:'bar',data:{labels:[],datasets:[{label:'Call OI',data:[],backgroundColor:'rgba(255,51,85,0.6)',borderWidth:0,borderRadius:2},{label:'Put OI',data:[],backgroundColor:'rgba(0,255,136,0.6)',borderWidth:0,borderRadius:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:true,labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:16}}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:14}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>v>=1e3?(v/1e3).toFixed(0)+'K':v}}}}});
-
-    const vx=_mkctx('vixChart');
-    if(vx) vixChart=new Chart(vx,{type:'line',data:{labels:[],datasets:[{label:'VIX',data:[],borderColor:'#ff6d00',backgroundColor:'rgba(255,109,0,0.08)',borderWidth:2,pointRadius:0,tension:0.3,fill:true}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},annotation:{annotations:{fear25:{type:'line',yMin:25,yMax:25,borderColor:'rgba(255,51,85,0.5)',borderWidth:1,borderDash:[4,4]},fear18:{type:'line',yMin:18,yMax:18,borderColor:'rgba(255,180,0,0.5)',borderWidth:1,borderDash:[4,4]}}}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:10}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8}}}}}});
-
-    const ml=_mkctx('macdLineChart');
-    if(ml) macdLineChart=new Chart(ml,{type:'line',data:{labels:[],datasets:[{label:'MACD',data:[],borderColor:'#00aaff',borderWidth:2,pointRadius:0,fill:false,tension:0.3},{label:'Signal',data:[],borderColor:'#ff8800',borderWidth:1,pointRadius:0,fill:false,tension:0.3}]},options:{...CHART_DEFAULTS,plugins:{legend:{display:true,labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:20}}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:10}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8}}}}}});
-
-    const mh=_mkctx('macdHistChart');
-    if(mh) macdHistChart=new Chart(mh,{type:'bar',data:{labels:[],datasets:[{label:'Histogram',data:[],backgroundColor:[],borderWidth:0,borderRadius:1}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{display:false},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8}}}}}});
-
-    const vb=_mkctx('volBarsChart');
-    if(vb) volBarsChart=new Chart(vb,{type:'bar',data:{labels:[],datasets:[{label:'Volume',data:[],backgroundColor:[],borderWidth:0,borderRadius:1}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:12}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>v>=1e6?(v/1e6).toFixed(0)+'M':v>=1e3?(v/1e3).toFixed(0)+'K':v}}}}});
-
-    const vp=_mkctx('volProfileChart');
-    if(vp) volProfileChart=new Chart(vp,{type:'bar',data:{labels:[],datasets:[{label:'Vol @ Price',data:[],backgroundColor:'rgba(201,168,76,0.5)',borderWidth:0,borderRadius:1}]},options:{responsive:true,maintainAspectRatio:false,indexAxis:'y',plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>'Vol: '+(c.parsed.x/1e6).toFixed(1)+'M'}}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:7},callback:v=>(v/1e6).toFixed(0)+'M'}},y:{grid:{display:false},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:7}}}}}});
-
+    if(!uoaHeatChart){const u=_mkctx('uoaHeatmapChart');if(u)uoaHeatChart=new Chart(u,{type:'bar',data:{labels:[],datasets:[{label:'Call Premium ($K)',data:[],backgroundColor:'rgba(0,255,136,0.7)',borderWidth:0,borderRadius:2,stack:'s'},{label:'Put Premium ($K)',data:[],backgroundColor:'rgba(255,51,85,0.7)',borderWidth:0,borderRadius:2,stack:'s'}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:true,labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:12}}},scales:{x:{stacked:true,grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:16}},y:{stacked:true,position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>v>=1000?(v/1000).toFixed(0)+'K':'$'+v}}}}});}
+    if(!volChart){const v=_mkctx('volChart');if(v)volChart=new Chart(v,{type:'line',data:{labels:[],datasets:[{label:'Realised Vol %',data:[],borderColor:'#00ff88',borderWidth:2,backgroundColor:'rgba(0,255,136,0.08)',fill:true,pointRadius:0,tension:0.4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:10}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>v.toFixed(0)+'%'}}}}});}
+    if(!intradayChart){const it=_mkctx('intradayChart');if(it)intradayChart=new Chart(it,{type:'line',data:{labels:[],datasets:[{label:'Price',data:[],borderColor:'#40c4ff',borderWidth:1.5,pointRadius:0,fill:false,tension:0,segment:{borderColor:c=>{const raw=c.chart.data.datasets[0]._sessionColors;return raw?raw[c.p1DataIndex]:'#40c4ff';}}}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},annotation:{annotations:{regStart:{type:'line',scaleID:'x',value:0,borderColor:'rgba(0,255,136,0.3)',borderWidth:1},regEnd:{type:'line',scaleID:'x',value:0,borderColor:'rgba(255,193,7,0.3)',borderWidth:1}}}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:12}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>'$'+v.toFixed(0)}}}}});}
+    if(!spyChart){const sp=_mkctx('spyChart');if(sp)spyChart=new Chart(sp,{type:'line',data:{labels:[],datasets:[{label:'SPY',data:[],borderColor:'#29b6f6',borderWidth:2,pointRadius:0,fill:false,tension:0.3},{label:'EMA20',data:[],borderColor:'rgba(255,193,7,0.7)',borderWidth:1,pointRadius:0,fill:false,borderDash:[4,4]},{label:'EMA50',data:[],borderColor:'rgba(255,100,50,0.7)',borderWidth:1,pointRadius:0,fill:false,borderDash:[4,4]}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:true,labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:16}}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:10}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>'$'+v.toFixed(0)}}}}});}
+    if(!rsChart){const rs=_mkctx('rsChart');if(rs)rsChart=new Chart(rs,{type:'line',data:{labels:[],datasets:[{label:'TSLA',data:[],borderColor:'#00ff88',borderWidth:2,pointRadius:0,fill:false,tension:0.3},{label:'SPY',data:[],borderColor:'#29b6f6',borderWidth:2,pointRadius:0,fill:false,tension:0.3},{label:'QQQ',data:[],borderColor:'#ffd600',borderWidth:1.5,pointRadius:0,fill:false,tension:0.3,borderDash:[4,4]}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:true,labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:16}},annotation:{annotations:[{type:'line',yMin:100,yMax:100,borderColor:'rgba(255,255,255,0.15)',borderWidth:1}]}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:10}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>v.toFixed(0)}}}}});}
+    if(!gexChart){const gx=_mkctx('gexChart');if(gx)gexChart=new Chart(gx,{type:'bar',data:{labels:[],datasets:[{label:'GEX ($M)',data:[],backgroundColor:[],borderWidth:0,borderRadius:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:14}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>v.toFixed(0)+'M'}}}}});}
+    if(!oiChart){const oi=_mkctx('oiChart');if(oi)oiChart=new Chart(oi,{type:'bar',data:{labels:[],datasets:[{label:'Call OI',data:[],backgroundColor:'rgba(255,51,85,0.6)',borderWidth:0,borderRadius:2},{label:'Put OI',data:[],backgroundColor:'rgba(0,255,136,0.6)',borderWidth:0,borderRadius:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:true,labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:16}}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:14}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>v>=1e3?(v/1e3).toFixed(0)+'K':v}}}}});}
+    if(!vixChart){const vx=_mkctx('vixChart');if(vx)vixChart=new Chart(vx,{type:'line',data:{labels:[],datasets:[{label:'VIX',data:[],borderColor:'#ff6d00',backgroundColor:'rgba(255,109,0,0.08)',borderWidth:2,pointRadius:0,tension:0.3,fill:true}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},annotation:{annotations:{fear25:{type:'line',yMin:25,yMax:25,borderColor:'rgba(255,51,85,0.5)',borderWidth:1,borderDash:[4,4]},fear18:{type:'line',yMin:18,yMax:18,borderColor:'rgba(255,180,0,0.5)',borderWidth:1,borderDash:[4,4]}}}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:10}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8}}}}}});}
+    if(!macdLineChart){const ml=_mkctx('macdLineChart');if(ml)macdLineChart=new Chart(ml,{type:'line',data:{labels:[],datasets:[{label:'MACD',data:[],borderColor:'#00aaff',borderWidth:2,pointRadius:0,fill:false,tension:0.3},{label:'Signal',data:[],borderColor:'#ff8800',borderWidth:1,pointRadius:0,fill:false,tension:0.3}]},options:{...CHART_DEFAULTS,plugins:{legend:{display:true,labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:20}}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:10}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8}}}}}});}
+    if(!macdHistChart){const mh=_mkctx('macdHistChart');if(mh)macdHistChart=new Chart(mh,{type:'bar',data:{labels:[],datasets:[{label:'Histogram',data:[],backgroundColor:[],borderWidth:0,borderRadius:1}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{display:false},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8}}}}}});}
+    if(!volBarsChart){const vb=_mkctx('volBarsChart');if(vb)volBarsChart=new Chart(vb,{type:'bar',data:{labels:[],datasets:[{label:'Volume',data:[],backgroundColor:[],borderWidth:0,borderRadius:1}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:12}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},callback:v=>v>=1e6?(v/1e6).toFixed(0)+'M':v>=1e3?(v/1e3).toFixed(0)+'K':v}}}}});}
+    if(!volProfileChart){const vp=_mkctx('volProfileChart');if(vp)volProfileChart=new Chart(vp,{type:'bar',data:{labels:[],datasets:[{label:'Vol @ Price',data:[],backgroundColor:'rgba(201,168,76,0.5)',borderWidth:0,borderRadius:1}]},options:{responsive:true,maintainAspectRatio:false,indexAxis:'y',plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>'Vol: '+(c.parsed.x/1e6).toFixed(1)+'M'}}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:7},callback:v=>(v/1e6).toFixed(0)+'M'}},y:{grid:{display:false},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:7}}}}}});}
     console.log('[Charts] All secondary charts initialized');
-  }catch(e){
-    console.error('[Charts] Secondary init error:',e.message);
-    setTimeout(initAllCharts,500);
-  }
+  }catch(e){console.error('[Charts] Secondary init error:',e.message);setTimeout(initAllCharts,500);}
 }
 initAllCharts();
 setTimeout(initAllCharts,800);
@@ -6900,11 +6889,11 @@ function updateUI(s) {
   const badge = document.getElementById('signalBadge');
   if(badge){badge.textContent=s.signal||'--';badge.className='signal-badge '+(s.signal||'');}
   const _pv=document.getElementById('priceVal');
-  if(_pv) _pv.textContent=s.price?'$'+s.price.toLocaleString('en-US',{minimumFractionDigits:2}):'-';
+  if(_pv)_pv.textContent=s.price?'$'+s.price.toLocaleString('en-US',{minimumFractionDigits:2}):'-';
   const pct=s.signal_strength||0;
   const fill=document.getElementById('strengthFill');
   if(fill){fill.style.width=pct+'%';fill.style.background=s.signal==='BUY'?'#00ff88':s.signal==='SELL'?'#ff3355':'#ffb300';}
-  const _sv=document.getElementById('strengthVal'); if(_sv) _sv.textContent=pct;
+  const _sv=document.getElementById('strengthVal');if(_sv)_sv.textContent=pct;
   // WhatsApp status badge
   const waEl = document.getElementById('waStatus');
   if(waEl) {
@@ -7068,10 +7057,10 @@ function updateUI(s) {
 
   // -- Institutional --
   const _il=document.getElementById('instList');
-  if(_il) _il.innerHTML=s.institutional?.length
+  if(_il)_il.innerHTML=s.institutional?.length
     ? s.institutional.map(i=>`<div class="inst-item"><div class="inst-name">${i.institution}</div><div class="inst-meta">Form ${i.form} - Filed ${i.date}</div><span class="inst-badge ${badgeClass(i.action)}">${i.action}</span></div>`).join('')
     : '<div class="no-alerts">Loading 13F data...</div>';
-  const _lu=document.getElementById('lastUpdated'); if(_lu) _lu.textContent=s.last_updated?'Updated '+s.last_updated:'-';
+  const _lu=document.getElementById('lastUpdated');if(_lu)_lu.textContent=s.last_updated?'Updated '+s.last_updated:'-';
 
   [
     ()=>renderExitPanel(s.exit_data||{}),
@@ -8369,11 +8358,11 @@ function renderInstModels(m, ind) {
 
 async function fetchState() {
   try {
-    const resp = await fetch('/api/state');
+    const resp=await fetch('/api/state');
     if(!resp.ok){console.warn('fetchState HTTP',resp.status);return;}
-    const data = await resp.json();
-    try{updateUI(data);}catch(e){console.error('updateUI error:',e);}
-  } catch(e){console.warn('fetchState:',e.message);}
+    const data=await resp.json();
+    try{updateUI(data);}catch(e){console.error('updateUI:',e);}
+  }catch(e){console.warn('fetchState:',e.message);}
 }
 async function manualRefresh() { await fetch('/api/refresh'); setTimeout(fetchState,2000); }
 showChartTab('price');
@@ -8777,34 +8766,29 @@ function selectTicker(sym) {
 }
 
 async function switchTicker(sym) {
-  // Tell the backend to switch the active ticker
   try {
     var r = await fetch('/api/switch_ticker?ticker=' + sym);
     var d = await r.json();
     console.log('Ticker switched to', sym, d);
-  } catch(e) {
-    console.warn('switchTicker error:', e);
-  }
-  // Clear all chart data so old ticker lines don't persist
-  const _charts = [chart, ichimokuChart, hmmChart, macdLineChart, macdHistChart,
-                   volBarsChart, volProfileChart, intradayChart, spyChart, rsChart,
-                   gexChart, oiChart, vixChart, volChart, uoaHeatChart];
-  _charts.forEach(function(c) {
+  } catch(e) { console.warn('switchTicker error:', e); }
+  // Clear all chart data
+  [chart,ichimokuChart,hmmChart,macdLineChart,macdHistChart,volBarsChart,
+   volProfileChart,intradayChart,spyChart,rsChart,gexChart,oiChart,
+   vixChart,volChart,uoaHeatChart].forEach(function(c){
     if(!c) return;
-    try {
-      c.data.labels = [];
-      c.data.datasets.forEach(function(ds){ ds.data = []; });
-      c.update('none');
-    } catch(e) {}
+    try{c.data.labels=[];c.data.datasets.forEach(function(ds){ds.data=[];});c.update('none');}catch(e){}
   });
-  // Reset SPOCK output
-  var spockOut = document.getElementById('spockOutput');
-  var spockEmpty = document.getElementById('spockEmpty');
-  if(spockOut) spockOut.style.display = 'none';
-  if(spockEmpty) spockEmpty.style.display = 'block';
-  var statusEl = document.getElementById('spockStatus');
-  if(statusEl) statusEl.textContent = 'Switched to ' + sym + ' — click Analyze to assess';
-  // Refresh all data panels
+  // Reset SPOCK
+  var spockOut=document.getElementById('spockOutput');
+  var spockEmpty=document.getElementById('spockEmpty');
+  if(spockOut) spockOut.style.display='none';
+  if(spockEmpty) spockEmpty.style.display='block';
+  var statusEl=document.getElementById('spockStatus');
+  if(statusEl) statusEl.textContent='Switched to '+sym+' — click Analyze to assess';
+  // Cancel any pending poll
+  if(_spockPollHandle) clearTimeout(_spockPollHandle);
+  // Reset stuck running flag
+  fetch('/api/spock/reset').catch(function(){});
   manualRefresh();
   setTimeout(function(){ loadDarthVader(); }, 2000);
 }
@@ -9206,27 +9190,68 @@ function askSpock() {
   fetch('/api/spock', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ trigger: 'manual', portfolio: portfolio, shares: shares, entry_price: entry, ticker: _currentTicker || 'TSLA' })
+    body: JSON.stringify({ trigger: 'manual', portfolio: portfolio, shares: shares, entry_price: entry })
   })
   .then(function(r) { return r.json(); })
   .then(function(d) {
-    if (d.error) {
-      if (statusEl) { statusEl.textContent = 'Error: ' + d.error; statusEl.style.color = '#ff3355'; }
-      if (loadEl)  { loadEl.style.display  = 'none';  }
-      if (emptyEl) { emptyEl.style.display = 'block'; }
-    } else {
-      renderSpockAnalysis(d);
-      if (statusEl) { statusEl.textContent = 'Updated ' + (d.timestamp || ''); statusEl.style.color = '#00ff88'; }
-    }
+    // Backend returns immediately — start polling for result
+    if (statusEl) { statusEl.textContent = 'Thinking... (polling for result)'; statusEl.style.color = '#00e5ff'; }
+    pollForSpockResult(0);
   })
   .catch(function(err) {
     if (statusEl) { statusEl.textContent = 'Network error: ' + err.message; statusEl.style.color = '#ff3355'; }
-    if (loadEl)  { loadEl.style.display  = 'none';  }
+    if (loadEl)  { loadEl.style.display = 'none'; }
     if (emptyEl) { emptyEl.style.display = 'block'; }
-  })
-  .finally(function() {
     if (btn) { btn.disabled = false; btn.style.opacity = '1'; btn.textContent = 'ANALYZE POSITION'; }
   });
+}
+
+var _spockPollHandle = null;
+function pollForSpockResult(attempt) {
+  if (_spockPollHandle) clearTimeout(_spockPollHandle);
+  if (attempt > 20) { // 40s max wait
+    var btn = document.getElementById('spockAnalyzeBtn');
+    var statusEl = document.getElementById('spockStatus');
+    var loadEl = document.getElementById('spockLoading');
+    var emptyEl = document.getElementById('spockEmpty');
+    if (statusEl) { statusEl.textContent = 'Timed out — click Analyze to retry'; statusEl.style.color = '#ff3355'; }
+    if (loadEl)  { loadEl.style.display = 'none'; }
+    if (emptyEl) { emptyEl.style.display = 'block'; }
+    if (btn) { btn.disabled = false; btn.style.opacity = '1'; btn.textContent = 'ANALYZE POSITION'; }
+    // Auto-reset stuck running flag
+    fetch('/api/spock/reset').catch(function(){});
+    return;
+  }
+  fetch('/api/spock/status')
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      var btn = document.getElementById('spockAnalyzeBtn');
+      var statusEl = document.getElementById('spockStatus');
+      var loadEl = document.getElementById('spockLoading');
+      var emptyEl = document.getElementById('spockEmpty');
+      if (d.running) {
+        // Still thinking — keep polling
+        if (statusEl) statusEl.textContent = 'Thinking... (' + (attempt * 2) + 's)';
+        _spockPollHandle = setTimeout(function(){ pollForSpockResult(attempt + 1); }, 2000);
+      } else if (d.has_analysis && d.analysis) {
+        // Got result!
+        renderSpockAnalysis(d.analysis);
+        if (statusEl) { statusEl.textContent = 'Updated ' + (d.analysis.timestamp || ''); statusEl.style.color = '#00ff88'; }
+        if (btn) { btn.disabled = false; btn.style.opacity = '1'; btn.textContent = 'ANALYZE POSITION'; }
+      } else {
+        // Not running but no result yet — wait one more cycle
+        if (attempt < 3) {
+          _spockPollHandle = setTimeout(function(){ pollForSpockResult(attempt + 1); }, 2000);
+        } else {
+          if (loadEl)  { loadEl.style.display = 'none'; }
+          if (emptyEl) { emptyEl.style.display = 'block'; }
+          if (btn) { btn.disabled = false; btn.style.opacity = '1'; btn.textContent = 'ANALYZE POSITION'; }
+        }
+      }
+    })
+    .catch(function() {
+      _spockPollHandle = setTimeout(function(){ pollForSpockResult(attempt + 1); }, 2000);
+    });
 }
 
 function spockExtract(txt, label) {
