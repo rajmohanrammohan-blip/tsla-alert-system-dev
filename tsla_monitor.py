@@ -11,9 +11,7 @@ Features:
   - Live browser dashboard at http://localhost:5050
 
 Setup:
-  1. pip install flask "yfinance>=0.2.51" pandas numpy requests twilio python-dotenv pytz
-     NOTE: Pin yfinance in requirements.txt → yfinance>=0.2.51
-     (Older versions have 403 issues with options/prepost on cloud servers)
+  1. pip install flask yfinance pandas numpy requests twilio python-dotenv
   2. Rename .env.example → .env
   3. python tsla_monitor.py
 """
@@ -29,51 +27,23 @@ import requests
 import yfinance as yf
 import pandas as pd
 
-# ── yfinance browser session — bypasses Railway/cloud 403 blocks from Yahoo ──
-def _make_yf_session():
-    s = requests.Session()
-    s.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache',
-    })
-    return s
-
-_yf_session = _make_yf_session()
-
-def _yft(symbol):
-    """yfinance Ticker with browser session to avoid 403 on Railway.
-    Auto-refreshes session on repeated failures."""
-    global _yf_session
-    return yf.Ticker(symbol, session=_yf_session)
-
-def _yft_history(symbol, **kwargs):
-    """Fetch history with automatic session refresh on 403/empty result."""
-    global _yf_session
-    for attempt in range(3):
+# ── yfinance retry helper — lets yfinance manage its own curl_cffi session ──
+# Do NOT pass session= to yf.Ticker — newer yfinance rejects requests.Session
+def _yf_history(symbol, retries=3, **kwargs):
+    """Fetch yfinance history with retry. Never injects a session object."""
+    for attempt in range(retries):
         try:
-            tkr = yf.Ticker(symbol, session=_yf_session)
-            df = tkr.history(**kwargs)
-            if not df.empty:
+            df = yf.Ticker(symbol).history(**kwargs)
+            if df is not None and not df.empty:
                 return df
-            # Empty result — refresh session and retry
-            if attempt < 2:
-                _yf_session = _make_yf_session()
-                time.sleep(1 + attempt)
-        except Exception as e:
-            err = str(e)
-            if '403' in err or 'tunnel' in err.lower() or 'curl' in err.lower():
-                print(f"  ⚠️ yfinance 403 on {symbol} (attempt {attempt+1}/3) — refreshing session")
-                _yf_session = _make_yf_session()
+            if attempt < retries - 1:
                 time.sleep(2 + attempt * 2)
-            else:
-                raise
-    return None  # All attempts failed
+        except Exception as e:
+            msg = str(e)
+            print(f"  ⚠️ yfinance fetch {symbol} (attempt {attempt+1}/{retries}): {msg[:120]}")
+            if attempt < retries - 1:
+                time.sleep(3 + attempt * 3)
+    return None
 import numpy as np
 from flask import Flask, jsonify, render_template_string, request
 from dotenv import load_dotenv
@@ -1000,10 +970,10 @@ def calculate_spy_analysis(tsla_closes, tsla_price):
     }
     try:
         print("  🌍 Fetching SPY, QQQ, VIX, TLT...")
-        spy_hist = _yft_history("SPY", period="6mo", interval="1d") or _yft("SPY").history(period="3mo", interval="1d")
-        qqq_hist = _yft_history("QQQ", period="6mo", interval="1d") or _yft("QQQ").history(period="3mo", interval="1d")
-        vix_hist = _yft_history("^VIX", period="6mo", interval="1d") or _yft("^VIX").history(period="3mo", interval="1d")
-        tlt_hist = _yft_history("TLT", period="3mo", interval="1d") or _yft("TLT").history(period="1mo", interval="1d")
+        spy_hist = _yf_history("SPY",  period="6mo", interval="1d")
+        qqq_hist = _yf_history("QQQ",  period="6mo", interval="1d")
+        vix_hist = _yf_history("^VIX", period="6mo", interval="1d")
+        tlt_hist = _yf_history("TLT",  period="3mo", interval="1d")
         if spy_hist is None or spy_hist.empty:
             print("  ⚠️ SPY hist empty - using fallback", flush=True)
             # Don't return - try to populate what we can from other tickers
@@ -2108,7 +2078,7 @@ def calculate_unusual_options_activity(ticker_symbol, current_price):
 
     try:
         import math
-        tkr      = _yft(ticker_symbol)
+        tkr      = yf.Ticker(ticker_symbol)
         expiries = tkr.options
         if not expiries:
             result["uoa_signal"] = "NO OPTIONS DATA"
@@ -2418,7 +2388,7 @@ def calculate_market_maker_data(ticker_symbol, current_price):
     }
 
     try:
-        tkr = _yft(ticker_symbol)
+        tkr = yf.Ticker(ticker_symbol)
 
         # ── Get options expiry dates ──
         expiries = tkr.options
@@ -2773,7 +2743,7 @@ def fetch_news():
 
     # ── Source 1: Yahoo Finance via yfinance ──
     try:
-        tkr = _yft(TICKER)
+        tkr = yf.Ticker(TICKER)
         yf_news = tkr.news or []
         for item in yf_news[:20]:
             title   = item.get("title", "")
@@ -3063,7 +3033,7 @@ def calculate_extended_hours(ticker_symbol):
     }
 
     try:
-        tkr = _yft(ticker_symbol)
+        tkr = yf.Ticker(ticker_symbol)
 
         # ── Determine current session ──
         from datetime import timezone
@@ -3095,12 +3065,8 @@ def calculate_extended_hours(ticker_symbol):
         result["current_et_time"] = now_et.strftime("%H:%M ET")
 
         # ── Fetch 5-day 1-minute data WITH pre/post market ──
-        # Use _yft_history with session to bypass Railway 403 blocks
-        global _yf_session
-        hist_1m = _yft_history(ticker_symbol, period="5d", interval="1m", prepost=True)
-        hist_5m = _yft_history(ticker_symbol, period="5d", interval="5m", prepost=True)
-        if hist_1m is None: hist_1m = tkr.history(period="2d", interval="1m", prepost=True)
-        if hist_5m is None: hist_5m = tkr.history(period="2d", interval="5m", prepost=True)
+        hist_1m = _yf_history(ticker_symbol, period="5d", interval="1m", prepost=True)
+        hist_5m = _yf_history(ticker_symbol, period="5d", interval="5m", prepost=True)
 
         if (hist_1m is None or hist_1m.empty) and (hist_5m is None or hist_5m.empty):
             result["ext_signal"] = "NO INTRADAY DATA"
@@ -4419,7 +4385,7 @@ def run_analysis():
         hist = None
         for _attempt in range(3):
             try:
-                hist = _yft(TICKER).history(period="6mo", interval="1d")
+                hist = _yf_history(TICKER, period="6mo", interval="1d")
                 if not hist.empty:
                     break
                 print(f"  ⚠️ yfinance returned empty data (attempt {_attempt+1}/3)")
@@ -5078,7 +5044,7 @@ def api_debug():
     # 1. Test yfinance
     try:
         import yfinance as yf
-        h = _yft("TSLA").history(period="5d", interval="1d")
+        h = yf.Ticker("TSLA").history(period="5d", interval="1d")
         results["yfinance"] = {
             "ok": not h.empty,
             "rows": len(h),
@@ -5096,7 +5062,7 @@ def api_debug():
     # 3. Try running a mini-analysis inline
     try:
         import yfinance as yf
-        hist = _yft("TSLA").history(period="6mo", interval="1d")
+        hist = yf.Ticker("TSLA").history(period="6mo", interval="1d")
         if hist.empty:
             results["mini_analysis"] = "FAIL - hist.empty"
         else:
@@ -5802,9 +5768,9 @@ def calculate_new_highs_lows():
     def _scan_one(tkr):
         try:
             import yfinance as yf
-            df = _yft(tkr).history(period="1d", interval="1m")
+            df = yf.Ticker(tkr).history(period="1d", interval="1m")
             if df is None or df.empty or len(df) < 5:
-                df = _yft(tkr).history(period="1d", interval="5m")
+                df = yf.Ticker(tkr).history(period="1d", interval="5m")
             if df is None or df.empty or len(df) < 3:
                 return None
 
@@ -7139,11 +7105,11 @@ function updateUI(s) {
   setText('ind-hmm-next', hmm.next_regime ? hmm.next_regime+' ('+hmm.next_prob+'% prob)' : '-');
 
   // -- Price Chart + Annotations --
-  if(s.price_history?.length && typeof chart !== 'undefined' && chart) {
+  if(s.price_history?.length && typeof chart !== "undefined" && chart) {
     chart.data.labels = s.price_history.map(p=>p.date.slice(5));
     chart.data.datasets[0].data = s.price_history.map(p=>p.price);
     // Annotations drawn AFTER data so y-axis range is correct
-    if(typeof updateChartAnnotations === 'function') updateChartAnnotations(s);
+    updateChartAnnotations(s);
     chart.resize();
     chart.update('none');
   }
@@ -7152,22 +7118,20 @@ function updateUI(s) {
   updateTickerBar(s);
 
   // -- MACD Charts --
-  if(s.macd_history?.length && typeof macdLineChart !== 'undefined' && macdLineChart) {
+  if(s.macd_history?.length && typeof macdLineChart !== "undefined" && macdLineChart) {
     const mh = s.macd_history;
     macdLineChart.data.labels = mh.map(m=>m.date.slice(5));
     macdLineChart.data.datasets[0].data = mh.map(m=>m.macd);
     macdLineChart.data.datasets[1].data = mh.map(m=>m.signal);
     macdLineChart.update('none');
-    if(typeof macdHistChart !== 'undefined' && macdHistChart) {
-      macdHistChart.data.labels = mh.map(m=>m.date.slice(5));
-      macdHistChart.data.datasets[0].data = mh.map(m=>m.hist);
-      macdHistChart.data.datasets[0].backgroundColor = mh.map(m=>m.color+'cc');
-      macdHistChart.update('none');
-    }
+    macdHistChart.data.labels = mh.map(m=>m.date.slice(5));
+    macdHistChart.data.datasets[0].data = mh.map(m=>m.hist);
+    macdHistChart.data.datasets[0].backgroundColor = mh.map(m=>m.color+'cc');
+    macdHistChart.update('none');
   }
 
   // -- Volume Charts --
-  if(s.vol_history?.length && typeof volBarsChart !== 'undefined' && volBarsChart) {
+  if(s.vol_history?.length && typeof volBarsChart !== "undefined" && volBarsChart) {
     const vh = s.vol_history;
     volBarsChart.data.labels = vh.map(v=>v.date.slice(5));
     volBarsChart.data.datasets[0].data = vh.map(v=>v.volume);
@@ -7176,15 +7140,14 @@ function updateUI(s) {
   }
   if(s.vol_profile?.length) {
     const vp = s.vol_profile;
-    if(typeof volProfileChart !== 'undefined' && volProfileChart) {
-      volProfileChart.data.labels = vp.map(v=>'$'+v.price_mid);
-      volProfileChart.data.datasets[0].data = vp.map(v=>v.volume);
-      const maxVol = Math.max(...vp.map(v=>v.volume));
-      volProfileChart.data.datasets[0].backgroundColor = vp.map(v=>
-        v.volume === maxVol ? '#c9a84c' : 'rgba(201,168,76,0.35)'
-      );
-      volProfileChart.update('none');
-    }
+    volProfileChart.data.labels = vp.map(v=>'$'+v.price_mid);
+    volProfileChart.data.datasets[0].data = vp.map(v=>v.volume);
+    // Highlight the POC (Point of Control - highest volume price)
+    const maxVol = Math.max(...vp.map(v=>v.volume));
+    volProfileChart.data.datasets[0].backgroundColor = vp.map(v=>
+      v.volume === maxVol ? '#c9a84c' : 'rgba(201,168,76,0.35)'
+    );
+    volProfileChart.update('none');
   }
 
   // -- Volume indicators --
@@ -7781,7 +7744,7 @@ function renderCTAPanel(sz, price) {
   ).join('') || '<div style="font-size:10px;color:var(--text-dim);">Computing...</div>';
 
   // Vol chart
-  if(sz.vol_history?.length && typeof volChart !== 'undefined' && volChart) {
+  if(sz.vol_history?.length && typeof volChart !== "undefined" && volChart) {
     const vh = sz.vol_history;
     volChart.data.labels = vh.map(v => v.date.slice(5));
     volChart.data.datasets[0].data = vh.map(v => v.vol);
@@ -7870,7 +7833,7 @@ function renderExtPanel(ext) {
     : '<div style="font-size:10px;color:var(--text-dim);">No extended hours signals</div>';
 
   // Intraday chart
-  if(ext.intraday_history?.length && typeof intradayChart !== 'undefined' && intradayChart) {
+  if(ext.intraday_history?.length && typeof intradayChart !== "undefined" && intradayChart) {
     intradayChart.data.labels = ext.intraday_history.map(b => b.dt);
     intradayChart.data.datasets[0].data = ext.intraday_history;
     intradayChart.update('none');
@@ -8051,7 +8014,7 @@ function renderSPYPanel(spy) {
   }
 
   // RS chart
-  if(spy.rs_history?.length && rsChart) {
+  if(spy.rs_history?.length && typeof rsChart !== "undefined" && rsChart) {
     const rsh = spy.rs_history;
     rsChart.data.labels = rsh.map(r => r.date?.slice(5));
     rsChart.data.datasets[0].data = rsh.map(r => r.tsla);
