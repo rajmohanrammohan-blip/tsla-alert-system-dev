@@ -105,6 +105,8 @@ _spock_cache = {
     "last_risk_mode":   None,   # risk mode at last analysis
     "last_whale_count": 0,      # whale count at last analysis
     "running":          False,  # prevent concurrent calls
+    "quick_read":       None,   # header quick-read (ACTION + sentence)
+    "quick_running":    False,  # prevent concurrent quick calls
 }
 SPOCK_COOLDOWN = 180  # seconds between auto-triggers
 
@@ -5082,14 +5084,14 @@ def api_debug():
 def api_spock():
     """Spock AI endpoint — manual trigger or fetch cached result."""
     from flask import request as freq
-    data        = freq.get_json(silent=True) or {}
-    trigger     = data.get("trigger", "manual")
-    portfolio   = int(data.get("portfolio", 100000))
-    shares      = float(data.get("shares", 0))
-    entry_price = float(data.get("entry_price", 0))
-    ticker_req  = data.get("ticker", state.get("ticker", "TSLA")).upper()
+    data       = freq.get_json(silent=True) or {}
+    trigger    = data.get("trigger", "manual")
+    portfolio  = int(data.get("portfolio", 100000))
+    shares     = float(data.get("shares", 0))
+    entry_price= float(data.get("entry_price", 0))
+
     result = call_spock(trigger=trigger, portfolio=portfolio,
-                        shares=shares, entry_price=entry_price, ticker=ticker_req)
+                        shares=shares, entry_price=entry_price)
     return jsonify(result)
 
 
@@ -5115,6 +5117,145 @@ def api_spock_status():
         "analysis":     cached,
         "running":      _spock_cache["running"],
         "last_trigger": _spock_cache["last_trigger"],
+    })
+
+@app.route("/api/spock/reset")
+def api_spock_reset():
+    """Force-clears stuck running flag."""
+    _spock_cache["running"] = False
+    return jsonify({"status": "reset"})
+
+def call_spock_quickread(ticker=None):
+    """Generate a one-line ACTION + sentence header read using historical intelligence."""
+    if _spock_cache.get("quick_running"):
+        return
+    _spock_cache["quick_running"] = True
+    ticker_name = (ticker or state.get("ticker", "TSLA")).upper()
+    try:
+        s        = state
+        price    = s.get("price", 0)
+        dv       = s.get("darthvader", {})
+        dv_state = dv.get("tsla_state", {})
+        risk     = dv.get("risk_mode", "NORMAL")
+        probs    = dv.get("probabilistic_signals", {})
+        rsi      = s.get("indicators", {}).get("rsi", 50)
+        spy_data = s.get("spy_data", {})
+        vix      = spy_data.get("vix_current", 0)
+        ext      = s.get("ext_data", {})
+        session  = ext.get("session", "REGULAR")
+
+        from datetime import datetime as _dt
+        now          = _dt.now()
+        month_name   = now.strftime("%B")
+        day_of_week  = now.strftime("%A")
+        is_opex      = (now.weekday() == 4 and 15 <= now.day <= 21)
+
+        system_prompt = (
+            "You are SPOCK - a ruthlessly logical AI trading co-pilot.\n"
+            "Task: ONE LINE ONLY in this exact format:\n"
+            "ACTION - one sentence explanation (max 12 words)\n\n"
+            "ACTION must be one of: BUY | SELL | HOLD | WAIT | CAUTION | AVOID\n\n"
+            "Rules:\n"
+            "- Total response: ONE LINE, NO newlines, NO bullets, NO extra text.\n"
+            "- Mention specific price levels or % moves when relevant.\n"
+            "- Apply 100 years of market wisdom:\n"
+            "  * Momentum/mean-reversion base rates (RSI extremes, vol expansion)\n"
+            "  * Macro regime (rate cycle phase, inflation regime, yield curve)\n"
+            "  * Seasonality (OpEx vol, Fed week bias, Jan effect, sell-in-May)\n"
+            "  * Crash pattern analogs (1987 waterfall, 2000 distribution, 2008 credit, 2020 V)\n"
+            "- Weight historical regime analogs in your call.\n\n"
+            "Examples:\n"
+            "HOLD - RSI overbought near resistance, mean-reversion likely within 3 sessions\n"
+            "CAUTION - OpEx week historically volatile, wait for Friday resolution\n"
+            "BUY - momentum breakout confirmed, 1995-style melt-up regime, add on dips\n"
+            "AVOID - VIX spike matches 2018 vol unwind, stay flat until sub-20"
+        )
+
+        brk_prob = probs.get("breakout_30m", {}).get("probability", 0)
+        brd_prob = probs.get("breakdown_30m", {}).get("probability", 0)
+        user_msg = (
+            f"Ticker: {ticker_name} | Price: ${price} | Session: {session}\n"
+            f"DV State: {dv_state.get('state','?')} "
+            f"({round(dv_state.get('confidence',0)*100)}% conf) | Risk: {risk}\n"
+            f"RSI: {round(rsi,1)} | VIX: {vix} | Month: {month_name} | Day: {day_of_week}\n"
+            f"OpEx week: {is_opex}\n"
+            f"Breakout prob: {brk_prob:.0%} | Breakdown prob: {brd_prob:.0%}\n"
+            f"Market intent: {dv.get('market_intent','unknown')}\n\n"
+            f"Generate the one-line header read now:"
+        )
+
+        import urllib.request as _urlreq, json as _json
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            _spock_cache["quick_read"] = {
+                "action": "WAIT", "sentence": "API key not configured",
+                "ticker": ticker_name, "timestamp": _dt.now().strftime("%H:%M")
+            }
+            return
+
+        payload = _json.dumps({
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 80,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": user_msg}]
+        }).encode()
+        req = _urlreq.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=payload,
+            headers={"Content-Type": "application/json",
+                     "x-api-key": api_key,
+                     "anthropic-version": "2023-06-01"}
+        )
+        with _urlreq.urlopen(req, timeout=15) as resp:
+            result = _json.loads(resp.read())
+        raw = result.get("content", [{}])[0].get("text", "HOLD - analyzing").strip()
+
+        # Parse "ACTION - sentence" or "ACTION: sentence"
+        import re as _re
+        m = _re.match(r'^(BUY|SELL|HOLD|WAIT|CAUTION|AVOID)\s*[-:\u2014]+\s*(.+)$', raw, _re.IGNORECASE)
+        if m:
+            action   = m.group(1).upper()
+            sentence = m.group(2).strip()[:120]
+        else:
+            action, sentence = "HOLD", raw[:120]
+
+        _spock_cache["quick_read"] = {
+            "action":    action,
+            "sentence":  sentence,
+            "ticker":    ticker_name,
+            "timestamp": _dt.now().strftime("%H:%M"),
+        }
+        print(f"[SPOCK-QR] {ticker_name}: {action} - {sentence[:60]}", flush=True)
+
+    except Exception as e:
+        print(f"[SPOCK-QR] Error: {e}", flush=True)
+        _spock_cache["quick_read"] = {
+            "action": "HOLD", "sentence": "Analysis temporarily unavailable",
+            "ticker": ticker_name, "timestamp": "--"
+        }
+    finally:
+        _spock_cache["quick_running"] = False
+
+@app.route("/api/spock/quickread", methods=["POST"])
+def api_spock_quickread():
+    """Fire background quick-read for header bar."""
+    import threading as _thr
+    from flask import request as freq
+    data       = freq.get_json(silent=True) or {}
+    ticker_req = data.get("ticker", state.get("ticker", "TSLA")).upper()
+    if _spock_cache.get("quick_running"):
+        return jsonify({"status": "running"})
+    _thr.Thread(target=call_spock_quickread,
+                kwargs={"ticker": ticker_req}, daemon=True).start()
+    return jsonify({"status": "started"})
+
+@app.route("/api/spock/quickread/status")
+def api_spock_quickread_status():
+    qr = _spock_cache.get("quick_read")
+    return jsonify({
+        "running":  _spock_cache.get("quick_running", False),
+        "has_read": qr is not None,
+        "quick_read": qr,
     })
 
 @app.route("/api/refresh")
@@ -5170,10 +5311,9 @@ def health(): return jsonify({"status": "ok"}), 200
 #  SPOCK 2.0 — AI TRADING CO-PILOT (Claude-powered, server-side)
 # ═══════════════════════════════════════════════════════════════
 
-def build_spock_prompt(portfolio=100000, shares=0, entry_price=0, ticker_override=None):
+def build_spock_prompt(portfolio=100000, shares=0, entry_price=0):
     """Assembles full market snapshot into Spock's prompt."""
     s         = state
-    if ticker_override: s = dict(s); s["ticker"] = ticker_override.upper()
     dv        = s.get("darthvader", {})
     dv_state  = dv.get("tsla_state", {})
     risk      = dv.get("risk_mode", "UNKNOWN")
@@ -5281,8 +5421,7 @@ Portfolio: ${portfolio:,}
 Watching for entry. Assess whether current conditions warrant opening a position.
 If yes: what price, how many shares, what stop loss."""
 
-    ticker_name = s.get("ticker", "TSLA")
-    prompt = f"""You are SPOCK — a ruthlessly logical AI trading co-pilot for an active {ticker_name} trader.
+    prompt = f"""You are SPOCK — a ruthlessly logical AI trading co-pilot for an active TSLA trader.
 You have access to a sophisticated multi-layer quant system (DarthVader 2.0).
 Be precise. Be direct. Give exact prices and percentages. No vague answers.
 The trader is relying on you for actionable guidance.
@@ -5366,7 +5505,7 @@ WATCH FOR:
 
     return prompt
 
-def call_spock(trigger="manual", portfolio=100000, shares=0, entry_price=0, ticker=None):
+def call_spock(trigger="manual", portfolio=100000, shares=0, entry_price=0):
     """Call Claude API server-side and cache the result."""
     import time, urllib.request, json as _json
 
@@ -5386,7 +5525,7 @@ def call_spock(trigger="manual", portfolio=100000, shares=0, entry_price=0, tick
 
     _spock_cache["running"] = True
     try:
-        prompt = build_spock_prompt(portfolio, shares, entry_price, ticker_override=ticker)
+        prompt = build_spock_prompt(portfolio, shares, entry_price)
 
         payload = _json.dumps({
             "model": "claude-sonnet-4-6",
@@ -6542,53 +6681,43 @@ function initChart() {
   }
 });
 
-} catch(e) { console.error('Chart init failed:', e.message); }
+// -- Ichimoku Chart --
+const _ich=document.getElementById('ichimokuChart'); const ichCtx=_ich?_ich.getContext('2d'):null;
+let ichimokuChart = null; if(ichCtx) ichimokuChart = new Chart(ichCtx, {
+  type:'line',
+  data:{labels:[],datasets:[
+    {label:'Close',     data:[], borderColor:'#fff',        borderWidth:2, pointRadius:0, tension:0.3, fill:false, order:1},
+    {label:'Tenkan',    data:[], borderColor:'#ff6688',     borderWidth:1, pointRadius:0, tension:0.3, fill:false, order:2},
+    {label:'Kijun',     data:[], borderColor:'#4488ff',     borderWidth:1, pointRadius:0, tension:0.3, fill:false, order:3},
+    {label:'Span A',    data:[], borderColor:'rgba(0,255,136,0.6)', borderWidth:1, pointRadius:0, tension:0.3,
+      fill:'+1', backgroundColor:'rgba(0,255,136,0.08)', order:4},
+    {label:'Span B',    data:[], borderColor:'rgba(255,51,85,0.6)',  borderWidth:1, pointRadius:0, tension:0.3,
+      fill:false, backgroundColor:'rgba(255,51,85,0.08)', order:5},
+  ]},
+  options:{
+    ...CHART_DEFAULTS,
+    plugins:{legend:{display:true, labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:20}}},
+  }
+});
+
+// -- HMM Chart --
+const _hmm=document.getElementById('hmmChart'); const hmmCtx=_hmm?_hmm.getContext('2d'):null;
+let hmmChart = null; if(hmmCtx) hmmChart = new Chart(hmmCtx, {
+  type:'bar',
+  data:{labels:[],datasets:[{label:'Daily Return (%)',data:[],backgroundColor:[],borderWidth:0,borderRadius:2}]},
+  options:{
+    responsive:true, maintainAspectRatio:false,
+    plugins:{legend:{display:false},
+      tooltip:{callbacks:{label:ctx=>`${ctx.parsed.y.toFixed(2)}% - ${ctx.dataset.regimes?ctx.dataset.regimes[ctx.dataIndex]:''}`}}},
+    scales:{
+      x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:12}},
+      y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:9},callback:v=>v.toFixed(1)+'%'}}
+    }
+  }
+}); } catch(e) { console.error('Chart init failed:', e.message, e.stack); }
 }
 initChart();
 setTimeout(initChart, 500);
-
-// -- Ichimoku + HMM: deferred so Chart.js CDN is ready --
-var ichimokuChart = null;
-var hmmChart = null;
-function initIchiHmm() {
-  if (typeof Chart === 'undefined') { setTimeout(initIchiHmm, 200); return; }
-  if (!ichimokuChart) {
-    var _ich = document.getElementById('ichimokuChart');
-    if (_ich) try {
-      ichimokuChart = new Chart(_ich.getContext('2d'), {
-        type:'line',
-        data:{labels:[],datasets:[
-          {label:'Close',  data:[], borderColor:'#fff',                borderWidth:2, pointRadius:0, tension:0.3, fill:false, order:1},
-          {label:'Tenkan', data:[], borderColor:'#ff6688',             borderWidth:1, pointRadius:0, tension:0.3, fill:false, order:2},
-          {label:'Kijun',  data:[], borderColor:'#4488ff',             borderWidth:1, pointRadius:0, tension:0.3, fill:false, order:3},
-          {label:'Span A', data:[], borderColor:'rgba(0,255,136,0.6)', borderWidth:1, pointRadius:0, tension:0.3, fill:'+1', backgroundColor:'rgba(0,255,136,0.08)', order:4},
-          {label:'Span B', data:[], borderColor:'rgba(255,51,85,0.6)', borderWidth:1, pointRadius:0, tension:0.3, fill:false, order:5}
-        ]},
-        options:{...CHART_DEFAULTS, plugins:{legend:{display:true, labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:20}}}}
-      });
-    } catch(e) { console.warn('ichimokuChart:', e.message); }
-  }
-  if (!hmmChart) {
-    var _hmm = document.getElementById('hmmChart');
-    if (_hmm) try {
-      hmmChart = new Chart(_hmm.getContext('2d'), {
-        type:'bar',
-        data:{labels:[],datasets:[{label:'Daily Return (%)',data:[],backgroundColor:[],borderWidth:0,borderRadius:2}]},
-        options:{
-          responsive:true, maintainAspectRatio:false,
-          plugins:{legend:{display:false}, tooltip:{callbacks:{label:function(c){return c.parsed.y.toFixed(2)+'% - '+(c.dataset.regimes?c.dataset.regimes[c.dataIndex]:'');} }}},
-          scales:{
-            x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:12}},
-            y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:9},callback:function(v){return v.toFixed(1)+'%';}}}
-          }
-        }
-      });
-    } catch(e) { console.warn('hmmChart:', e.message); }
-  }
-}
-initIchiHmm();
-setTimeout(initIchiHmm, 600);
-setTimeout(initIchiHmm, 1500);
 
 // -- UOA Heatmap Chart --
 const _uoa=document.getElementById('uoaHeatmapChart'); const uoaHeatCtx=_uoa?_uoa.getContext('2d'):null;
@@ -7158,7 +7287,7 @@ function updateUI(s) {
   }
 
   // -- Ichimoku Cloud Chart --
-  if(ichimokuChart && ichi.history?.length) {
+  if(typeof ichimokuChart!=='undefined' && ichimokuChart && ichi.history?.length) {
     try {
       var ih = ichi.history;
       ichimokuChart.data.labels = ih.map(p=>p.date.slice(5));
@@ -7172,7 +7301,7 @@ function updateUI(s) {
   }
 
   // -- HMM Regime Chart --
-  if(hmmChart && hmm.history?.length) {
+  if(typeof hmmChart!=='undefined' && hmmChart && hmm.history?.length) {
     try {
       var hh = hmm.history;
       hmmChart.data.labels = hh.map((h,i)=>i%5===0?i:'');
@@ -7354,7 +7483,7 @@ function renderUOAPanel(uoa) {
   }
 
   // -- Premium heatmap chart --
-  if(uoa.strike_heatmap && uoa.strike_heatmap.length && uoaHeatChart) {
+  if(uoa.strike_heatmap?.length && typeof uoaHeatChart !== 'undefined') {
     const hm = uoa.strike_heatmap;
     uoaHeatChart.data.labels              = hm.map(h => '$'+h.strike);
     uoaHeatChart.data.datasets[0].data   = hm.map(h => Math.round(h.call_premium/1000));
@@ -8517,6 +8646,108 @@ function renderInstModels(m, ind) {
   ).join('');
 }
 
+// ── SPOCK Quick Read ───────────────────────────────────────────
+var _sqPoll = null;
+var SQ_ACTION_COLORS = {
+  BUY:     { bg:'rgba(0,255,136,0.15)',  border:'rgba(0,255,136,0.5)',  text:'#00ff88' },
+  SELL:    { bg:'rgba(255,51,85,0.15)',  border:'rgba(255,51,85,0.5)',  text:'#ff3355' },
+  HOLD:    { bg:'rgba(0,229,255,0.12)',  border:'rgba(0,229,255,0.35)', text:'#00e5ff' },
+  WAIT:    { bg:'rgba(255,179,0,0.12)',  border:'rgba(255,179,0,0.35)', text:'#ffb300' },
+  CAUTION: { bg:'rgba(255,152,0,0.15)',  border:'rgba(255,152,0,0.45)', text:'#ff9800' },
+  AVOID:   { bg:'rgba(255,51,85,0.12)',  border:'rgba(255,51,85,0.4)',  text:'#ff3355' },
+};
+
+function triggerQuickRead() {
+  var btn      = document.getElementById('sqBtn');
+  var spinner  = document.getElementById('sqSpinner');
+  var sentence = document.getElementById('sqSentence');
+  if (btn) { btn.disabled = true; btn.textContent = 'READING...'; }
+  if (spinner) { spinner.style.display = 'inline'; }
+  if (sentence) { sentence.textContent = 'Consulting 100 years of market data...'; }
+
+  fetch('/api/spock/quickread', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ticker: _currentTicker })
+  })
+  .then(function(r) { return r.json(); })
+  .then(function() { _pollQuickRead(0); })
+  .catch(function(e) {
+    if (sentence) sentence.textContent = 'Network error: ' + e.message;
+    if (btn) { btn.disabled = false; btn.textContent = 'READ'; }
+    if (spinner) spinner.style.display = 'none';
+  });
+}
+
+function _pollQuickRead(n) {
+  if (_sqPoll) clearTimeout(_sqPoll);
+  if (n > 15) {
+    var sentence = document.getElementById('sqSentence');
+    var btn = document.getElementById('sqBtn');
+    var spinner = document.getElementById('sqSpinner');
+    if (sentence) sentence.textContent = 'Timed out - press READ to retry';
+    if (btn) { btn.disabled = false; btn.textContent = 'READ'; }
+    if (spinner) spinner.style.display = 'none';
+    return;
+  }
+  fetch('/api/spock/quickread/status')
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.running) {
+        _sqPoll = setTimeout(function(){ _pollQuickRead(n + 1); }, 1500);
+      } else if (d.has_read && d.quick_read) {
+        renderQuickRead(d.quick_read);
+      } else if (n < 3) {
+        _sqPoll = setTimeout(function(){ _pollQuickRead(n + 1); }, 1500);
+      } else {
+        var btn = document.getElementById('sqBtn');
+        var spinner = document.getElementById('sqSpinner');
+        if (btn) { btn.disabled = false; btn.textContent = 'READ'; }
+        if (spinner) spinner.style.display = 'none';
+      }
+    })
+    .catch(function() { _sqPoll = setTimeout(function(){ _pollQuickRead(n + 1); }, 1500); });
+}
+
+function renderQuickRead(qr) {
+  var actionEl   = document.getElementById('sqAction');
+  var sentenceEl = document.getElementById('sqSentence');
+  var timeEl     = document.getElementById('sqTime');
+  var tickerEl   = document.getElementById('sqTicker');
+  var btn        = document.getElementById('sqBtn');
+  var spinner    = document.getElementById('sqSpinner');
+  var bar        = document.getElementById('spockQuickBar');
+
+  var action  = (qr.action || 'HOLD').toUpperCase();
+  var colors  = SQ_ACTION_COLORS[action] || SQ_ACTION_COLORS['HOLD'];
+
+  if (actionEl) {
+    actionEl.textContent      = action;
+    actionEl.style.background = colors.bg;
+    actionEl.style.borderColor= colors.border;
+    actionEl.style.color      = colors.text;
+  }
+  if (sentenceEl) { sentenceEl.textContent = qr.sentence || ''; sentenceEl.style.color = colors.text; }
+  if (timeEl)     timeEl.textContent = qr.timestamp || '';
+  if (tickerEl)   tickerEl.textContent = qr.ticker || _currentTicker;
+  if (bar)        bar.style.borderTopColor = colors.border;
+  if (btn)        { btn.disabled = false; btn.textContent = 'READ'; }
+  if (spinner)    spinner.style.display = 'none';
+}
+
+// On ticker switch, reset quick-read bar
+var _origSwitchTicker = typeof switchTicker === 'function' ? switchTicker : null;
+function patchSwitchTickerQR() {
+  var sqSentence = document.getElementById('sqSentence');
+  var sqAction   = document.getElementById('sqAction');
+  var sqTime     = document.getElementById('sqTime');
+  if (sqSentence) sqSentence.textContent = 'Press READ to get SPOCK analysis for ' + _currentTicker;
+  if (sqAction)   { sqAction.textContent = '—'; sqAction.style.color = '#00e5ff'; sqAction.style.background = 'rgba(0,229,255,0.12)'; sqAction.style.borderColor = 'rgba(0,229,255,0.3)'; }
+  if (sqTime)     sqTime.textContent = '—';
+}
+
+// ── SPOCK Quick Read end ────────────────────────────────────────
+
 async function fetchState() { try { updateUI(await (await fetch('/api/state')).json()); } catch(e){} }
 async function manualRefresh() { await fetch('/api/refresh'); setTimeout(fetchState,2000); }
 showChartTab('price');
@@ -8901,6 +9132,7 @@ function selectTicker(sym) {
   sym = sym.toUpperCase().trim();
   if(!sym) return;
   _currentTicker = sym;
+  patchSwitchTickerQR();
   // Clear search box so it shows placeholder again
   var inp = document.getElementById('tickerSearchInput');
   if(inp) { inp.value = ''; inp.placeholder = 'Search symbol...'; }
@@ -9330,7 +9562,7 @@ function askSpock() {
   fetch('/api/spock', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ trigger: 'manual', portfolio: portfolio, shares: shares, entry_price: entry, ticker: _currentTicker })
+    body: JSON.stringify({ trigger: 'manual', portfolio: portfolio, shares: shares, entry_price: entry })
   })
   .then(function(r) { return r.json(); })
   .then(function(d) {
@@ -9693,6 +9925,45 @@ setTimeout(pollSpockStatus, 5000);
       <span style="font-size:8px;color:var(--text-dim);">STRETCH CONDITION</span>
       <span id="stretchCondition" style="font-family:var(--font-mono);font-size:10px;color:#ff9800;">—</span>
     </div>
+  </div>
+
+  <!-- SPOCK QUICK READ BAR -->
+  <div id="spockQuickBar" style="background:rgba(0,229,255,0.04);border-top:1px solid rgba(0,229,255,0.15);
+       padding:7px 28px;display:flex;align-items:center;gap:12px;grid-column:1/-1;min-height:36px;">
+    <!-- Label -->
+    <span style="font-size:8px;letter-spacing:3px;color:#00e5ff;flex-shrink:0;">🖖 SPOCK READ</span>
+
+    <!-- Action badge -->
+    <span id="sqAction" style="font-family:var(--font-mono);font-size:11px;font-weight:700;
+      padding:2px 10px;border-radius:1px;letter-spacing:1.5px;flex-shrink:0;
+      background:rgba(0,229,255,0.12);color:#00e5ff;border:1px solid rgba(0,229,255,0.3);">—</span>
+
+    <!-- Sentence -->
+    <span id="sqSentence" style="font-family:var(--font-mono);font-size:10px;color:var(--text);
+      flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+      Press READ to get SPOCK market analysis
+    </span>
+
+    <!-- Spinner (hidden by default) -->
+    <span id="sqSpinner" style="display:none;font-size:9px;color:#00e5ff;font-family:var(--font-mono);
+      animation:pulse 1.2s infinite;flex-shrink:0;">ANALYZING...</span>
+
+    <!-- Timestamp -->
+    <span id="sqTime" style="font-size:8px;color:var(--text-dim);flex-shrink:0;font-family:var(--font-mono);">—</span>
+
+    <!-- Ticker tag -->
+    <span id="sqTicker" style="font-size:8px;color:var(--text-dim);font-family:var(--font-mono);
+      padding:1px 6px;border:1px solid rgba(255,255,255,0.1);border-radius:1px;flex-shrink:0;">—</span>
+
+    <!-- READ button -->
+    <button id="sqBtn" onclick="triggerQuickRead()"
+      style="flex-shrink:0;background:rgba(0,229,255,0.08);border:1px solid rgba(0,229,255,0.4);
+      color:#00e5ff;font-family:var(--font-mono);font-size:9px;letter-spacing:1.5px;
+      padding:4px 14px;cursor:pointer;border-radius:1px;transition:all 0.2s;"
+      onmouseover="this.style.background='rgba(0,229,255,0.18)'"
+      onmouseout="this.style.background='rgba(0,229,255,0.08)'">
+      READ
+    </button>
   </div>
 
 
