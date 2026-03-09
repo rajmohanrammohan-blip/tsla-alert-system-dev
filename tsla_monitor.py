@@ -27,6 +27,18 @@ import requests
 import yfinance as yf
 import pandas as pd
 import numpy as np
+
+def _yf_history(symbol, retries=3, **kwargs):
+    """yfinance retry — no session injection (breaks 0.2.x+ curl_cffi)."""
+    for attempt in range(retries):
+        try:
+            df = yf.Ticker(symbol).history(**kwargs)
+            if df is not None and not df.empty: return df
+            if attempt < retries - 1: time.sleep(2 + attempt * 2)
+        except Exception as e:
+            print(f"  yfinance {symbol} attempt {attempt+1}/{retries}: {str(e)[:100]}")
+            if attempt < retries - 1: time.sleep(3 + attempt * 3)
+    return None
 from flask import Flask, jsonify, render_template_string, request
 from dotenv import load_dotenv
 try:
@@ -98,13 +110,15 @@ state = {
 
 # ── Spock AI cache ──
 _spock_cache = {
-    "last_analysis":    None,   # last Spock response text
-    "last_trigger":     None,   # what triggered it
-    "last_ts":          0,      # unix timestamp of last call
-    "last_dv_state":    None,   # DV state at last analysis
-    "last_risk_mode":   None,   # risk mode at last analysis
-    "last_whale_count": 0,      # whale count at last analysis
-    "running":          False,  # prevent concurrent calls
+    "last_analysis":    None,
+    "last_trigger":     None,
+    "last_ts":          0,
+    "last_dv_state":    None,
+    "last_risk_mode":   None,
+    "last_whale_count": 0,
+    "running":          False,
+    "quick_read":       None,
+    "quick_running":    False,
 }
 SPOCK_COOLDOWN = 180  # seconds between auto-triggers
 
@@ -952,19 +966,19 @@ def calculate_spy_analysis(tsla_closes, tsla_price):
     }
     try:
         print("  🌍 Fetching SPY, QQQ, VIX, TLT...")
-        spy_hist = yf.Ticker("SPY").history(period="6mo", interval="1d", auto_adjust=True)
-        qqq_hist = yf.Ticker("QQQ").history(period="6mo", interval="1d", auto_adjust=True)
-        vix_hist = yf.Ticker("^VIX").history(period="6mo", interval="1d", auto_adjust=True)
-        tlt_hist = yf.Ticker("TLT").history(period="3mo", interval="1d", auto_adjust=True)
-        if spy_hist.empty:
+        spy_hist = _yf_history("SPY",  period="6mo", interval="1d")
+        qqq_hist = _yf_history("QQQ",  period="6mo", interval="1d")
+        vix_hist = _yf_history("^VIX", period="6mo", interval="1d")
+        tlt_hist = _yf_history("TLT",  period="3mo", interval="1d")
+        if spy_hist is None or spy_hist.empty:
             print("  ⚠️ SPY hist empty - using fallback", flush=True)
             # Don't return - try to populate what we can from other tickers
             spy_closes = None
         else:
             spy_closes = spy_hist["Close"]
-        qqq_closes = qqq_hist["Close"] if not qqq_hist.empty else None
-        vix_closes = vix_hist["Close"] if not vix_hist.empty else None
-        tlt_closes = tlt_hist["Close"] if not tlt_hist.empty else None
+        qqq_closes = qqq_hist["Close"] if qqq_hist is not None and not qqq_hist.empty else None
+        vix_closes = vix_hist["Close"] if vix_hist is not None and not vix_hist.empty else None
+        tlt_closes = tlt_hist["Close"] if tlt_hist is not None and not tlt_hist.empty else None
         spy_price  = round(float(spy_closes.iloc[-1]), 2)
         result["spy_price"] = spy_price
         spy_chg = round((float(spy_closes.iloc[-1]) / float(spy_closes.iloc[-2]) - 1) * 100, 2) if len(spy_closes) > 1 else 0
@@ -3050,14 +3064,14 @@ def calculate_extended_hours(ticker_symbol):
         result["current_et_time"] = now_et.strftime("%H:%M ET")
 
         # ── Fetch 5-day 1-minute data WITH pre/post market ──
-        hist_1m = tkr.history(period="5d", interval="1m", prepost=True)
-        hist_5m = tkr.history(period="5d", interval="5m", prepost=True)
+        hist_1m = _yf_history(ticker_symbol, period="5d", interval="1m", prepost=True)
+        hist_5m = _yf_history(ticker_symbol, period="5d", interval="5m", prepost=True)
 
-        if hist_1m.empty and hist_5m.empty:
+        if (hist_1m is None or hist_1m.empty) and (hist_5m is None or hist_5m.empty):
             result["ext_signal"] = "NO INTRADAY DATA"
             return result
 
-        hist = hist_1m if not hist_1m.empty else hist_5m
+        hist = hist_1m if (hist_1m is not None and not hist_1m.empty) else hist_5m
 
         # ── Get last regular session close ──
         hist_day = tkr.history(period="10d", interval="1d")
@@ -4370,7 +4384,7 @@ def run_analysis():
         hist = None
         for _attempt in range(3):
             try:
-                hist = yf.Ticker(TICKER).history(period="6mo", interval="1d", auto_adjust=True)
+                hist = yf.Ticker(TICKER).history(period="6mo", interval="1d")
                 if not hist.empty:
                     break
                 print(f"  ⚠️ yfinance returned empty data (attempt {_attempt+1}/3)")
@@ -4379,7 +4393,8 @@ def run_analysis():
                 print(f"  ⚠️ yfinance fetch error (attempt {_attempt+1}/3): {_ye}")
                 time.sleep(2)
         if hist is None or hist.empty:
-            print(f"[FATAL] Could not fetch {TICKER} data after 3 attempts", flush=True)
+            print(f"[FATAL] Could not fetch {TICKER} data — will retry next cycle",flush=True)
+            state.update({"signal":"WAIT","price":state.get("price",0),"market_state":"DATA UNAVAILABLE","last_updated":datetime.now().strftime("%H:%M:%S"),"signal_strength":0})
             return
         closes  = hist["Close"]
         volumes = hist["Volume"]
@@ -5083,17 +5098,22 @@ def api_debug():
 
 @app.route("/api/spock", methods=["GET", "POST"])
 def api_spock():
-    """Spock AI endpoint — manual trigger or fetch cached result."""
+    """Spock AI — fires background thread, returns immediately."""
     from flask import request as freq
-    data       = freq.get_json(silent=True) or {}
-    trigger    = data.get("trigger", "manual")
-    portfolio  = int(data.get("portfolio", 100000))
-    shares     = float(data.get("shares", 0))
-    entry_price= float(data.get("entry_price", 0))
-
-    result = call_spock(trigger=trigger, portfolio=portfolio,
-                        shares=shares, entry_price=entry_price)
-    return jsonify(result)
+    import threading as _thr
+    data        = freq.get_json(silent=True) or {}
+    trigger     = data.get("trigger", "manual")
+    portfolio   = int(data.get("portfolio", 100000))
+    shares      = float(data.get("shares", 0))
+    entry_price = float(data.get("entry_price", 0))
+    ticker_req  = data.get("ticker", state.get("ticker", "TSLA")).upper()
+    if _spock_cache["running"]:
+        return jsonify({"status": "running", "message": "Spock is already analyzing..."})
+    _thr.Thread(target=call_spock,
+        kwargs={"trigger":trigger,"portfolio":portfolio,
+                "shares":shares,"entry_price":entry_price,"ticker":ticker_req},
+        daemon=True).start()
+    return jsonify({"status": "started", "message": "Spock is analyzing..."})
 
 
 @app.route("/api/algo_alerts")
@@ -5111,49 +5131,116 @@ def api_algo_alerts():
 
 @app.route("/api/spock/status")
 def api_spock_status():
-    """Returns cached Spock analysis without triggering a new one."""
     cached = _spock_cache.get("last_analysis")
-    return jsonify({
-        "has_analysis": cached is not None,
-        "analysis":     cached,
-        "running":      _spock_cache["running"],
-        "last_trigger": _spock_cache["last_trigger"],
-    })
+    return jsonify({"has_analysis":cached is not None,"analysis":cached,
+                    "running":_spock_cache["running"],"last_trigger":_spock_cache["last_trigger"]})
+
+@app.route("/api/spock/reset")
+def api_spock_reset():
+    _spock_cache["running"] = False
+    return jsonify({"status":"reset"})
+
+def call_spock_quickread(ticker=None):
+    """One-line ACTION + sentence header read with full historical intelligence."""
+    if _spock_cache.get("quick_running"): return
+    _spock_cache["quick_running"] = True
+    ticker_name = (ticker or state.get("ticker","TSLA")).upper()
+    try:
+        s=state; price=s.get("price",0); dv=s.get("darthvader",{})
+        dv_state=dv.get("tsla_state",{}); risk=dv.get("risk_mode","NORMAL")
+        probs=dv.get("probabilistic_signals",{}); rsi=s.get("indicators",{}).get("rsi",50)
+        vix=s.get("spy_data",{}).get("vix_current",0)
+        ext=s.get("ext_data",{}); session=ext.get("session","REGULAR")
+        from datetime import datetime as _dt
+        now=_dt.now(); month_name=now.strftime("%B"); day_of_week=now.strftime("%A")
+        is_opex=(now.weekday()==4 and 15<=now.day<=21)
+        system_prompt=(
+            "You are SPOCK - a ruthlessly logical AI trading co-pilot.\n"
+            "Task: ONE LINE ONLY in this exact format:\n"
+            "ACTION - one sentence explanation (max 12 words)\n\n"
+            "ACTION must be one of: BUY | SELL | HOLD | WAIT | CAUTION | AVOID\n\n"
+            "Rules:\n"
+            "- Total response: ONE LINE, NO newlines, NO bullets, NO extra text.\n"
+            "- Apply 100 years of market wisdom:\n"
+            "  * Momentum/mean-reversion base rates (RSI extremes, vol expansion)\n"
+            "  * Macro regime (rate cycle phase, inflation regime, yield curve)\n"
+            "  * Seasonality (OpEx vol, Fed week bias, Jan effect, sell-in-May)\n"
+            "  * Crash pattern analogs (1987, 2000, 2008, 2020)\n\n"
+            "Examples:\n"
+            "HOLD - RSI overbought near resistance, mean-reversion likely within 3 sessions\n"
+            "CAUTION - OpEx week historically volatile, wait for Friday resolution\n"
+            "BUY - momentum breakout confirmed, 1995-style melt-up regime, add on dips\n"
+            "AVOID - VIX spike matches 2018 vol unwind, stay flat until sub-20"
+        )
+        brk=probs.get("breakout_30m",{}).get("probability",0)
+        brd=probs.get("breakdown_30m",{}).get("probability",0)
+        user_msg=(
+            f"Ticker: {ticker_name} | Price: ${price} | Session: {session}\n"
+            f"DV State: {dv_state.get('state','?')} ({round(dv_state.get('confidence',0)*100)}% conf) | Risk: {risk}\n"
+            f"RSI: {round(rsi,1)} | VIX: {vix} | Month: {month_name} | Day: {day_of_week} | OpEx: {is_opex}\n"
+            f"Breakout: {brk:.0%} | Breakdown: {brd:.0%} | Intent: {dv.get('market_intent','?')}\n"
+            f"Generate the one-line header read now:"
+        )
+        import urllib.request as _u, json as _j
+        api_key=os.environ.get("ANTHROPIC_API_KEY","")
+        if not api_key:
+            _spock_cache["quick_read"]={"action":"WAIT","sentence":"API key not configured","ticker":ticker_name,"timestamp":"--"}
+            return
+        payload=_j.dumps({"model":"claude-haiku-4-5-20251001","max_tokens":80,
+            "system":system_prompt,"messages":[{"role":"user","content":user_msg}]}).encode()
+        req=_u.Request("https://api.anthropic.com/v1/messages",data=payload,
+            headers={"Content-Type":"application/json","x-api-key":api_key,"anthropic-version":"2023-06-01"})
+        with _u.urlopen(req,timeout=15) as resp: result=_j.loads(resp.read())
+        raw=result.get("content",[{}])[0].get("text","HOLD - analyzing").strip()
+        import re as _re
+        m=_re.match(r'^(BUY|SELL|HOLD|WAIT|CAUTION|AVOID)\s*[-:\u2014]+\s*(.+)$',raw,_re.IGNORECASE)
+        action,sentence=(m.group(1).upper(),m.group(2).strip()[:120]) if m else ("HOLD",raw[:120])
+        _spock_cache["quick_read"]={"action":action,"sentence":sentence,"ticker":ticker_name,"timestamp":_dt.now().strftime("%H:%M")}
+        print(f"[SPOCK-QR] {ticker_name}: {action} - {sentence[:60]}",flush=True)
+    except Exception as e:
+        print(f"[SPOCK-QR] Error: {e}",flush=True)
+        _spock_cache["quick_read"]={"action":"HOLD","sentence":"Analysis temporarily unavailable","ticker":ticker_name,"timestamp":"--"}
+    finally:
+        _spock_cache["quick_running"]=False
+
+@app.route("/api/spock/quickread",methods=["POST"])
+def api_spock_quickread():
+    import threading as _thr
+    from flask import request as freq
+    data=freq.get_json(silent=True) or {}
+    ticker_req=data.get("ticker",state.get("ticker","TSLA")).upper()
+    if _spock_cache.get("quick_running"): return jsonify({"status":"running"})
+    _thr.Thread(target=call_spock_quickread,kwargs={"ticker":ticker_req},daemon=True).start()
+    return jsonify({"status":"started"})
+
+@app.route("/api/spock/quickread/status")
+def api_spock_quickread_status():
+    qr=_spock_cache.get("quick_read")
+    return jsonify({"running":_spock_cache.get("quick_running",False),"has_read":qr is not None,"quick_read":qr})
+
+@app.route("/api/debug/options")
+def api_debug_options():
+    ticker_sym=request.args.get("ticker",TICKER)
+    result={"ticker":ticker_sym,"steps":[]}
+    try:
+        tkr=yf.Ticker(ticker_sym); result["steps"].append("yf.Ticker() OK")
+        expiries=tkr.options; result["expiries"]=list(expiries) if expiries else []
+        result["steps"].append(f"tkr.options: {len(expiries) if expiries else 0} expiries")
+        if expiries:
+            chain=tkr.option_chain(expiries[0]); result["steps"].append(f"option_chain({expiries[0]}) OK")
+            result["calls_rows"]=len(chain.calls); result["puts_rows"]=len(chain.puts)
+        result["uoa_in_state"]={"net_flow":state.get("uoa_data",{}).get("net_flow","MISSING"),
+            "signal":state.get("uoa_data",{}).get("uoa_signal","MISSING"),
+            "whales":len(state.get("uoa_data",{}).get("whale_alerts",[])),
+            "reasons":state.get("uoa_data",{}).get("uoa_reasons",[])}
+    except Exception as e:
+        import traceback; result["error"]=str(e); result["tb"]=traceback.format_exc()[-600:]
+    return jsonify(result)
 
 @app.route("/api/refresh")
 def api_refresh():
     threading.Thread(target=run_analysis).start()
     return jsonify({"status": "refreshing"})
-
-@app.route("/api/debug/options")
-def api_debug_options():
-    """Debug: test yfinance options chain directly."""
-    ticker_sym = request.args.get("ticker", TICKER)
-    result = {"ticker": ticker_sym, "steps": []}
-    try:
-        tkr = yf.Ticker(ticker_sym)
-        result["steps"].append("yf.Ticker() created")
-        expiries = tkr.options
-        result["expiries"] = list(expiries) if expiries else []
-        result["steps"].append(f"tkr.options returned {len(expiries) if expiries else 0} expiries")
-        if expiries:
-            chain = tkr.option_chain(expiries[0])
-            result["steps"].append(f"option_chain({expiries[0]}) OK")
-            result["calls_rows"] = len(chain.calls)
-            result["puts_rows"]  = len(chain.puts)
-            result["sample_call"] = chain.calls.head(2).to_dict("records") if len(chain.calls) else []
-        result["uoa_data_in_state"] = {
-            "net_flow":     state.get("uoa_data", {}).get("net_flow", "MISSING"),
-            "uoa_signal":   state.get("uoa_data", {}).get("uoa_signal", "MISSING"),
-            "whale_count":  len(state.get("uoa_data", {}).get("whale_alerts", [])),
-            "unusual_total":state.get("uoa_data", {}).get("total_unusual", 0),
-            "uoa_reasons":  state.get("uoa_data", {}).get("uoa_reasons", []),
-        }
-    except Exception as e:
-        result["error"] = str(e)
-        import traceback
-        result["traceback"] = traceback.format_exc()[-800:]
-    return jsonify(result)
 
 @app.route("/api/institutions/refresh")
 def api_inst_refresh():
@@ -5203,9 +5290,10 @@ def health(): return jsonify({"status": "ok"}), 200
 #  SPOCK 2.0 — AI TRADING CO-PILOT (Claude-powered, server-side)
 # ═══════════════════════════════════════════════════════════════
 
-def build_spock_prompt(portfolio=100000, shares=0, entry_price=0):
+def build_spock_prompt(portfolio=100000, shares=0, entry_price=0, ticker_override=None):
     """Assembles full market snapshot into Spock's prompt."""
     s         = state
+    if ticker_override: s = dict(s); s["ticker"] = ticker_override.upper()
     dv        = s.get("darthvader", {})
     dv_state  = dv.get("tsla_state", {})
     risk      = dv.get("risk_mode", "UNKNOWN")
@@ -5313,7 +5401,8 @@ Portfolio: ${portfolio:,}
 Watching for entry. Assess whether current conditions warrant opening a position.
 If yes: what price, how many shares, what stop loss."""
 
-    prompt = f"""You are SPOCK — a ruthlessly logical AI trading co-pilot for an active TSLA trader.
+    ticker_name = s.get("ticker","TSLA")
+    prompt = f"""You are SPOCK — a ruthlessly logical AI trading co-pilot for an active {ticker_name} trader.
 You have access to a sophisticated multi-layer quant system (DarthVader 2.0).
 Be precise. Be direct. Give exact prices and percentages. No vague answers.
 The trader is relying on you for actionable guidance.
@@ -5397,7 +5486,7 @@ WATCH FOR:
 
     return prompt
 
-def call_spock(trigger="manual", portfolio=100000, shares=0, entry_price=0):
+def call_spock(trigger="manual", portfolio=100000, shares=0, entry_price=0, ticker=None):
     """Call Claude API server-side and cache the result."""
     import time, urllib.request, json as _json
 
@@ -5417,7 +5506,7 @@ def call_spock(trigger="manual", portfolio=100000, shares=0, entry_price=0):
 
     _spock_cache["running"] = True
     try:
-        prompt = build_spock_prompt(portfolio, shares, entry_price)
+        prompt = build_spock_prompt(portfolio, shares, entry_price, ticker_override=ticker)
 
         payload = _json.dumps({
             "model": "claude-sonnet-4-6",
@@ -5436,7 +5525,7 @@ def call_spock(trigger="manual", portfolio=100000, shares=0, entry_price=0):
             method="POST"
         )
 
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=25) as resp:
             data = _json.loads(resp.read())
 
         text = data["content"][0]["text"].strip()
@@ -5727,7 +5816,7 @@ def check_spock_triggers(algo_alert=None):
         print(f"  🖖 Spock auto-trigger: {trigger}")
         threading.Thread(
             target=call_spock,
-            kwargs={"trigger": trigger},
+            kwargs={"trigger": trigger, "ticker": state.get("ticker","TSLA")},
             daemon=True
         ).start()
 
@@ -5783,9 +5872,9 @@ def calculate_new_highs_lows():
     def _scan_one(tkr):
         try:
             import yfinance as yf
-            df = yf.Ticker(tkr).history(period="1d", interval="1m", auto_adjust=True)
+            df = yf.Ticker(tkr).history(period="1d", interval="1m")
             if df is None or df.empty or len(df) < 5:
-                df = yf.Ticker(tkr).history(period="1d", interval="5m", auto_adjust=True)
+                df = yf.Ticker(tkr).history(period="1d", interval="5m")
             if df is None or df.empty or len(df) < 3:
                 return None
 
@@ -6573,43 +6662,18 @@ function initChart() {
   }
 });
 
-// -- Ichimoku Chart --
-const _ich=document.getElementById('ichimokuChart'); const ichCtx=_ich?_ich.getContext('2d'):null;
-let ichimokuChart = null; if(ichCtx) ichimokuChart = new Chart(ichCtx, {
-  type:'line',
-  data:{labels:[],datasets:[
-    {label:'Close',     data:[], borderColor:'#fff',        borderWidth:2, pointRadius:0, tension:0.3, fill:false, order:1},
-    {label:'Tenkan',    data:[], borderColor:'#ff6688',     borderWidth:1, pointRadius:0, tension:0.3, fill:false, order:2},
-    {label:'Kijun',     data:[], borderColor:'#4488ff',     borderWidth:1, pointRadius:0, tension:0.3, fill:false, order:3},
-    {label:'Span A',    data:[], borderColor:'rgba(0,255,136,0.6)', borderWidth:1, pointRadius:0, tension:0.3,
-      fill:'+1', backgroundColor:'rgba(0,255,136,0.08)', order:4},
-    {label:'Span B',    data:[], borderColor:'rgba(255,51,85,0.6)',  borderWidth:1, pointRadius:0, tension:0.3,
-      fill:false, backgroundColor:'rgba(255,51,85,0.08)', order:5},
-  ]},
-  options:{
-    ...CHART_DEFAULTS,
-    plugins:{legend:{display:true, labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:20}}},
-  }
-});
-
-// -- HMM Chart --
-const _hmm=document.getElementById('hmmChart'); const hmmCtx=_hmm?_hmm.getContext('2d'):null;
-let hmmChart = null; if(hmmCtx) hmmChart = new Chart(hmmCtx, {
-  type:'bar',
-  data:{labels:[],datasets:[{label:'Daily Return (%)',data:[],backgroundColor:[],borderWidth:0,borderRadius:2}]},
-  options:{
-    responsive:true, maintainAspectRatio:false,
-    plugins:{legend:{display:false},
-      tooltip:{callbacks:{label:ctx=>`${ctx.parsed.y.toFixed(2)}% - ${ctx.dataset.regimes?ctx.dataset.regimes[ctx.dataIndex]:''}`}}},
-    scales:{
-      x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:12}},
-      y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:9},callback:v=>v.toFixed(1)+'%'}}
-    }
-  }
-}); } catch(e) { console.error('Chart init failed:', e.message, e.stack); }
+} catch(e) { console.error('Chart init failed:', e.message); }
 }
 initChart();
 setTimeout(initChart, 500);
+
+var ichimokuChart = null, hmmChart = null;
+function initIchiHmm() {
+  if(typeof Chart==='undefined'){setTimeout(initIchiHmm,200);return;}
+  if(!ichimokuChart){var _ich=document.getElementById('ichimokuChart');if(_ich)try{ichimokuChart=new Chart(_ich.getContext('2d'),{type:'line',data:{labels:[],datasets:[{label:'Close',data:[],borderColor:'#fff',borderWidth:2,pointRadius:0,tension:0.3,fill:false,order:1},{label:'Tenkan',data:[],borderColor:'#ff6688',borderWidth:1,pointRadius:0,tension:0.3,fill:false,order:2},{label:'Kijun',data:[],borderColor:'#4488ff',borderWidth:1,pointRadius:0,tension:0.3,fill:false,order:3},{label:'Span A',data:[],borderColor:'rgba(0,255,136,0.6)',borderWidth:1,pointRadius:0,tension:0.3,fill:'+1',backgroundColor:'rgba(0,255,136,0.08)',order:4},{label:'Span B',data:[],borderColor:'rgba(255,51,85,0.6)',borderWidth:1,pointRadius:0,tension:0.3,fill:false,order:5}]},options:{...CHART_DEFAULTS,plugins:{legend:{display:true,labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:20}}}}});}catch(e){console.warn('ichimokuChart:',e.message);}}
+  if(!hmmChart){var _hmm=document.getElementById('hmmChart');if(_hmm)try{hmmChart=new Chart(_hmm.getContext('2d'),{type:'bar',data:{labels:[],datasets:[{label:'Daily Return (%)',data:[],backgroundColor:[],borderWidth:0,borderRadius:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:function(c){return c.parsed.y.toFixed(2)+'%';} }}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:12}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:9},callback:function(v){return v.toFixed(1)+'%';}}}}}});}catch(e){console.warn('hmmChart:',e.message);}}
+}
+initIchiHmm(); setTimeout(initIchiHmm,600); setTimeout(initIchiHmm,1500);
 
 // -- UOA Heatmap Chart --
 const _uoa=document.getElementById('uoaHeatmapChart'); const uoaHeatCtx=_uoa?_uoa.getContext('2d'):null;
@@ -7066,14 +7130,13 @@ function updateTickerBar(s) {
 
 function updateUI(s) {
   // -- Signal Badge --
-  const badge = document.getElementById('signalBadge');
-  badge.textContent = s.signal; badge.className = 'signal-badge '+s.signal;
-  document.getElementById('priceVal').textContent = s.price ? '$'+s.price.toLocaleString('en-US',{minimumFractionDigits:2}) : '-';
-  const pct = s.signal_strength||0;
-  const fill = document.getElementById('strengthFill');
-  fill.style.width = pct+'%';
-  fill.style.background = s.signal==='BUY'?'#00ff88':s.signal==='SELL'?'#ff3355':'#ffb300';
-  document.getElementById('strengthVal').textContent = pct;
+  var badge=document.getElementById('signalBadge');
+  if(badge){badge.textContent=s.signal||'--';badge.className='signal-badge '+(s.signal||'');}
+  var _pv=document.getElementById('priceVal');if(_pv)_pv.textContent=s.price?'$'+s.price.toLocaleString('en-US',{minimumFractionDigits:2}):'-';
+  var pct=s.signal_strength||0;
+  var fill=document.getElementById('strengthFill');
+  if(fill){fill.style.width=pct+'%';fill.style.background=s.signal==='BUY'?'#00ff88':s.signal==='SELL'?'#ff3355':'#ffb300';}
+  var _sv=document.getElementById('strengthVal');if(_sv)_sv.textContent=pct;
   // WhatsApp status badge
   const waEl = document.getElementById('waStatus');
   if(waEl) {
@@ -7120,30 +7183,13 @@ function updateUI(s) {
   setText('ind-hmm-next', hmm.next_regime ? hmm.next_regime+' ('+hmm.next_prob+'% prob)' : '-');
 
   // -- Price Chart + Annotations --
-  if(s.price_history?.length) {
-    chart.data.labels = s.price_history.map(p=>p.date.slice(5));
-    chart.data.datasets[0].data = s.price_history.map(p=>p.price);
-    // Annotations drawn AFTER data so y-axis range is correct
-    updateChartAnnotations(s);
-    chart.resize();
-    chart.update('none');
-  }
+  if(s.price_history && s.price_history.length && chart){try{chart.data.labels=s.price_history.map(p=>p.date.slice(5));chart.data.datasets[0].data=s.price_history.map(p=>p.price);updateChartAnnotations(s);chart.update('none');}catch(e){console.warn('priceChart:'+e.message);}}
 
   // -- Live Ticker Bar --
   updateTickerBar(s);
 
   // -- MACD Charts --
-  if(s.macd_history?.length) {
-    const mh = s.macd_history;
-    macdLineChart.data.labels = mh.map(m=>m.date.slice(5));
-    macdLineChart.data.datasets[0].data = mh.map(m=>m.macd);
-    macdLineChart.data.datasets[1].data = mh.map(m=>m.signal);
-    macdLineChart.update('none');
-    macdHistChart.data.labels = mh.map(m=>m.date.slice(5));
-    macdHistChart.data.datasets[0].data = mh.map(m=>m.hist);
-    macdHistChart.data.datasets[0].backgroundColor = mh.map(m=>m.color+'cc');
-    macdHistChart.update('none');
-  }
+  if(s.macd_history&&s.macd_history.length&&macdLineChart&&macdHistChart){try{var mh=s.macd_history;macdLineChart.data.labels=mh.map(m=>m.date.slice(5));macdLineChart.data.datasets[0].data=mh.map(m=>m.macd);macdLineChart.data.datasets[1].data=mh.map(m=>m.signal);macdLineChart.update('none');macdHistChart.data.labels=mh.map(m=>m.date.slice(5));macdHistChart.data.datasets[0].data=mh.map(m=>m.hist);macdHistChart.data.datasets[0].backgroundColor=mh.map(m=>m.color+'cc');macdHistChart.update('none');}catch(e){console.warn('macdCharts:'+e.message);}}
 
   // -- Volume Charts --
   if(s.vol_history?.length) {
@@ -7242,22 +7288,20 @@ function updateUI(s) {
 
   document.getElementById('lastUpdated').textContent = s.last_updated ? 'Updated '+s.last_updated : '-';
 
-  // -- SPY / Macro Panel --
-    // -- All Panels --
-  renderExitPanel(s.exit_data || {});
-  renderUOAPanel(s.uoa_data || {});
-  const pv = parseFloat(document.getElementById('portfolioInput')?.value || 100000);
-  renderEntryPanel(s.entry_data || {}, pv);
-  renderPeakPanel(s.peak_data || {});
-  renderCTAPanel(s.sizing || {}, s.price || 0);
-  renderExtPanel(s.ext_data || {});
-  updateAlgoRadar(s);
-  renderNewsPanel(s.news_data || {});
-  renderSPYPanel(s.spy_data || {});
-  renderMMPanel(s.mm_data || {}, s.dark_pool || {}, s.price || 0);
-  renderInstModels(s.institutional_models || {}, s.indicators || {});
-  // DarthVader 1.0
-  if(s.darthvader) renderDarthVader(s.darthvader);
+  [
+    function(){renderExitPanel(s.exit_data||{});},
+    function(){renderUOAPanel(s.uoa_data||{});},
+    function(){var pv=parseFloat((document.getElementById('portfolioInput')||{}).value||'100000')||100000;renderEntryPanel(s.entry_data||{},pv);},
+    function(){renderPeakPanel(s.peak_data||{});},
+    function(){renderCTAPanel(s.sizing||{},s.price||0);},
+    function(){renderExtPanel(s.ext_data||{});},
+    function(){updateAlgoRadar(s);},
+    function(){renderNewsPanel(s.news_data||{});},
+    function(){renderSPYPanel(s.spy_data||{});},
+    function(){renderMMPanel(s.mm_data||{},s.dark_pool||{},s.price||0);},
+    function(){renderInstModels(s.institutional_models||{},s.indicators||{});},
+    function(){if(s.darthvader)renderDarthVader(s.darthvader);},
+  ].forEach(function(fn,i){try{fn();}catch(e){console.warn('Panel['+i+']: '+e.message);}});
 }
 
 
@@ -8041,9 +8085,7 @@ function renderSPYPanel(spy) {
   // VIX chart
   if(false && spy.vix_history?.length && vixChart) { // vixChart removed
     const vh = spy.vix_history;
-    vixChart.data.labels = vh.map(v => v.date?.slice(5));
-    vixChart.data.datasets[0].data = vh.map(v => v.vix);
-    vixChart.update('none');
+    if(vixChart){try{vixChart.data.labels=vh.map(v=>v.date?v.date.slice(5):'');vixChart.data.datasets[0].data=vh.map(v=>v.vix);vixChart.update('none');}catch(e){console.warn('vixChart:'+e.message);}}
   }
 
   // Macro reasons chips
@@ -8133,10 +8175,7 @@ function renderMMPanel(mm, dp, price) {
   // -- OI Chart --
   if(mm.oi_by_strike?.length) {
     const os = mm.oi_by_strike;
-    oiChart.data.labels = os.map(o => '$' + o.strike);
-    oiChart.data.datasets[0].data = os.map(o => o.call_oi);
-    oiChart.data.datasets[1].data = os.map(o => o.put_oi);
-    oiChart.update('none');
+    if(oiChart){try{oiChart.data.labels=os.map(o=>'$'+o.strike);oiChart.data.datasets[0].data=os.map(o=>o.call_oi);oiChart.data.datasets[1].data=os.map(o=>o.put_oi);oiChart.update('none');}catch(e){console.warn('oiChart:'+e.message);}}
   }
 
   // -- Dark Pool Levels --
@@ -8538,7 +8577,75 @@ function renderInstModels(m, ind) {
   ).join('');
 }
 
-async function fetchState() { try { updateUI(await (await fetch('/api/state')).json()); } catch(e){} }
+var _sqPoll = null;
+var SQ_COLORS = {
+  BUY:    {bg:'rgba(0,255,136,0.15)',border:'rgba(0,255,136,0.5)',text:'#00ff88'},
+  SELL:   {bg:'rgba(255,51,85,0.15)',border:'rgba(255,51,85,0.5)',text:'#ff3355'},
+  HOLD:   {bg:'rgba(0,229,255,0.12)',border:'rgba(0,229,255,0.35)',text:'#00e5ff'},
+  WAIT:   {bg:'rgba(255,179,0,0.12)',border:'rgba(255,179,0,0.35)',text:'#ffb300'},
+  CAUTION:{bg:'rgba(255,152,0,0.15)',border:'rgba(255,152,0,0.45)',text:'#ff9800'},
+  AVOID:  {bg:'rgba(255,51,85,0.12)',border:'rgba(255,51,85,0.4)',text:'#ff3355'},
+};
+function triggerQuickRead() {
+  var btn=document.getElementById('sqBtn'),spinner=document.getElementById('sqSpinner'),
+      sentence=document.getElementById('sqSentence');
+  if(btn){btn.disabled=true;btn.textContent='READING...';}
+  if(spinner)spinner.style.display='inline';
+  if(sentence)sentence.textContent='Consulting 100 years of market data...';
+  fetch('/api/spock/quickread',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({ticker:_currentTicker})})
+  .then(function(r){return r.json();})
+  .then(function(){_pollQuickRead(0);})
+  .catch(function(e){
+    if(sentence)sentence.textContent='Error: '+e.message;
+    if(btn){btn.disabled=false;btn.textContent='READ';}
+    if(spinner)spinner.style.display='none';
+  });
+}
+function _pollQuickRead(n) {
+  if(_sqPoll)clearTimeout(_sqPoll);
+  if(n>15){
+    var s=document.getElementById('sqSentence'),b=document.getElementById('sqBtn'),sp=document.getElementById('sqSpinner');
+    if(s)s.textContent='Timed out - press READ to retry';
+    if(b){b.disabled=false;b.textContent='READ';}if(sp)sp.style.display='none';return;
+  }
+  fetch('/api/spock/quickread/status').then(function(r){return r.json();}).then(function(d){
+    if(d.running){_sqPoll=setTimeout(function(){_pollQuickRead(n+1);},1500);}
+    else if(d.has_read&&d.quick_read){renderQuickRead(d.quick_read);}
+    else if(n<3){_sqPoll=setTimeout(function(){_pollQuickRead(n+1);},1500);}
+    else{var b=document.getElementById('sqBtn'),sp=document.getElementById('sqSpinner');
+      if(b){b.disabled=false;b.textContent='READ';}if(sp)sp.style.display='none';}
+  }).catch(function(){_sqPoll=setTimeout(function(){_pollQuickRead(n+1);},1500);});
+}
+function renderQuickRead(qr) {
+  var action=(qr.action||'HOLD').toUpperCase(),c=SQ_COLORS[action]||SQ_COLORS.HOLD;
+  var aEl=document.getElementById('sqAction'),sEl=document.getElementById('sqSentence'),
+      tEl=document.getElementById('sqTime'),tkEl=document.getElementById('sqTicker'),
+      btn=document.getElementById('sqBtn'),sp=document.getElementById('sqSpinner'),
+      bar=document.getElementById('spockQuickBar');
+  if(aEl){aEl.textContent=action;aEl.style.background=c.bg;aEl.style.borderColor=c.border;aEl.style.color=c.text;}
+  if(sEl){sEl.textContent=qr.sentence||'';sEl.style.color=c.text;}
+  if(tEl)tEl.textContent=qr.timestamp||'';
+  if(tkEl)tkEl.textContent=qr.ticker||_currentTicker;
+  if(bar)bar.style.borderTopColor=c.border;
+  if(btn){btn.disabled=false;btn.textContent='READ';}
+  if(sp)sp.style.display='none';
+}
+function _resetQuickReadBar(){
+  var sEl=document.getElementById('sqSentence'),aEl=document.getElementById('sqAction'),tEl=document.getElementById('sqTime');
+  if(sEl)sEl.textContent='Press READ to get SPOCK analysis for '+_currentTicker;
+  if(aEl){aEl.textContent='—';aEl.style.color='#00e5ff';aEl.style.background='rgba(0,229,255,0.12)';aEl.style.borderColor='rgba(0,229,255,0.3)';}
+  if(tEl)tEl.textContent='—';
+}
+
+async function fetchState() {
+  try {
+    var resp = await fetch('/api/state');
+    if(!resp.ok){ console.warn('fetchState HTTP ' + resp.status); return; }
+    var data = await resp.json();
+    try { updateUI(data); } catch(e) { console.error('updateUI: ' + e.message); }
+  } catch(e) { console.warn('fetchState: ' + e.message); }
+}
 async function manualRefresh() { await fetch('/api/refresh'); setTimeout(fetchState,2000); }
 showChartTab('price');
 fetchState();
@@ -8922,6 +9029,7 @@ function selectTicker(sym) {
   sym = sym.toUpperCase().trim();
   if(!sym) return;
   _currentTicker = sym;
+  if(typeof _resetQuickReadBar==='function') _resetQuickReadBar();
   // Clear search box so it shows placeholder again
   var inp = document.getElementById('tickerSearchInput');
   if(inp) { inp.value = ''; inp.placeholder = 'Search symbol...'; }
@@ -9351,27 +9459,50 @@ function askSpock() {
   fetch('/api/spock', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ trigger: 'manual', portfolio: portfolio, shares: shares, entry_price: entry })
+    body: JSON.stringify({ trigger: 'manual', portfolio: portfolio, shares: shares, entry_price: entry, ticker: _currentTicker })
   })
   .then(function(r) { return r.json(); })
-  .then(function(d) {
-    if (d.error) {
-      if (statusEl) { statusEl.textContent = 'Error: ' + d.error; statusEl.style.color = '#ff3355'; }
-      if (loadEl)  { loadEl.style.display  = 'none';  }
-      if (emptyEl) { emptyEl.style.display = 'block'; }
-    } else {
-      renderSpockAnalysis(d);
-      if (statusEl) { statusEl.textContent = 'Updated ' + (d.timestamp || ''); statusEl.style.color = '#00ff88'; }
-    }
+  .then(function() {
+    if (statusEl) { statusEl.textContent = 'Thinking... (0s)'; statusEl.style.color = '#00e5ff'; }
+    _pollSpock(0);
   })
   .catch(function(err) {
     if (statusEl) { statusEl.textContent = 'Network error: ' + err.message; statusEl.style.color = '#ff3355'; }
-    if (loadEl)  { loadEl.style.display  = 'none';  }
+    if (loadEl)  { loadEl.style.display = 'none'; }
     if (emptyEl) { emptyEl.style.display = 'block'; }
-  })
-  .finally(function() {
     if (btn) { btn.disabled = false; btn.style.opacity = '1'; btn.textContent = 'ANALYZE POSITION'; }
   });
+}
+
+var _spockPoll = null;
+function _pollSpock(n) {
+  if (_spockPoll) clearTimeout(_spockPoll);
+  var btn=document.getElementById('spockAnalyzeBtn'),statusEl=document.getElementById('spockStatus'),
+      loadEl=document.getElementById('spockLoading'),emptyEl=document.getElementById('spockEmpty');
+  if (n > 20) {
+    fetch('/api/spock/reset').catch(function(){});
+    if (statusEl) { statusEl.textContent = 'Timed out - try again'; statusEl.style.color = '#ff3355'; }
+    if (loadEl)  loadEl.style.display = 'none';
+    if (emptyEl) emptyEl.style.display = 'block';
+    if (btn) { btn.disabled = false; btn.style.opacity = '1'; btn.textContent = 'ANALYZE POSITION'; }
+    return;
+  }
+  fetch('/api/spock/status').then(function(r){return r.json();}).then(function(d){
+    if (d.running) {
+      if (statusEl) statusEl.textContent = 'Thinking... (' + (n*2) + 's)';
+      _spockPoll = setTimeout(function(){ _pollSpock(n+1); }, 2000);
+    } else if (d.has_analysis && d.analysis) {
+      renderSpockAnalysis(d.analysis);
+      if (statusEl) { statusEl.textContent = 'Updated ' + (d.analysis.timestamp||''); statusEl.style.color = '#00ff88'; }
+      if (btn) { btn.disabled = false; btn.style.opacity = '1'; btn.textContent = 'ANALYZE POSITION'; }
+    } else if (n < 4) {
+      _spockPoll = setTimeout(function(){ _pollSpock(n+1); }, 2000);
+    } else {
+      if (loadEl)  loadEl.style.display = 'none';
+      if (emptyEl) emptyEl.style.display = 'block';
+      if (btn) { btn.disabled = false; btn.style.opacity = '1'; btn.textContent = 'ANALYZE POSITION'; }
+    }
+  }).catch(function(){ _spockPoll = setTimeout(function(){ _pollSpock(n+1); }, 2000); });
 }
 
 function spockExtract(txt, label) {
@@ -9699,7 +9830,7 @@ setTimeout(pollSpockStatus, 5000);
   <div class="strength-bar-wrap" style="display:none;"><div class="strength-bar"><div class="strength-fill" id="strengthFill" style="width:0%"></div></div><div class="strength-val"><span id="strengthVal">0</span>/100</div></div>
   </div><!-- /signal-panel -->
 
-  <!-- SYSTEM INTENT NARRATIVE BAR (Change #4 from doc — market wants to do) -->
+  <!-- SYSTEM INTENT NARRATIVE BAR -->
   <div id="intentBar" style="background:rgba(138,43,226,0.06);border-top:1px solid rgba(138,43,226,0.2);
        padding:8px 28px;display:flex;align-items:center;gap:16px;grid-column:1/-1;">
     <span style="font-size:8px;letter-spacing:3px;color:#b388ff;flex-shrink:0;">⚔️ SYSTEM READS</span>
@@ -9714,6 +9845,29 @@ setTimeout(pollSpockStatus, 5000);
       <span style="font-size:8px;color:var(--text-dim);">STRETCH CONDITION</span>
       <span id="stretchCondition" style="font-family:var(--font-mono);font-size:10px;color:#ff9800;">—</span>
     </div>
+  </div>
+
+  <!-- SPOCK QUICK READ BAR -->
+  <div id="spockQuickBar" style="background:rgba(0,229,255,0.04);border-top:1px solid rgba(0,229,255,0.15);
+       padding:7px 28px;display:flex;align-items:center;gap:12px;grid-column:1/-1;min-height:36px;">
+    <span style="font-size:8px;letter-spacing:3px;color:#00e5ff;flex-shrink:0;">🖖 SPOCK READ</span>
+    <span id="sqAction" style="font-family:var(--font-mono);font-size:11px;font-weight:700;
+      padding:2px 10px;border-radius:1px;letter-spacing:1.5px;flex-shrink:0;
+      background:rgba(0,229,255,0.12);color:#00e5ff;border:1px solid rgba(0,229,255,0.3);">—</span>
+    <span id="sqSentence" style="font-family:var(--font-mono);font-size:10px;color:var(--text);
+      flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+      Press READ to get SPOCK market analysis
+    </span>
+    <span id="sqSpinner" style="display:none;font-size:9px;color:#00e5ff;font-family:var(--font-mono);flex-shrink:0;">ANALYZING...</span>
+    <span id="sqTime" style="font-size:8px;color:var(--text-dim);flex-shrink:0;font-family:var(--font-mono);">—</span>
+    <span id="sqTicker" style="font-size:8px;color:var(--text-dim);font-family:var(--font-mono);
+      padding:1px 6px;border:1px solid rgba(255,255,255,0.1);border-radius:1px;flex-shrink:0;">—</span>
+    <button id="sqBtn" onclick="triggerQuickRead()"
+      style="flex-shrink:0;background:rgba(0,229,255,0.08);border:1px solid rgba(0,229,255,0.4);
+      color:#00e5ff;font-family:var(--font-mono);font-size:9px;letter-spacing:1.5px;
+      padding:4px 14px;cursor:pointer;border-radius:1px;"
+      onmouseover="this.style.background='rgba(0,229,255,0.2)'"
+      onmouseout="this.style.background='rgba(0,229,255,0.08)'">READ</button>
   </div>
 
 
