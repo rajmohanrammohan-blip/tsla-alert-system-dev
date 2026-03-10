@@ -27,6 +27,18 @@ import requests
 import yfinance as yf
 import pandas as pd
 import numpy as np
+
+def _yf_history(symbol, retries=3, **kwargs):
+    """yfinance retry wrapper — no session injection (breaks 0.2.x+ curl_cffi)."""
+    for attempt in range(retries):
+        try:
+            df = yf.Ticker(symbol).history(**kwargs)
+            if df is not None and not df.empty: return df
+            if attempt < retries-1: time.sleep(2+attempt*2)
+        except Exception as e:
+            print(f"  yfinance {symbol} attempt {attempt+1}/{retries}: {str(e)[:100]}")
+            if attempt < retries-1: time.sleep(3+attempt*3)
+    return None
 from flask import Flask, jsonify, render_template_string, request
 from dotenv import load_dotenv
 try:
@@ -98,13 +110,15 @@ state = {
 
 # ── Spock AI cache ──
 _spock_cache = {
-    "last_analysis":    None,   # last Spock response text
-    "last_trigger":     None,   # what triggered it
-    "last_ts":          0,      # unix timestamp of last call
-    "last_dv_state":    None,   # DV state at last analysis
-    "last_risk_mode":   None,   # risk mode at last analysis
-    "last_whale_count": 0,      # whale count at last analysis
-    "running":          False,  # prevent concurrent calls
+    "last_analysis":    None,
+    "last_trigger":     None,
+    "last_ts":          0,
+    "last_dv_state":    None,
+    "last_risk_mode":   None,
+    "last_whale_count": 0,
+    "running":          False,
+    "quick_read":       None,
+    "quick_running":    False,
 }
 SPOCK_COOLDOWN = 180  # seconds between auto-triggers
 
@@ -2061,10 +2075,13 @@ def calculate_unusual_options_activity(ticker_symbol, current_price):
     try:
         import math
         tkr      = yf.Ticker(ticker_symbol)
+        print(f"  [UOA] Fetching options for {ticker_symbol}...", flush=True)
         expiries = tkr.options
         if not expiries:
+            print(f"  [UOA] tkr.options empty/None for {ticker_symbol}", flush=True)
             result["uoa_signal"] = "NO OPTIONS DATA"
             return result
+        print(f"  [UOA] Got {len(expiries)} expiries: {list(expiries)[:3]}", flush=True)
 
         # Scan nearest 4 expiries — captures weekly and monthly flow
         scan_expiries = expiries[:4]
@@ -4376,7 +4393,8 @@ def run_analysis():
                 print(f"  ⚠️ yfinance fetch error (attempt {_attempt+1}/3): {_ye}")
                 time.sleep(2)
         if hist is None or hist.empty:
-            print(f"[FATAL] Could not fetch {TICKER} data after 3 attempts", flush=True)
+            print(f"[FATAL] Could not fetch {TICKER} data — retrying next cycle",flush=True)
+            state.update({"signal":"WAIT","price":state.get("price",0),"market_state":"DATA UNAVAILABLE","last_updated":datetime.now().strftime("%H:%M:%S"),"signal_strength":0})
             return
         closes  = hist["Close"]
         volumes = hist["Volume"]
@@ -4667,11 +4685,23 @@ def run_analysis():
             "ichimoku_history": ichi.get("history", []),
         })
 
+        # ── Capitulation Bounce Detector ─────────────────────────
+        cap_result = {}
+        try:
+            cap_result = calculate_capitulation_bounce(TICKER, price, closes, highs, lows)
+            state["capitulation"] = _sanitize(cap_result)
+            if cap_result.get("detected"):
+                print(f"  CAPITULATION BOUNCE DETECTED! Conv:{cap_result.get('conviction',0)} Phase:{cap_result.get('phase','?')}", flush=True)
+        except Exception as _cap_e:
+            print(f"  Capitulation detector error: {_cap_e}", flush=True)
+            state["capitulation"] = {}
+
         # ── DarthVader 1.0 — Institutional Intelligence ──────────
         try:
             dv_result = calculate_darthvader(
                 closes, highs, lows, volumes, opens_s,
                 mm_data, spy_data, indicators,
+                cap_data=cap_result,
             )
             state["darthvader"] = _sanitize(dv_result)
             dv_state = dv_result.get("tsla_state", {}).get("state", "?")
@@ -4769,55 +4799,30 @@ def run_analysis():
         prev_cap = state.get("_prev_cap_detected", False)
         curr_cap = cap_result.get("detected", False)
         if curr_cap and not prev_cap:
-            cap_conv   = cap_result.get("conviction", 0)
-            cap_phase  = cap_result.get("phase", "?")
-            cap_drop   = cap_result.get("drop_from_high_pct", 0)
-            cap_low    = cap_result.get("session_low", 0)
-            cap_high   = cap_result.get("session_high", 0)
-            cap_entry_lo = cap_result.get("entry_zone_low", 0)
-            cap_entry_hi = cap_result.get("entry_zone_high", 0)
-            cap_stop   = cap_result.get("stop_loss", 0)
-            cap_t1     = cap_result.get("t1", 0)
-            cap_t2     = cap_result.get("t2", 0)
-            cap_t3     = cap_result.get("t3", 0)
-            cap_vwap   = cap_result.get("vwap", 0)
-            cap_reasns = cap_result.get("reasons", [])
+            cap_conv=cap_result.get("conviction",0); cap_phase=cap_result.get("phase","?")
+            cap_drop=cap_result.get("drop_from_high_pct",0)
+            cap_lo=cap_result.get("session_low",0); cap_hi=cap_result.get("session_high",0)
+            cap_elo=cap_result.get("entry_zone_low",0); cap_ehi=cap_result.get("entry_zone_high",0)
+            cap_stop=cap_result.get("stop_loss",0)
+            cap_t1=cap_result.get("t1",0); cap_t2=cap_result.get("t2",0); cap_t3=cap_result.get("t3",0)
+            cap_vwap=cap_result.get("vwap",0); cap_rs=cap_result.get("reasons",[])
             send_whatsapp(
-                f"🎯 *CAPITULATION BOUNCE DETECTED — {TICKER}*\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"Phase: *{cap_phase}* | Conviction: *{cap_conv}/100*\n"
-                f"\n"
-                f"📉 *The Drop:*\n"
-                f"  Session High: ${cap_high:.2f}\n"
-                f"  Session Low:  ${cap_low:.2f}\n"
-                f"  Drop: *{cap_drop:.1f}%* ({cap_high - cap_low:.2f} pts)\n"
-                f"\n"
-                f"💰 *Current Price:* ${price:.2f}\n"
-                f"📊 *VWAP:* ${cap_vwap:.2f}\n"
-                f"\n"
-                f"🟢 *MULTI-DAY LONG SETUP:*\n"
-                f"  Entry:   ${cap_entry_lo:.2f} – ${cap_entry_hi:.2f}\n"
-                f"  Stop:    ${cap_stop:.2f}\n"
-                f"  T1:      ${cap_t1:.2f}\n"
-                f"  T2:      ${cap_t2:.2f}\n"
-                f"  T3:      ${cap_t3:.2f}\n"
-                f"\n"
-                f"📡 *Why:*\n"
-                + "\n".join(f"  • {r}" for r in cap_reasns[:4]),
+                f"CAPITULATION BOUNCE DETECTED — {TICKER}\n"
+                f"Phase: {cap_phase} | Conviction: {cap_conv}/100\n"
+                f"Drop: {cap_drop:.1f}% from ${cap_hi:.2f} to ${cap_lo:.2f}\n"
+                f"Current: ${price:.2f} | VWAP: ${cap_vwap:.2f}\n"
+                f"MULTI-DAY LONG SETUP:\n"
+                f"  Entry: ${cap_elo:.2f} - ${cap_ehi:.2f}\n"
+                f"  Stop: ${cap_stop:.2f}\n"
+                f"  T1: ${cap_t1:.2f} | T2: ${cap_t2:.2f} | T3: ${cap_t3:.2f}\n"
+                f"Signals: {' | '.join(cap_rs[:3])}",
                 alert_key="cap_bounce"
             )
-            # Auto-trigger SPOCK with bounce context
             if not _spock_cache.get("running"):
                 import threading as _ct
-                _ct.Thread(
-                    target=call_spock,
-                    kwargs={
-                        "trigger": "capitulation_bounce",
-                        "ticker": TICKER,
-                    },
-                    daemon=True
-                ).start()
-                print(f"  🖖 SPOCK auto-triggered: capitulation bounce", flush=True)
+                _ct.Thread(target=call_spock,
+                    kwargs={"trigger":"capitulation_bounce","ticker":TICKER},daemon=True).start()
+                print(f"  SPOCK auto-triggered: capitulation bounce",flush=True)
         state["_prev_cap_detected"] = curr_cap
 
         # ── Entry signal WhatsApp alert ──
@@ -5119,7 +5124,7 @@ def api_debug():
                 ("mm_data",    lambda: calculate_market_maker_data("TSLA", float(closes.iloc[-1]))),
                 ("uoa",        lambda: calculate_unusual_options_activity("TSLA", float(closes.iloc[-1]))),
                 ("exit",       lambda: calculate_exit_analysis(closes, highs, lows, volumes, {}, {})),
-                ("darthvader", lambda: calculate_darthvader(closes, highs, lows, volumes, opens_s, {}, {}, {}, cap_data=state.get("capitulation",{}))),
+                ("darthvader", lambda: calculate_darthvader(closes, highs, lows, volumes, opens_s, {}, {}, {})),
             ]:
                 try:
                     r = fn_call()
@@ -5135,17 +5140,22 @@ def api_debug():
 
 @app.route("/api/spock", methods=["GET", "POST"])
 def api_spock():
-    """Spock AI endpoint — manual trigger or fetch cached result."""
+    """Spock AI — fires background thread, returns immediately."""
     from flask import request as freq
-    data       = freq.get_json(silent=True) or {}
-    trigger    = data.get("trigger", "manual")
-    portfolio  = int(data.get("portfolio", 100000))
-    shares     = float(data.get("shares", 0))
-    entry_price= float(data.get("entry_price", 0))
-
-    result = call_spock(trigger=trigger, portfolio=portfolio,
-                        shares=shares, entry_price=entry_price)
-    return jsonify(result)
+    import threading as _thr
+    data        = freq.get_json(silent=True) or {}
+    trigger     = data.get("trigger", "manual")
+    portfolio   = int(data.get("portfolio", 100000))
+    shares      = float(data.get("shares", 0))
+    entry_price = float(data.get("entry_price", 0))
+    ticker_req  = data.get("ticker", state.get("ticker","TSLA")).upper()
+    if _spock_cache["running"]:
+        return jsonify({"status":"running","message":"Spock is already analyzing..."})
+    _thr.Thread(target=call_spock,
+        kwargs={"trigger":trigger,"portfolio":portfolio,
+                "shares":shares,"entry_price":entry_price,"ticker":ticker_req},
+        daemon=True).start()
+    return jsonify({"status":"started","message":"Spock is analyzing..."})
 
 
 @app.route("/api/algo_alerts")
@@ -5163,19 +5173,116 @@ def api_algo_alerts():
 
 @app.route("/api/spock/status")
 def api_spock_status():
-    """Returns cached Spock analysis without triggering a new one."""
-    cached = _spock_cache.get("last_analysis")
-    return jsonify({
-        "has_analysis": cached is not None,
-        "analysis":     cached,
-        "running":      _spock_cache["running"],
-        "last_trigger": _spock_cache["last_trigger"],
-    })
+    cached=_spock_cache.get("last_analysis")
+    return jsonify({"has_analysis":cached is not None,"analysis":cached,
+                    "running":_spock_cache["running"],"last_trigger":_spock_cache["last_trigger"]})
+
+@app.route("/api/spock/reset")
+def api_spock_reset():
+    _spock_cache["running"]=False
+    return jsonify({"status":"reset"})
+
+def call_spock_quickread(ticker=None):
+    """One-line ACTION — sentence header read."""
+    if _spock_cache.get("quick_running"): return
+    _spock_cache["quick_running"]=True
+    ticker_name=(ticker or state.get("ticker","TSLA")).upper()
+    try:
+        s=state; price=s.get("price",0); dv=s.get("darthvader",{})
+        dv_state=dv.get("tsla_state",{}); risk=dv.get("risk_mode","NORMAL")
+        probs=dv.get("probabilistic_signals",{}); rsi=s.get("indicators",{}).get("rsi",50)
+        vix=s.get("spy_data",{}).get("vix_current",0)
+        ext=s.get("ext_data",{}); session=ext.get("session","REGULAR")
+        from datetime import datetime as _dt
+        now=_dt.now(); month_name=now.strftime("%B"); day_of_week=now.strftime("%A")
+        is_opex=(now.weekday()==4 and 15<=now.day<=21)
+        system_prompt=(
+            "You are SPOCK - a ruthlessly logical AI trading co-pilot.\n"
+            "Task: ONE LINE ONLY in this exact format:\n"
+            "ACTION - one sentence explanation (max 12 words)\n\n"
+            "ACTION must be one of: BUY | SELL | HOLD | WAIT | CAUTION | AVOID\n\n"
+            "Rules:\n"
+            "- Total response: ONE LINE, NO newlines, NO bullets, NO extra text.\n"
+            "- Apply 100 years of market wisdom:\n"
+            "  * Momentum/mean-reversion base rates (RSI extremes, vol expansion)\n"
+            "  * Macro regime (rate cycle phase, inflation regime, yield curve)\n"
+            "  * Seasonality (OpEx vol, Fed week bias, Jan effect, sell-in-May)\n"
+            "  * Crash pattern analogs (1987, 2000, 2008, 2020)\n\n"
+            "Examples:\n"
+            "HOLD - RSI overbought near resistance, mean-reversion likely within 3 sessions\n"
+            "CAUTION - OpEx week historically volatile, wait for Friday resolution\n"
+            "BUY - momentum breakout confirmed, 1995-style melt-up regime, add on dips\n"
+            "AVOID - VIX spike matches 2018 vol unwind, stay flat until sub-20"
+        )
+        brk=probs.get("breakout_30m",{}).get("probability",0)
+        brd=probs.get("breakdown_30m",{}).get("probability",0)
+        user_msg=(
+            f"Ticker: {ticker_name} | Price: ${price} | Session: {session}\n"
+            f"DV State: {dv_state.get('state','?')} ({round(dv_state.get('confidence',0)*100)}% conf) | Risk: {risk}\n"
+            f"RSI: {round(rsi,1)} | VIX: {vix} | Month: {month_name} | Day: {day_of_week} | OpEx: {is_opex}\n"
+            f"Breakout: {brk:.0%} | Breakdown: {brd:.0%} | Intent: {dv.get('market_intent','?')}\n"
+            f"Generate the one-line header read now:"
+        )
+        import urllib.request as _u, json as _j
+        api_key=os.environ.get("ANTHROPIC_API_KEY","")
+        if not api_key:
+            _spock_cache["quick_read"]={"action":"WAIT","sentence":"API key not configured","ticker":ticker_name,"timestamp":"--"}
+            return
+        payload=_j.dumps({"model":"claude-haiku-4-5-20251001","max_tokens":80,
+            "system":system_prompt,"messages":[{"role":"user","content":user_msg}]}).encode()
+        req=_u.Request("https://api.anthropic.com/v1/messages",data=payload,
+            headers={"Content-Type":"application/json","x-api-key":api_key,"anthropic-version":"2023-06-01"})
+        with _u.urlopen(req,timeout=15) as resp: result=_j.loads(resp.read())
+        raw=result.get("content",[{}])[0].get("text","HOLD - analyzing").strip()
+        import re as _re
+        m=_re.match(r'^(BUY|SELL|HOLD|WAIT|CAUTION|AVOID)\s*[-:\u2014]+\s*(.+)$',raw,_re.IGNORECASE)
+        action,sentence=(m.group(1).upper(),m.group(2).strip()[:120]) if m else ("HOLD",raw[:120])
+        _spock_cache["quick_read"]={"action":action,"sentence":sentence,"ticker":ticker_name,"timestamp":_dt.now().strftime("%H:%M")}
+        print(f"[SPOCK-QR] {ticker_name}: {action} - {sentence[:60]}",flush=True)
+    except Exception as e:
+        print(f"[SPOCK-QR] Error: {e}",flush=True)
+        _spock_cache["quick_read"]={"action":"HOLD","sentence":"Analysis temporarily unavailable","ticker":ticker_name,"timestamp":"--"}
+    finally:
+        _spock_cache["quick_running"]=False
+
+@app.route("/api/spock/quickread",methods=["POST"])
+def api_spock_quickread():
+    import threading as _thr
+    from flask import request as freq
+    data=freq.get_json(silent=True) or {}
+    ticker_req=data.get("ticker",state.get("ticker","TSLA")).upper()
+    if _spock_cache.get("quick_running"): return jsonify({"status":"running"})
+    _thr.Thread(target=call_spock_quickread,kwargs={"ticker":ticker_req},daemon=True).start()
+    return jsonify({"status":"started"})
+
+@app.route("/api/spock/quickread/status")
+def api_spock_quickread_status():
+    qr=_spock_cache.get("quick_read")
+    return jsonify({"running":_spock_cache.get("quick_running",False),"has_read":qr is not None,"quick_read":qr})
 
 @app.route("/api/refresh")
 def api_refresh():
     threading.Thread(target=run_analysis).start()
     return jsonify({"status": "refreshing"})
+
+@app.route("/api/debug/options")
+def api_debug_options():
+    ticker_sym=request.args.get("ticker",TICKER)
+    result={"ticker":ticker_sym,"steps":[]}
+    try:
+        tkr=yf.Ticker(ticker_sym); result["steps"].append("yf.Ticker() OK")
+        expiries=tkr.options; result["expiries"]=list(expiries) if expiries else []
+        result["steps"].append(f"tkr.options: {len(expiries) if expiries else 0} expiries")
+        if expiries:
+            chain=tkr.option_chain(expiries[0]); result["steps"].append(f"option_chain({expiries[0]}) OK")
+            result["calls_rows"]=len(chain.calls); result["puts_rows"]=len(chain.puts)
+        result["uoa_in_state"]={"net_flow":state.get("uoa_data",{}).get("net_flow","MISSING"),
+            "signal":state.get("uoa_data",{}).get("uoa_signal","MISSING"),
+            "whales":len(state.get("uoa_data",{}).get("whale_alerts",[])),
+            "reasons":state.get("uoa_data",{}).get("uoa_reasons",[])}
+    except Exception as e:
+        import traceback; result["error"]=str(e); result["tb"]=traceback.format_exc()[-600:]
+    return jsonify(result)
 
 @app.route("/api/institutions/refresh")
 def api_inst_refresh():
@@ -5226,24 +5333,22 @@ def health(): return jsonify({"status": "ok"}), 200
 # ═══════════════════════════════════════════════════════════════
 
 def _build_cap_context(s):
-    """Returns a capitulation bounce context block for SPOCK prompt."""
-    cap = s.get("capitulation", {})
-    if not cap or not cap.get("detected"):
-        return ""
+    cap=s.get("capitulation",{})
+    if not cap or not cap.get("detected"): return ""
     return (
-        f"\n🎯 CAPITULATION BOUNCE ALERT:\n"
-        f"  Drop: {cap.get('drop_from_high_pct',0):.1f}% from ${cap.get('session_high',0):.0f} to ${cap.get('session_low',0):.0f}\n"
-        f"  Phase: {cap.get('phase','?')} | Recovery: {cap.get('recovery_pct',0):.0f}% off low\n"
+        f"\nCAPITULATION BOUNCE ALERT:\n"
+        f"  Drop: {cap.get('drop_from_high_pct',0):.1f}% | Phase: {cap.get('phase','?')} | Recovery: {cap.get('recovery_pct',0):.0f}%\n"
         f"  OFI Flip: {cap.get('ofi_flip',False)} | Vol Exhaustion: {cap.get('vol_exhaustion',False)} | VWAP Reclaim: {cap.get('vwap_reclaim',False)}\n"
-        f"  Entry: ${cap.get('entry_zone_low',0):.2f}–${cap.get('entry_zone_high',0):.2f} | Stop: ${cap.get('stop_loss',0):.2f}\n"
+        f"  Entry: ${cap.get('entry_zone_low',0):.2f}-${cap.get('entry_zone_high',0):.2f} | Stop: ${cap.get('stop_loss',0):.2f}\n"
         f"  T1: ${cap.get('t1',0):.2f} | T2: ${cap.get('t2',0):.2f} | T3: ${cap.get('t3',0):.2f}\n"
         f"  Daily Trend Intact: {cap.get('daily_trend_intact',True)} | Conviction: {cap.get('conviction',0)}/100"
     )
 
 
-def build_spock_prompt(portfolio=100000, shares=0, entry_price=0):
+def build_spock_prompt(portfolio=100000, shares=0, entry_price=0, ticker_override=None):
     """Assembles full market snapshot into Spock's prompt."""
     s         = state
+    if ticker_override: s = dict(s); s["ticker"] = ticker_override.upper()
     dv        = s.get("darthvader", {})
     dv_state  = dv.get("tsla_state", {})
     risk      = dv.get("risk_mode", "UNKNOWN")
@@ -5351,7 +5456,8 @@ Portfolio: ${portfolio:,}
 Watching for entry. Assess whether current conditions warrant opening a position.
 If yes: what price, how many shares, what stop loss."""
 
-    prompt = f"""You are SPOCK — a ruthlessly logical AI trading co-pilot for an active TSLA trader.
+    ticker_name = s.get("ticker","TSLA")
+    prompt = f"""You are SPOCK — a ruthlessly logical AI trading co-pilot for an active {ticker_name} trader.
 You have access to a sophisticated multi-layer quant system (DarthVader 2.0).
 Be precise. Be direct. Give exact prices and percentages. No vague answers.
 The trader is relying on you for actionable guidance.
@@ -5436,7 +5542,7 @@ WATCH FOR:
 
     return prompt
 
-def call_spock(trigger="manual", portfolio=100000, shares=0, entry_price=0):
+def call_spock(trigger="manual", portfolio=100000, shares=0, entry_price=0, ticker=None):
     """Call Claude API server-side and cache the result."""
     import time, urllib.request, json as _json
 
@@ -5475,7 +5581,7 @@ def call_spock(trigger="manual", portfolio=100000, shares=0, entry_price=0):
             method="POST"
         )
 
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=25) as resp:
             data = _json.loads(resp.read())
 
         text = data["content"][0]["text"].strip()
@@ -5766,7 +5872,7 @@ def check_spock_triggers(algo_alert=None):
         print(f"  🖖 Spock auto-trigger: {trigger}")
         threading.Thread(
             target=call_spock,
-            kwargs={"trigger": trigger},
+            kwargs={"trigger": trigger, "ticker": state.get("ticker","TSLA")},
             daemon=True
         ).start()
 
@@ -6192,15 +6298,13 @@ def calculate_tsla_state(features, mm_data, spy_data, indicators):
         scores["MACRO_RISK_OFF"] += 1.0
 
     # ── CAPITULATION_BOUNCE scoring ──────────────────────────────
-    # Needs: sharp drop (>3%), then buyers absorbing, trend still intact on daily
     cap_data = features.get("capitulation", {})
-    drop_pct      = cap_data.get("drop_from_high_pct", 0)
-    ofi_flip      = cap_data.get("ofi_flip", False)
-    vol_exhaust   = cap_data.get("vol_exhaustion", False)
-    vwap_reclaim  = cap_data.get("vwap_reclaim", False)
-    support_bounce= cap_data.get("support_bounce", False)
-    daily_trend_ok= cap_data.get("daily_trend_intact", True)
-
+    drop_pct       = cap_data.get("drop_from_high_pct", 0)
+    ofi_flip       = cap_data.get("ofi_flip", False)
+    vol_exhaust    = cap_data.get("vol_exhaustion", False)
+    vwap_reclaim   = cap_data.get("vwap_reclaim", False)
+    support_bounce = cap_data.get("support_bounce", False)
+    daily_trend_ok = cap_data.get("daily_trend_intact", True)
     if drop_pct > 3.0 and daily_trend_ok:
         scores["CAPITULATION_BOUNCE"] += 2.5
         signals.append(f"Intraday drop {drop_pct:.1f}% — potential capitulation")
@@ -6218,7 +6322,7 @@ def calculate_tsla_state(features, mm_data, spy_data, indicators):
         signals.append("Bounced off key support level — structure intact")
     if drop_pct > 5.0 and ofi_flip and daily_trend_ok:
         scores["CAPITULATION_BOUNCE"] += 1.5
-        signals.append(f"Large drop ({drop_pct:.1f}%) + buyer absorption = high-conviction bounce setup")
+        signals.append(f"Large drop ({drop_pct:.1f}%) + buyer absorption = high-conviction setup")
 
     # ── Determine winner ─────────────────────────────────────────
     total = sum(scores.values()) or 1.0
@@ -6391,246 +6495,108 @@ def calculate_probabilistic_signals(closes, highs, lows, volumes,
 # MASTER DARTHVADER FUNCTION — runs all 4 layers, returns JSON
 # ─────────────────────────────────────────────────────────────────
 def calculate_capitulation_bounce(ticker_symbol, current_price, closes_daily, highs_daily, lows_daily):
-    """
-    Detects intraday capitulation + bounce setups on 5m bars.
-    Designed for multi-day position entries after sharp pullbacks.
-
-    Returns a dict with:
-    - detected: bool — is a bounce setup forming?
-    - drop_from_high_pct: how far price dropped from session high
-    - session_low: the low it bounced from
-    - ofi_flip: buyers absorbing after drop
-    - vol_exhaustion: sell volume drying up
-    - vwap_reclaim: price back above intraday VWAP
-    - support_bounce: bounced off key daily support
-    - daily_trend_intact: daily structure still bullish
-    - entry_zone: suggested entry price range
-    - stop_loss: below session low + buffer
-    - t1/t2/t3: multi-day targets
-    - conviction: 0-100 score
-    - summary: human-readable signal string
-    """
+    """Detects intraday capitulation + bounce setups on 5m bars for multi-day entries."""
     result = {
-        "detected": False,
-        "drop_from_high_pct": 0,
-        "session_high": 0,
-        "session_low": 0,
-        "ofi_flip": False,
-        "vol_exhaustion": False,
-        "vwap_reclaim": False,
-        "support_bounce": False,
-        "daily_trend_intact": True,
-        "entry_zone_low": 0,
-        "entry_zone_high": 0,
-        "stop_loss": 0,
-        "t1": 0, "t2": 0, "t3": 0,
-        "conviction": 0,
-        "summary": "No capitulation setup",
-        "reasons": [],
-        "phase": "NONE",   # DROPPING / EXHAUSTING / BOUNCING / CONFIRMED
+        "detected": False, "drop_from_high_pct": 0, "session_high": 0, "session_low": 0,
+        "ofi_flip": False, "vol_exhaustion": False, "vwap_reclaim": False,
+        "support_bounce": False, "daily_trend_intact": True,
+        "entry_zone_low": 0, "entry_zone_high": 0, "stop_loss": 0,
+        "t1": 0, "t2": 0, "t3": 0, "conviction": 0,
+        "summary": "No capitulation setup", "reasons": [], "phase": "NONE",
+        "vwap": 0, "recovery_pct": 0, "risk_per_share": 0,
     }
     try:
         import numpy as np
-
-        # ── Get 5m intraday bars ──────────────────────────────────
         tkr = yf.Ticker(ticker_symbol)
         hist5 = tkr.history(period="2d", interval="5m", prepost=False)
-        if hist5 is None or hist5.empty or len(hist5) < 20:
-            return result
-
-        # Today's session only
-        from datetime import datetime, date
-        today = date.today()
-        try:
-            hist5.index = hist5.index.tz_convert("America/New_York")
+        if hist5 is None or hist5.empty or len(hist5) < 20: return result
+        from datetime import date as _date
+        today = _date.today()
+        try: hist5.index = hist5.index.tz_convert("America/New_York")
         except Exception:
             try: hist5.index = hist5.index.tz_localize("America/New_York")
             except Exception: pass
         today_mask = hist5.index.date == today
         h5 = hist5[today_mask]
-        if len(h5) < 12:  # need at least 1 hour of data
-            return result
-
-        c5 = h5["Close"].values.astype(float)
-        h5h = h5["High"].values.astype(float)
-        h5l = h5["Low"].values.astype(float)
-        v5 = h5["Volume"].values.astype(float)
-        o5 = h5["Open"].values.astype(float)
-
-        session_high = float(np.max(h5h))
-        session_low  = float(np.min(h5l))
-        current      = float(c5[-1])
-
-        result["session_high"] = round(session_high, 2)
-        result["session_low"]  = round(session_low, 2)
-
-        # ── Phase 1: Was there a significant drop? ────────────────
-        drop_pct = (session_high - session_low) / session_high * 100
-        result["drop_from_high_pct"] = round(drop_pct, 2)
-
+        if len(h5) < 12: return result
+        c5=h5["Close"].values.astype(float); h5h=h5["High"].values.astype(float)
+        h5l=h5["Low"].values.astype(float);  v5=h5["Volume"].values.astype(float)
+        o5=h5["Open"].values.astype(float)
+        session_high=float(np.max(h5h)); session_low=float(np.min(h5l))
+        current=float(c5[-1])
+        result["session_high"]=round(session_high,2); result["session_low"]=round(session_low,2)
+        drop_pct=(session_high-session_low)/session_high*100
+        result["drop_from_high_pct"]=round(drop_pct,2)
         if drop_pct < 2.5:
-            result["summary"] = f"Normal intraday range ({drop_pct:.1f}%) — no capitulation"
-            return result
-
-        # Find when the low occurred (which bar index)
-        low_bar_idx = int(np.argmin(h5l))
-        bars_since_low = len(c5) - 1 - low_bar_idx
-
-        # ── VWAP calculation ──────────────────────────────────────
-        typical = (h5h + h5l + c5) / 3
-        cum_vol = np.cumsum(v5)
-        cum_tpv = np.cumsum(typical * v5)
-        vwap_arr = cum_tpv / (cum_vol + 1e-9)
-        vwap = float(vwap_arr[-1])
-
-        # ── Phase 2: OFI — is buying pressure returning? ──────────
-        bar_range = h5h - h5l
-        bar_range = np.where(bar_range < 0.01, 0.01, bar_range)
-        ofi_bars = (c5 - o5) / bar_range * v5
-
-        # OFI in last 3 bars vs 3 bars around the low
-        low_window = ofi_bars[max(0, low_bar_idx-1):low_bar_idx+2]
-        recent_ofi = ofi_bars[-3:]
-        ofi_at_low   = float(np.sum(low_window))
-        ofi_recent   = float(np.sum(recent_ofi))
-        ofi_flip = (ofi_at_low < 0) and (ofi_recent > 0) and bars_since_low >= 2
-        result["ofi_flip"] = ofi_flip
-
-        # ── Phase 3: Volume exhaustion ────────────────────────────
-        avg_vol = float(np.mean(v5))
-        vol_at_low = float(np.mean(v5[max(0,low_bar_idx-2):low_bar_idx+1]))
-        vol_recent = float(np.mean(v5[-4:]))
-        vol_exhaustion = (vol_at_low > avg_vol * 1.3) and (vol_recent < vol_at_low * 0.6)
-        result["vol_exhaustion"] = vol_exhaustion
-
-        # ── Phase 4: VWAP reclaim ─────────────────────────────────
-        below_vwap_at_low = float(h5l[low_bar_idx]) < vwap
-        vwap_reclaim = below_vwap_at_low and (current > vwap * 0.999)
-        result["vwap_reclaim"] = vwap_reclaim
-
-        # ── Phase 5: Key support bounce ───────────────────────────
-        support_bounce = False
-        support_level_hit = None
-        if closes_daily is not None and len(closes_daily) >= 20:
-            daily_closes = closes_daily.values.astype(float)
-            # Key levels: 20d MA, 50d MA, recent swing lows
-            ma20 = float(np.mean(daily_closes[-20:]))
-            ma50 = float(np.mean(daily_closes[-50:])) if len(daily_closes) >= 50 else ma20
-            # Check if session low within 1.5% of key level
-            for level, name in [(ma20, "20D MA"), (ma50, "50D MA")]:
-                if abs(session_low - level) / level < 0.015:
-                    support_bounce = True
-                    support_level_hit = f"{name} (${level:.0f})"
-                    break
-            # Also check round numbers ($5 increments for TSLA)
-            import math
-            nearest_round = round(session_low / 5) * 5
-            if abs(session_low - nearest_round) < 1.5:
-                support_bounce = True
-                support_level_hit = f"Round level ${nearest_round:.0f}"
-        result["support_bounce"] = support_bounce
-
-        # ── Phase 6: Daily trend intact? ─────────────────────────
-        daily_trend_intact = True
-        if closes_daily is not None and len(closes_daily) >= 20:
-            dc = closes_daily.values.astype(float)
-            ma20d = float(np.mean(dc[-20:]))
-            ma50d = float(np.mean(dc[-50:])) if len(dc) >= 50 else ma20d
-            # Trend intact = price above 20d MA and 20d > 50d (uptrend structure)
-            daily_trend_intact = (current > ma20d * 0.97) and (ma20d >= ma50d * 0.98)
-        result["daily_trend_intact"] = daily_trend_intact
-
-        # ── Determine phase ───────────────────────────────────────
-        recovery_pct = (current - session_low) / (session_high - session_low + 0.01) * 100
-        if bars_since_low <= 2:
-            phase = "DROPPING"
-        elif recovery_pct < 30:
-            phase = "EXHAUSTING"
-        elif recovery_pct < 60:
-            phase = "BOUNCING"
-        else:
-            phase = "CONFIRMED"
-        result["phase"] = phase
-
-        # ── Conviction score ──────────────────────────────────────
-        conviction = 0
-        reasons = []
-        if drop_pct >= 3.0:
-            conviction += 20
-            reasons.append(f"Dropped {drop_pct:.1f}% from session high (${session_high:.0f} → ${session_low:.0f})")
-        if drop_pct >= 5.0:
-            conviction += 10
-            reasons.append(f"Large capitulation move — increased snap-back potential")
-        if ofi_flip:
-            conviction += 25
-            reasons.append("OFI turned positive — institutional buyers stepping in after drop")
-        if vol_exhaustion:
-            conviction += 20
-            reasons.append("Selling volume exhausted — sellers giving up, supply absorbed")
-        if vwap_reclaim:
-            conviction += 20
-            reasons.append(f"Price reclaimed VWAP (${vwap:.2f}) — bullish intraday structure restored")
-        if support_bounce:
-            conviction += 15
-            reasons.append(f"Bounced off {support_level_hit} — key structural support holding")
-        if not daily_trend_intact:
-            conviction -= 30
-            reasons.append("⚠️ Daily trend degraded — possible real breakdown, not just pullback")
-        if phase in ("BOUNCING", "CONFIRMED"):
-            conviction += 10
-            reasons.append(f"Recovery underway: {recovery_pct:.0f}% retraced from low")
-
-        result["conviction"] = max(0, min(100, conviction))
-        result["reasons"] = reasons
-
-        # ── Entry / Stop / Targets (multi-day position) ───────────
-        # Entry: just above current (confirmed bounce) or near VWAP
-        entry_low  = round(min(current, vwap) * 0.999, 2)
-        entry_high = round(max(current, vwap) * 1.003, 2)
-        stop_loss  = round(session_low * 0.992, 2)   # 0.8% below session low
-        risk_per_share = entry_high - stop_loss
-
-        # Multi-day targets: 1R, 2R, prior session high
-        t1 = round(entry_high + risk_per_share * 1.5, 2)
-        t2 = round(entry_high + risk_per_share * 2.5, 2)
-        t3 = round(session_high * 1.005, 2)   # just above prior session high
-
-        result["entry_zone_low"]  = entry_low
-        result["entry_zone_high"] = entry_high
-        result["stop_loss"]  = stop_loss
-        result["t1"] = t1
-        result["t2"] = t2
-        result["t3"] = t3
-        result["risk_per_share"] = round(risk_per_share, 2)
-        result["vwap"] = round(vwap, 2)
-        result["recovery_pct"] = round(recovery_pct, 1)
-
-        # ── Detected? ─────────────────────────────────────────────
-        detected = (
-            conviction >= 45 and
-            drop_pct >= 2.5 and
-            daily_trend_intact and
-            phase in ("EXHAUSTING", "BOUNCING", "CONFIRMED") and
-            (ofi_flip or vwap_reclaim or vol_exhaustion)
-        )
-        result["detected"] = detected
-
+            result["summary"]=f"Normal range ({drop_pct:.1f}%) — no capitulation"; return result
+        low_bar_idx=int(np.argmin(h5l)); bars_since_low=len(c5)-1-low_bar_idx
+        typical=(h5h+h5l+c5)/3; cum_vol=np.cumsum(v5); cum_tpv=np.cumsum(typical*v5)
+        vwap=float(cum_tpv[-1]/(cum_vol[-1]+1e-9))
+        bar_range=h5h-h5l; bar_range=np.where(bar_range<0.01,0.01,bar_range)
+        ofi_bars=(c5-o5)/bar_range*v5
+        low_window=ofi_bars[max(0,low_bar_idx-1):low_bar_idx+2]
+        recent_ofi=ofi_bars[-3:]
+        ofi_flip=(float(np.sum(low_window))<0)and(float(np.sum(recent_ofi))>0)and bars_since_low>=2
+        avg_vol=float(np.mean(v5))
+        vol_at_low=float(np.mean(v5[max(0,low_bar_idx-2):low_bar_idx+1]))
+        vol_recent=float(np.mean(v5[-4:]))
+        vol_exhaustion=(vol_at_low>avg_vol*1.3)and(vol_recent<vol_at_low*0.6)
+        below_vwap_at_low=float(h5l[low_bar_idx])<vwap
+        vwap_reclaim=below_vwap_at_low and(current>vwap*0.999)
+        support_bounce=False; support_level_hit=None
+        if closes_daily is not None and len(closes_daily)>=20:
+            dc=closes_daily.values.astype(float)
+            ma20=float(np.mean(dc[-20:]))
+            ma50=float(np.mean(dc[-50:]))if len(dc)>=50 else ma20
+            for level,name in[(ma20,"20D MA"),(ma50,"50D MA")]:
+                if abs(session_low-level)/level<0.015:
+                    support_bounce=True; support_level_hit=f"{name} (${level:.0f})"; break
+            nearest_round=round(session_low/5)*5
+            if not support_bounce and abs(session_low-nearest_round)<1.5:
+                support_bounce=True; support_level_hit=f"Round level ${nearest_round:.0f}"
+        daily_trend_intact=True
+        if closes_daily is not None and len(closes_daily)>=20:
+            dc=closes_daily.values.astype(float)
+            ma20d=float(np.mean(dc[-20:]))
+            ma50d=float(np.mean(dc[-50:]))if len(dc)>=50 else ma20d
+            daily_trend_intact=(current>ma20d*0.97)and(ma20d>=ma50d*0.98)
+        recovery_pct=(current-session_low)/(session_high-session_low+0.01)*100
+        if bars_since_low<=2: phase="DROPPING"
+        elif recovery_pct<30: phase="EXHAUSTING"
+        elif recovery_pct<60: phase="BOUNCING"
+        else: phase="CONFIRMED"
+        conviction=0; reasons=[]
+        if drop_pct>=3.0: conviction+=20; reasons.append(f"Dropped {drop_pct:.1f}% from ${session_high:.0f} to ${session_low:.0f}")
+        if drop_pct>=5.0: conviction+=10; reasons.append("Large capitulation — increased snap-back potential")
+        if ofi_flip: conviction+=25; reasons.append("OFI turned positive — buyers stepping in after drop")
+        if vol_exhaustion: conviction+=20; reasons.append("Sell volume exhausted — supply absorbed")
+        if vwap_reclaim: conviction+=20; reasons.append(f"Price reclaimed VWAP (${vwap:.2f}) — bullish structure restored")
+        if support_bounce: conviction+=15; reasons.append(f"Bounced off {support_level_hit}")
+        if not daily_trend_intact: conviction-=30; reasons.append("WARNING: Daily trend degraded — possible real breakdown")
+        if phase in("BOUNCING","CONFIRMED"): conviction+=10; reasons.append(f"Recovery underway: {recovery_pct:.0f}% retraced")
+        conviction=max(0,min(100,conviction))
+        entry_low=round(min(current,vwap)*0.999,2)
+        entry_high=round(max(current,vwap)*1.003,2)
+        stop_loss=round(session_low*0.992,2)
+        risk_ps=entry_high-stop_loss
+        t1=round(entry_high+risk_ps*1.5,2); t2=round(entry_high+risk_ps*2.5,2); t3=round(session_high*1.005,2)
+        detected=(conviction>=45 and drop_pct>=2.5 and daily_trend_intact
+                  and phase in("EXHAUSTING","BOUNCING","CONFIRMED")
+                  and(ofi_flip or vwap_reclaim or vol_exhaustion))
+        result.update({"detected":detected,"ofi_flip":ofi_flip,"vol_exhaustion":vol_exhaustion,
+            "vwap_reclaim":vwap_reclaim,"support_bounce":support_bounce,
+            "daily_trend_intact":daily_trend_intact,"entry_zone_low":entry_low,
+            "entry_zone_high":entry_high,"stop_loss":stop_loss,"t1":t1,"t2":t2,"t3":t3,
+            "conviction":conviction,"reasons":reasons,"phase":phase,"vwap":round(vwap,2),
+            "recovery_pct":round(recovery_pct,1),"risk_per_share":round(risk_ps,2)})
         if detected:
-            result["summary"] = (
-                f"CAPITULATION BOUNCE — Dropped {drop_pct:.1f}% to ${session_low:.0f}, "
-                f"now recovering ({phase}). "
-                f"Entry ${entry_low}–${entry_high} | Stop ${stop_loss} | "
-                f"T1 ${t1} / T2 ${t2} / T3 ${t3}"
-            )
+            result["summary"]=(f"CAPITULATION BOUNCE — Dropped {drop_pct:.1f}% to ${session_low:.0f}, "
+                f"recovering ({phase}). Entry ${entry_low}-${entry_high} | Stop ${stop_loss} | T1 ${t1} T2 ${t2} T3 ${t3}")
         else:
-            pct_word = f"{drop_pct:.1f}% drop" if drop_pct >= 2.5 else "no significant drop"
-            result["summary"] = f"Monitoring: {pct_word}, conviction {result['conviction']}/100 — waiting for confirmation"
-
-        print(f"  [CAP] {phase} | drop:{drop_pct:.1f}% | conv:{result['conviction']} | detected:{detected}", flush=True)
-
+            result["summary"]=f"Monitoring: {drop_pct:.1f}% drop, conviction {conviction}/100"
+        print(f"  [CAP] {phase} | drop:{drop_pct:.1f}% | conv:{conviction} | detected:{detected}",flush=True)
     except Exception as e:
-        print(f"  [CAP] Error: {e}", flush=True)
-
+        print(f"  [CAP] Error: {e}",flush=True)
     return result
 
 
@@ -6647,9 +6613,7 @@ def calculate_darthvader(closes, highs, lows, volumes, opens,
 
     # L2: Feature Engineering
     features = calculate_order_flow_features(closes, highs, lows, volumes, opens)
-    # Inject capitulation data into features for state scoring
-    if cap_data:
-        features["capitulation"] = cap_data
+    if cap_data: features["capitulation"] = cap_data
 
     # L6: TSLA State Engine  
     tsla_state = calculate_tsla_state(features, mm_data, spy_data, indicators)
@@ -6894,43 +6858,18 @@ function initChart() {
   }
 });
 
-// -- Ichimoku Chart --
-const _ich=document.getElementById('ichimokuChart'); const ichCtx=_ich?_ich.getContext('2d'):null;
-let ichimokuChart = null; if(ichCtx) ichimokuChart = new Chart(ichCtx, {
-  type:'line',
-  data:{labels:[],datasets:[
-    {label:'Close',     data:[], borderColor:'#fff',        borderWidth:2, pointRadius:0, tension:0.3, fill:false, order:1},
-    {label:'Tenkan',    data:[], borderColor:'#ff6688',     borderWidth:1, pointRadius:0, tension:0.3, fill:false, order:2},
-    {label:'Kijun',     data:[], borderColor:'#4488ff',     borderWidth:1, pointRadius:0, tension:0.3, fill:false, order:3},
-    {label:'Span A',    data:[], borderColor:'rgba(0,255,136,0.6)', borderWidth:1, pointRadius:0, tension:0.3,
-      fill:'+1', backgroundColor:'rgba(0,255,136,0.08)', order:4},
-    {label:'Span B',    data:[], borderColor:'rgba(255,51,85,0.6)',  borderWidth:1, pointRadius:0, tension:0.3,
-      fill:false, backgroundColor:'rgba(255,51,85,0.08)', order:5},
-  ]},
-  options:{
-    ...CHART_DEFAULTS,
-    plugins:{legend:{display:true, labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:20}}},
-  }
-});
-
-// -- HMM Chart --
-const _hmm=document.getElementById('hmmChart'); const hmmCtx=_hmm?_hmm.getContext('2d'):null;
-let hmmChart = null; if(hmmCtx) hmmChart = new Chart(hmmCtx, {
-  type:'bar',
-  data:{labels:[],datasets:[{label:'Daily Return (%)',data:[],backgroundColor:[],borderWidth:0,borderRadius:2}]},
-  options:{
-    responsive:true, maintainAspectRatio:false,
-    plugins:{legend:{display:false},
-      tooltip:{callbacks:{label:ctx=>`${ctx.parsed.y.toFixed(2)}% - ${ctx.dataset.regimes?ctx.dataset.regimes[ctx.dataIndex]:''}`}}},
-    scales:{
-      x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:12}},
-      y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:9},callback:v=>v.toFixed(1)+'%'}}
-    }
-  }
-}); } catch(e) { console.error('Chart init failed:', e.message, e.stack); }
+} catch(e) { console.error('Chart init failed:', e.message); }
 }
 initChart();
 setTimeout(initChart, 500);
+
+var ichimokuChart = null, hmmChart = null;
+function initIchiHmm() {
+  if(typeof Chart==='undefined'){setTimeout(initIchiHmm,200);return;}
+  if(!ichimokuChart){var _ich=document.getElementById('ichimokuChart');if(_ich)try{ichimokuChart=new Chart(_ich.getContext('2d'),{type:'line',data:{labels:[],datasets:[{label:'Close',data:[],borderColor:'#fff',borderWidth:2,pointRadius:0,tension:0.3,fill:false,order:1},{label:'Tenkan',data:[],borderColor:'#ff6688',borderWidth:1,pointRadius:0,tension:0.3,fill:false,order:2},{label:'Kijun',data:[],borderColor:'#4488ff',borderWidth:1,pointRadius:0,tension:0.3,fill:false,order:3},{label:'Span A',data:[],borderColor:'rgba(0,255,136,0.6)',borderWidth:1,pointRadius:0,tension:0.3,fill:'+1',backgroundColor:'rgba(0,255,136,0.08)',order:4},{label:'Span B',data:[],borderColor:'rgba(255,51,85,0.6)',borderWidth:1,pointRadius:0,tension:0.3,fill:false,order:5}]},options:{...CHART_DEFAULTS,plugins:{legend:{display:true,labels:{color:'#6070a0',font:{family:'Share Tech Mono',size:9},boxWidth:20}}}}});}catch(e){console.warn('ichimokuChart:',e.message);}}
+  if(!hmmChart){var _hmm=document.getElementById('hmmChart');if(_hmm)try{hmmChart=new Chart(_hmm.getContext('2d'),{type:'bar',data:{labels:[],datasets:[{label:'Daily Return (%)',data:[],backgroundColor:[],borderWidth:0,borderRadius:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:function(c){return c.parsed.y.toFixed(2)+'%';}}}},scales:{x:{grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8},maxTicksLimit:12}},y:{position:'right',grid:{color:'#1e2540'},ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:9},callback:function(v){return v.toFixed(1)+'%';}}}}}})}catch(e){console.warn('hmmChart:',e.message);}}
+}
+initIchiHmm(); setTimeout(initIchiHmm,600); setTimeout(initIchiHmm,1500);
 
 // -- UOA Heatmap Chart --
 const _uoa=document.getElementById('uoaHeatmapChart'); const uoaHeatCtx=_uoa?_uoa.getContext('2d'):null;
@@ -7387,14 +7326,13 @@ function updateTickerBar(s) {
 
 function updateUI(s) {
   // -- Signal Badge --
-  const badge = document.getElementById('signalBadge');
-  badge.textContent = s.signal; badge.className = 'signal-badge '+s.signal;
-  document.getElementById('priceVal').textContent = s.price ? '$'+s.price.toLocaleString('en-US',{minimumFractionDigits:2}) : '-';
-  const pct = s.signal_strength||0;
-  const fill = document.getElementById('strengthFill');
-  fill.style.width = pct+'%';
-  fill.style.background = s.signal==='BUY'?'#00ff88':s.signal==='SELL'?'#ff3355':'#ffb300';
-  document.getElementById('strengthVal').textContent = pct;
+  var badge=document.getElementById('signalBadge');
+  if(badge){badge.textContent=s.signal||'--';badge.className='signal-badge '+(s.signal||'');}
+  var _pv=document.getElementById('priceVal');if(_pv)_pv.textContent=s.price?'$'+s.price.toLocaleString('en-US',{minimumFractionDigits:2}):'-';
+  var pct=s.signal_strength||0;
+  var fill=document.getElementById('strengthFill');
+  if(fill){fill.style.width=pct+'%';fill.style.background=s.signal==='BUY'?'#00ff88':s.signal==='SELL'?'#ff3355':'#ffb300';}
+  var _sv=document.getElementById('strengthVal');if(_sv)_sv.textContent=pct;
   // WhatsApp status badge
   const waEl = document.getElementById('waStatus');
   if(waEl) {
@@ -7441,30 +7379,13 @@ function updateUI(s) {
   setText('ind-hmm-next', hmm.next_regime ? hmm.next_regime+' ('+hmm.next_prob+'% prob)' : '-');
 
   // -- Price Chart + Annotations --
-  if(s.price_history?.length) {
-    chart.data.labels = s.price_history.map(p=>p.date.slice(5));
-    chart.data.datasets[0].data = s.price_history.map(p=>p.price);
-    // Annotations drawn AFTER data so y-axis range is correct
-    updateChartAnnotations(s);
-    chart.resize();
-    chart.update('none');
-  }
+  if(s.price_history&&s.price_history.length&&chart){try{chart.data.labels=s.price_history.map(p=>p.date.slice(5));chart.data.datasets[0].data=s.price_history.map(p=>p.price);updateChartAnnotations(s);chart.update('none');}catch(e){console.warn('priceChart:'+e.message);}}
 
   // -- Live Ticker Bar --
   updateTickerBar(s);
 
   // -- MACD Charts --
-  if(s.macd_history?.length) {
-    const mh = s.macd_history;
-    macdLineChart.data.labels = mh.map(m=>m.date.slice(5));
-    macdLineChart.data.datasets[0].data = mh.map(m=>m.macd);
-    macdLineChart.data.datasets[1].data = mh.map(m=>m.signal);
-    macdLineChart.update('none');
-    macdHistChart.data.labels = mh.map(m=>m.date.slice(5));
-    macdHistChart.data.datasets[0].data = mh.map(m=>m.hist);
-    macdHistChart.data.datasets[0].backgroundColor = mh.map(m=>m.color+'cc');
-    macdHistChart.update('none');
-  }
+  if(s.macd_history&&s.macd_history.length&&macdLineChart&&macdHistChart){try{var mh=s.macd_history;macdLineChart.data.labels=mh.map(m=>m.date.slice(5));macdLineChart.data.datasets[0].data=mh.map(m=>m.macd);macdLineChart.data.datasets[1].data=mh.map(m=>m.signal);macdLineChart.update('none');macdHistChart.data.labels=mh.map(m=>m.date.slice(5));macdHistChart.data.datasets[0].data=mh.map(m=>m.hist);macdHistChart.data.datasets[0].backgroundColor=mh.map(m=>m.color+'cc');macdHistChart.update('none');}catch(e){console.warn('macdCharts:'+e.message);}}
 
   // -- Volume Charts --
   if(s.vol_history?.length) {
@@ -7563,107 +7484,58 @@ function updateUI(s) {
 
   document.getElementById('lastUpdated').textContent = s.last_updated ? 'Updated '+s.last_updated : '-';
 
-  // -- SPY / Macro Panel --
-    // -- All Panels --
-  renderExitPanel(s.exit_data || {});
-  renderUOAPanel(s.uoa_data || {});
-  const pv = parseFloat(document.getElementById('portfolioInput')?.value || 100000);
-  renderEntryPanel(s.entry_data || {}, pv);
-  renderPeakPanel(s.peak_data || {});
-  renderCTAPanel(s.sizing || {}, s.price || 0);
-  renderExtPanel(s.ext_data || {});
-  updateAlgoRadar(s);
-  renderNewsPanel(s.news_data || {});
-  renderSPYPanel(s.spy_data || {});
-  renderMMPanel(s.mm_data || {}, s.dark_pool || {}, s.price || 0);
-  renderInstModels(s.institutional_models || {}, s.indicators || {});
-  // DarthVader 1.0
-  if(s.darthvader) renderDarthVader(s.darthvader);
-  try { renderCapBounce(s.capitulation||null); } catch(e) { console.warn("capBounce: "+e.message); }
+  [
+    function(){renderExitPanel(s.exit_data||{});},
+    function(){renderUOAPanel(s.uoa_data||{});},
+    function(){var pv=parseFloat((document.getElementById('portfolioInput')||{}).value||'100000')||100000;renderEntryPanel(s.entry_data||{},pv);},
+    function(){renderPeakPanel(s.peak_data||{});},
+    function(){renderCTAPanel(s.sizing||{},s.price||0);},
+    function(){renderExtPanel(s.ext_data||{});},
+    function(){updateAlgoRadar(s);},
+    function(){renderNewsPanel(s.news_data||{});},
+    function(){renderSPYPanel(s.spy_data||{});},
+    function(){renderMMPanel(s.mm_data||{},s.dark_pool||{},s.price||0);},
+    function(){renderInstModels(s.institutional_models||{},s.indicators||{});},
+    function(){if(s.darthvader)renderDarthVader(s.darthvader);},
+    function(){try{renderCapBounce(s.capitulation||null);}catch(e){}},
+  ].forEach(function(fn,i){try{fn();}catch(e){console.warn('Panel['+i+']: '+e.message);}});
 }
 
 
 
 function renderCapBounce(cap) {
-  var banner = document.getElementById('capBounceAlert');
-  if (!banner) return;
-
-  if (!cap || !cap.detected) {
-    banner.style.display = 'none';
-    return;
+  var banner=document.getElementById('capBounceAlert');
+  if(!banner)return;
+  if(!cap||!cap.detected){banner.style.display='none';return;}
+  banner.style.display='block';
+  var phaseColors={CONFIRMED:'#00ff88',BOUNCING:'#00e5ff',EXHAUSTING:'#ffb300',DROPPING:'#ff3355'};
+  var phaseEl=document.getElementById('capPhase');
+  if(phaseEl){phaseEl.textContent=cap.phase||'?';phaseEl.style.color=phaseColors[cap.phase]||'#00ff88';}
+  var convEl=document.getElementById('capConviction');
+  if(convEl)convEl.textContent='Conviction: '+(cap.conviction||0)+'/100';
+  var dropEl=document.getElementById('capDropLine');
+  if(dropEl)dropEl.textContent='$'+cap.session_high+' to $'+cap.session_low+' ('+cap.drop_from_high_pct+'%)';
+  var recEl=document.getElementById('capRecovery');
+  if(recEl)recEl.textContent='Recovery: '+(cap.recovery_pct||0)+'% off low';
+  var eEl=document.getElementById('capEntry');if(eEl)eEl.textContent='$'+cap.entry_zone_low+' - $'+cap.entry_zone_high;
+  var stEl=document.getElementById('capStop');if(stEl)stEl.textContent='$'+cap.stop_loss;
+  var t1El=document.getElementById('capT1');if(t1El)t1El.textContent='$'+cap.t1;
+  var t2El=document.getElementById('capT2');if(t2El)t2El.textContent='$'+cap.t2;
+  var t3El=document.getElementById('capT3');if(t3El)t3El.textContent='$'+cap.t3;
+  function setPill(id,active,label){
+    var el=document.getElementById(id);if(!el)return;
+    if(active){el.textContent=label+' OK';el.style.background='rgba(0,255,136,0.15)';el.style.borderColor='rgba(0,255,136,0.5)';el.style.color='#00ff88';}
+    else{el.textContent=label;el.style.background='rgba(255,255,255,0.05)';el.style.borderColor='rgba(255,255,255,0.1)';el.style.color='var(--text-dim)';}
   }
-
-  banner.style.display = 'block';
-
-  // Phase + conviction
-  var phaseEl = document.getElementById('capPhase');
-  var convEl  = document.getElementById('capConviction');
-  var phaseColors = {CONFIRMED:'#00ff88', BOUNCING:'#00e5ff', EXHAUSTING:'#ffb300', DROPPING:'#ff3355'};
-  if (phaseEl) { phaseEl.textContent = cap.phase || '?'; phaseEl.style.color = phaseColors[cap.phase] || '#00ff88'; }
-  if (convEl)  convEl.textContent = 'Conviction: ' + (cap.conviction || 0) + '/100';
-
-  // Drop line
-  var dropEl = document.getElementById('capDropLine');
-  var recEl  = document.getElementById('capRecovery');
-  if (dropEl) dropEl.textContent = '$' + cap.session_high + ' → $' + cap.session_low + ' (' + cap.drop_from_high_pct + '%)';
-  if (recEl)  recEl.textContent  = 'Recovery: ' + (cap.recovery_pct || 0) + '% off low';
-
-  // Entry/Stop/Targets
-  var entryEl = document.getElementById('capEntry');
-  var stopEl  = document.getElementById('capStop');
-  var t1El    = document.getElementById('capT1');
-  var t2El    = document.getElementById('capT2');
-  var t3El    = document.getElementById('capT3');
-  if (entryEl) entryEl.textContent = '$' + cap.entry_zone_low + ' – $' + cap.entry_zone_high;
-  if (stopEl)  stopEl.textContent  = '$' + cap.stop_loss;
-  if (t1El)    t1El.textContent    = '$' + cap.t1;
-  if (t2El)    t2El.textContent    = '$' + cap.t2;
-  if (t3El)    t3El.textContent    = '$' + cap.t3;
-
-  // Signal pills
-  function setPill(id, active, label) {
-    var el = document.getElementById(id);
-    if (!el) return;
-    if (active) {
-      el.textContent = label + ' ✓';
-      el.style.background = 'rgba(0,255,136,0.15)';
-      el.style.borderColor = 'rgba(0,255,136,0.5)';
-      el.style.color = '#00ff88';
-    } else {
-      el.textContent = label + ' ○';
-      el.style.background = 'rgba(255,255,255,0.05)';
-      el.style.borderColor = 'rgba(255,255,255,0.1)';
-      el.style.color = 'var(--text-dim)';
-    }
+  setPill('capOFI',cap.ofi_flip,'OFI');setPill('capVolX',cap.vol_exhaustion,'VOL EX');
+  setPill('capVWAP',cap.vwap_reclaim,'VWAP');setPill('capSupp',cap.support_bounce,'SUPPORT');
+  var dEl=document.getElementById('capDaily');
+  if(dEl){
+    if(cap.daily_trend_intact){dEl.textContent='DAILY TREND OK';dEl.style.background='rgba(0,255,136,0.12)';dEl.style.borderColor='rgba(0,255,136,0.4)';dEl.style.color='#00ff88';}
+    else{dEl.textContent='DAILY TREND WARN';dEl.style.background='rgba(255,51,85,0.12)';dEl.style.borderColor='rgba(255,51,85,0.4)';dEl.style.color='#ff3355';}
   }
-  setPill('capOFI',  cap.ofi_flip,         'OFI');
-  setPill('capVolX', cap.vol_exhaustion,    'VOL EX');
-  setPill('capVWAP', cap.vwap_reclaim,      'VWAP');
-  setPill('capSupp', cap.support_bounce,    'SUPPORT');
-
-  var dailyEl = document.getElementById('capDaily');
-  if (dailyEl) {
-    if (cap.daily_trend_intact) {
-      dailyEl.textContent = 'DAILY TREND ✓ INTACT';
-      dailyEl.style.background = 'rgba(0,255,136,0.12)';
-      dailyEl.style.borderColor = 'rgba(0,255,136,0.4)';
-      dailyEl.style.color = '#00ff88';
-    } else {
-      dailyEl.textContent = 'DAILY TREND ⚠ DEGRADED';
-      dailyEl.style.background = 'rgba(255,51,85,0.12)';
-      dailyEl.style.borderColor = 'rgba(255,51,85,0.4)';
-      dailyEl.style.color = '#ff3355';
-    }
-  }
-
-  // Reasons
-  var reasEl = document.getElementById('capReasons');
-  if (reasEl) {
-    var reasons = cap.reasons || [];
-    reasEl.innerHTML = reasons.slice(0, 4).map(function(r) {
-      return '<div style="font-size:9px;color:var(--text-primary);padding:2px 0;">• ' + r + '</div>';
-    }).join('');
-  }
+  var rEl=document.getElementById('capReasons');
+  if(rEl){var rs=cap.reasons||[];rEl.innerHTML=rs.slice(0,4).map(function(r){return '<div style="font-size:9px;color:var(--text-primary);padding:2px 0;">- '+r+'</div>';}).join('');}
 }
 
 function renderUOAPanel(uoa) {
@@ -7780,7 +7652,7 @@ function renderUOAPanel(uoa) {
   }
 
   // -- Premium heatmap chart --
-  if(uoa.strike_heatmap?.length && typeof uoaHeatChart !== 'undefined') {
+  if(uoa.strike_heatmap && uoa.strike_heatmap.length && uoaHeatChart) {
     const hm = uoa.strike_heatmap;
     uoaHeatChart.data.labels              = hm.map(h => '$'+h.strike);
     uoaHeatChart.data.datasets[0].data   = hm.map(h => Math.round(h.call_premium/1000));
@@ -8446,9 +8318,7 @@ function renderSPYPanel(spy) {
   // VIX chart
   if(false && spy.vix_history?.length && vixChart) { // vixChart removed
     const vh = spy.vix_history;
-    vixChart.data.labels = vh.map(v => v.date?.slice(5));
-    vixChart.data.datasets[0].data = vh.map(v => v.vix);
-    vixChart.update('none');
+    if(vixChart){try{vixChart.data.labels=vh.map(v=>v.date?v.date.slice(5):'');vixChart.data.datasets[0].data=vh.map(v=>v.vix);vixChart.update('none');}catch(e){console.warn('vixChart:'+e.message);}}
   }
 
   // Macro reasons chips
@@ -8538,10 +8408,7 @@ function renderMMPanel(mm, dp, price) {
   // -- OI Chart --
   if(mm.oi_by_strike?.length) {
     const os = mm.oi_by_strike;
-    oiChart.data.labels = os.map(o => '$' + o.strike);
-    oiChart.data.datasets[0].data = os.map(o => o.call_oi);
-    oiChart.data.datasets[1].data = os.map(o => o.put_oi);
-    oiChart.update('none');
+    if(oiChart){try{oiChart.data.labels=os.map(o=>'$'+o.strike);oiChart.data.datasets[0].data=os.map(o=>o.call_oi);oiChart.data.datasets[1].data=os.map(o=>o.put_oi);oiChart.update('none');}catch(e){console.warn('oiChart:'+e.message);}}
   }
 
   // -- Dark Pool Levels --
@@ -8943,7 +8810,75 @@ function renderInstModels(m, ind) {
   ).join('');
 }
 
-async function fetchState() { try { updateUI(await (await fetch('/api/state')).json()); } catch(e){} }
+var _sqPoll = null;
+var SQ_COLORS = {
+  BUY:    {bg:'rgba(0,255,136,0.15)',border:'rgba(0,255,136,0.5)',text:'#00ff88'},
+  SELL:   {bg:'rgba(255,51,85,0.15)',border:'rgba(255,51,85,0.5)',text:'#ff3355'},
+  HOLD:   {bg:'rgba(0,229,255,0.12)',border:'rgba(0,229,255,0.35)',text:'#00e5ff'},
+  WAIT:   {bg:'rgba(255,179,0,0.12)',border:'rgba(255,179,0,0.35)',text:'#ffb300'},
+  CAUTION:{bg:'rgba(255,152,0,0.15)',border:'rgba(255,152,0,0.45)',text:'#ff9800'},
+  AVOID:  {bg:'rgba(255,51,85,0.12)',border:'rgba(255,51,85,0.4)',text:'#ff3355'},
+};
+function triggerQuickRead() {
+  var btn=document.getElementById('sqBtn'),spinner=document.getElementById('sqSpinner'),
+      sentence=document.getElementById('sqSentence');
+  if(btn){btn.disabled=true;btn.textContent='READING...';}
+  if(spinner)spinner.style.display='inline';
+  if(sentence)sentence.textContent='Consulting 100 years of market data...';
+  fetch('/api/spock/quickread',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({ticker:_currentTicker})})
+  .then(function(r){return r.json();})
+  .then(function(){_pollQuickRead(0);})
+  .catch(function(e){
+    if(sentence)sentence.textContent='Error: '+e.message;
+    if(btn){btn.disabled=false;btn.textContent='READ';}
+    if(spinner)spinner.style.display='none';
+  });
+}
+function _pollQuickRead(n) {
+  if(_sqPoll)clearTimeout(_sqPoll);
+  if(n>15){
+    var s2=document.getElementById('sqSentence'),b=document.getElementById('sqBtn'),sp=document.getElementById('sqSpinner');
+    if(s2)s2.textContent='Timed out - press READ to retry';
+    if(b){b.disabled=false;b.textContent='READ';}if(sp)sp.style.display='none';return;
+  }
+  fetch('/api/spock/quickread/status').then(function(r){return r.json();}).then(function(d){
+    if(d.running){_sqPoll=setTimeout(function(){_pollQuickRead(n+1);},1500);}
+    else if(d.has_read&&d.quick_read){renderQuickRead(d.quick_read);}
+    else if(n<3){_sqPoll=setTimeout(function(){_pollQuickRead(n+1);},1500);}
+    else{var b=document.getElementById('sqBtn'),sp=document.getElementById('sqSpinner');
+      if(b){b.disabled=false;b.textContent='READ';}if(sp)sp.style.display='none';}
+  }).catch(function(){_sqPoll=setTimeout(function(){_pollQuickRead(n+1);},1500);});
+}
+function renderQuickRead(qr) {
+  var action=(qr.action||'HOLD').toUpperCase(),col=SQ_COLORS[action]||SQ_COLORS.HOLD;
+  var aEl=document.getElementById('sqAction'),sEl=document.getElementById('sqSentence'),
+      tEl=document.getElementById('sqTime'),tkEl=document.getElementById('sqTicker'),
+      btn=document.getElementById('sqBtn'),sp=document.getElementById('sqSpinner'),
+      bar=document.getElementById('spockQuickBar');
+  if(aEl){aEl.textContent=action;aEl.style.background=col.bg;aEl.style.borderColor=col.border;aEl.style.color=col.text;}
+  if(sEl){sEl.textContent=qr.sentence||'';sEl.style.color=col.text;}
+  if(tEl)tEl.textContent=qr.timestamp||'';
+  if(tkEl)tkEl.textContent=qr.ticker||_currentTicker;
+  if(bar)bar.style.borderTopColor=col.border;
+  if(btn){btn.disabled=false;btn.textContent='READ';}
+  if(sp)sp.style.display='none';
+}
+function _resetQuickReadBar(){
+  var sEl=document.getElementById('sqSentence'),aEl=document.getElementById('sqAction'),tEl=document.getElementById('sqTime');
+  if(sEl)sEl.textContent='Press READ to get SPOCK analysis for '+_currentTicker;
+  if(aEl){aEl.textContent='—';aEl.style.color='#00e5ff';aEl.style.background='rgba(0,229,255,0.12)';aEl.style.borderColor='rgba(0,229,255,0.3)';}
+  if(tEl)tEl.textContent='—';
+}
+
+async function fetchState() {
+  try {
+    var resp = await fetch('/api/state');
+    if(!resp.ok){ console.warn('fetchState HTTP ' + resp.status); return; }
+    var data = await resp.json();
+    try { updateUI(data); } catch(e) { console.error('updateUI: ' + e.message); }
+  } catch(e) { console.warn('fetchState: ' + e.message); }
+}
 async function manualRefresh() { await fetch('/api/refresh'); setTimeout(fetchState,2000); }
 showChartTab('price');
 fetchState();
@@ -9327,6 +9262,7 @@ function selectTicker(sym) {
   sym = sym.toUpperCase().trim();
   if(!sym) return;
   _currentTicker = sym;
+  if(typeof _resetQuickReadBar==='function') _resetQuickReadBar();
   // Clear search box so it shows placeholder again
   var inp = document.getElementById('tickerSearchInput');
   if(inp) { inp.value = ''; inp.placeholder = 'Search symbol...'; }
@@ -9756,27 +9692,50 @@ function askSpock() {
   fetch('/api/spock', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ trigger: 'manual', portfolio: portfolio, shares: shares, entry_price: entry })
+    body: JSON.stringify({ trigger: 'manual', portfolio: portfolio, shares: shares, entry_price: entry, ticker: _currentTicker })
   })
   .then(function(r) { return r.json(); })
-  .then(function(d) {
-    if (d.error) {
-      if (statusEl) { statusEl.textContent = 'Error: ' + d.error; statusEl.style.color = '#ff3355'; }
-      if (loadEl)  { loadEl.style.display  = 'none';  }
-      if (emptyEl) { emptyEl.style.display = 'block'; }
-    } else {
-      renderSpockAnalysis(d);
-      if (statusEl) { statusEl.textContent = 'Updated ' + (d.timestamp || ''); statusEl.style.color = '#00ff88'; }
-    }
+  .then(function() {
+    if (statusEl) { statusEl.textContent = 'Thinking... (0s)'; statusEl.style.color = '#00e5ff'; }
+    _pollSpock(0);
   })
   .catch(function(err) {
     if (statusEl) { statusEl.textContent = 'Network error: ' + err.message; statusEl.style.color = '#ff3355'; }
-    if (loadEl)  { loadEl.style.display  = 'none';  }
+    if (loadEl)  { loadEl.style.display = 'none'; }
     if (emptyEl) { emptyEl.style.display = 'block'; }
-  })
-  .finally(function() {
     if (btn) { btn.disabled = false; btn.style.opacity = '1'; btn.textContent = 'ANALYZE POSITION'; }
   });
+}
+
+var _spockPoll = null;
+function _pollSpock(n) {
+  if (_spockPoll) clearTimeout(_spockPoll);
+  var btn=document.getElementById('spockAnalyzeBtn'),statusEl=document.getElementById('spockStatus'),
+      loadEl=document.getElementById('spockLoading'),emptyEl=document.getElementById('spockEmpty');
+  if (n > 20) {
+    fetch('/api/spock/reset').catch(function(){});
+    if (statusEl) { statusEl.textContent = 'Timed out - try again'; statusEl.style.color = '#ff3355'; }
+    if (loadEl)  loadEl.style.display = 'none';
+    if (emptyEl) emptyEl.style.display = 'block';
+    if (btn) { btn.disabled = false; btn.style.opacity = '1'; btn.textContent = 'ANALYZE POSITION'; }
+    return;
+  }
+  fetch('/api/spock/status').then(function(r){return r.json();}).then(function(d){
+    if (d.running) {
+      if (statusEl) statusEl.textContent = 'Thinking... (' + (n*2) + 's)';
+      _spockPoll = setTimeout(function(){ _pollSpock(n+1); }, 2000);
+    } else if (d.has_analysis && d.analysis) {
+      renderSpockAnalysis(d.analysis);
+      if (statusEl) { statusEl.textContent = 'Updated ' + (d.analysis.timestamp||''); statusEl.style.color = '#00ff88'; }
+      if (btn) { btn.disabled = false; btn.style.opacity = '1'; btn.textContent = 'ANALYZE POSITION'; }
+    } else if (n < 4) {
+      _spockPoll = setTimeout(function(){ _pollSpock(n+1); }, 2000);
+    } else {
+      if (loadEl)  loadEl.style.display = 'none';
+      if (emptyEl) emptyEl.style.display = 'block';
+      if (btn) { btn.disabled = false; btn.style.opacity = '1'; btn.textContent = 'ANALYZE POSITION'; }
+    }
+  }).catch(function(){ _spockPoll = setTimeout(function(){ _pollSpock(n+1); }, 2000); });
 }
 
 function spockExtract(txt, label) {
@@ -10104,7 +10063,7 @@ setTimeout(pollSpockStatus, 5000);
   <div class="strength-bar-wrap" style="display:none;"><div class="strength-bar"><div class="strength-fill" id="strengthFill" style="width:0%"></div></div><div class="strength-val"><span id="strengthVal">0</span>/100</div></div>
   </div><!-- /signal-panel -->
 
-  <!-- SYSTEM INTENT NARRATIVE BAR (Change #4 from doc — market wants to do) -->
+  <!-- SYSTEM INTENT NARRATIVE BAR -->
   <div id="intentBar" style="background:rgba(138,43,226,0.06);border-top:1px solid rgba(138,43,226,0.2);
        padding:8px 28px;display:flex;align-items:center;gap:16px;grid-column:1/-1;">
     <span style="font-size:8px;letter-spacing:3px;color:#b388ff;flex-shrink:0;">⚔️ SYSTEM READS</span>
@@ -10119,6 +10078,29 @@ setTimeout(pollSpockStatus, 5000);
       <span style="font-size:8px;color:var(--text-dim);">STRETCH CONDITION</span>
       <span id="stretchCondition" style="font-family:var(--font-mono);font-size:10px;color:#ff9800;">—</span>
     </div>
+  </div>
+
+  <!-- SPOCK QUICK READ BAR -->
+  <div id="spockQuickBar" style="background:rgba(0,229,255,0.04);border-top:1px solid rgba(0,229,255,0.15);
+       padding:7px 28px;display:flex;align-items:center;gap:12px;grid-column:1/-1;min-height:36px;">
+    <span style="font-size:8px;letter-spacing:3px;color:#00e5ff;flex-shrink:0;">🖖 SPOCK READ</span>
+    <span id="sqAction" style="font-family:var(--font-mono);font-size:11px;font-weight:700;
+      padding:2px 10px;border-radius:1px;letter-spacing:1.5px;flex-shrink:0;
+      background:rgba(0,229,255,0.12);color:#00e5ff;border:1px solid rgba(0,229,255,0.3);">—</span>
+    <span id="sqSentence" style="font-family:var(--font-mono);font-size:10px;color:var(--text);
+      flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+      Press READ to get SPOCK market analysis
+    </span>
+    <span id="sqSpinner" style="display:none;font-size:9px;color:#00e5ff;font-family:var(--font-mono);flex-shrink:0;">ANALYZING...</span>
+    <span id="sqTime" style="font-size:8px;color:var(--text-dim);flex-shrink:0;font-family:var(--font-mono);">—</span>
+    <span id="sqTicker" style="font-size:8px;color:var(--text-dim);font-family:var(--font-mono);
+      padding:1px 6px;border:1px solid rgba(255,255,255,0.1);border-radius:1px;flex-shrink:0;">—</span>
+    <button id="sqBtn" onclick="triggerQuickRead()"
+      style="flex-shrink:0;background:rgba(0,229,255,0.08);border:1px solid rgba(0,229,255,0.4);
+      color:#00e5ff;font-family:var(--font-mono);font-size:9px;letter-spacing:1.5px;
+      padding:4px 14px;cursor:pointer;border-radius:1px;"
+      onmouseover="this.style.background='rgba(0,229,255,0.2)'"
+      onmouseout="this.style.background='rgba(0,229,255,0.08)'">READ</button>
   </div>
 
 
@@ -10862,24 +10844,24 @@ setTimeout(pollSpockStatus, 5000);
        padding:16px 24px;animation:capPulse 2s ease-in-out infinite;">
     <div style="display:flex;align-items:center;gap:20px;flex-wrap:wrap;">
       <div style="flex-shrink:0;">
-        <div style="font-size:9px;letter-spacing:3px;color:#00ff88;margin-bottom:4px;">🎯 CAPITULATION BOUNCE DETECTED</div>
+        <div style="font-size:9px;letter-spacing:3px;color:#00ff88;margin-bottom:4px;">CAPITULATION BOUNCE DETECTED</div>
         <div id="capPhase" style="font-family:var(--font-mono);font-size:20px;font-weight:700;color:#00ff88;">BOUNCING</div>
         <div id="capConviction" style="font-size:9px;color:var(--text-dim);margin-top:2px;">Conviction: —/100</div>
       </div>
       <div style="flex-shrink:0;border-left:1px solid rgba(0,255,136,0.3);padding-left:20px;">
         <div style="font-size:9px;color:var(--text-dim);margin-bottom:4px;">THE MOVE</div>
-        <div id="capDropLine" style="font-family:var(--font-mono);font-size:12px;color:var(--text-primary);">— → — (—%)</div>
+        <div id="capDropLine" style="font-family:var(--font-mono);font-size:12px;color:var(--text-primary);">— to — (—%)</div>
         <div id="capRecovery" style="font-size:10px;color:#00e5ff;margin-top:2px;">Recovery: —%</div>
       </div>
       <div style="flex-shrink:0;border-left:1px solid rgba(0,255,136,0.3);padding-left:20px;">
         <div style="font-size:9px;color:var(--text-dim);margin-bottom:6px;">MULTI-DAY ENTRY</div>
-        <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;">
+        <div style="display:flex;gap:10px;align-items:baseline;">
           <span style="font-size:9px;color:var(--text-dim);">ENTRY</span>
           <span id="capEntry" style="font-family:var(--font-mono);font-size:13px;font-weight:700;color:#00ff88;">$—</span>
           <span style="font-size:9px;color:var(--text-dim);">STOP</span>
           <span id="capStop" style="font-family:var(--font-mono);font-size:13px;font-weight:700;color:#ff3355;">$—</span>
         </div>
-        <div style="display:flex;gap:10px;align-items:baseline;margin-top:4px;flex-wrap:wrap;">
+        <div style="display:flex;gap:10px;align-items:baseline;margin-top:4px;">
           <span style="font-size:9px;color:var(--text-dim);">T1</span>
           <span id="capT1" style="font-family:var(--font-mono);font-size:11px;color:#00e5ff;">$—</span>
           <span style="font-size:9px;color:var(--text-dim);">T2</span>
@@ -10888,29 +10870,24 @@ setTimeout(pollSpockStatus, 5000);
           <span id="capT3" style="font-family:var(--font-mono);font-size:11px;color:#00e5ff;">$—</span>
         </div>
       </div>
-      <div style="flex:1;min-width:200px;border-left:1px solid rgba(0,255,136,0.3);padding-left:20px;">
+      <div style="flex:1;min-width:180px;border-left:1px solid rgba(0,255,136,0.3);padding-left:20px;">
         <div style="font-size:9px;color:var(--text-dim);margin-bottom:6px;">SIGNALS CONFIRMING</div>
         <div id="capReasons" style="display:flex;flex-direction:column;gap:3px;"></div>
       </div>
       <div style="flex-shrink:0;display:flex;flex-direction:column;gap:6px;">
         <div style="display:flex;gap:6px;">
-          <div id="capOFI"    style="font-size:9px;padding:3px 8px;border-radius:1px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);color:var(--text-dim);">OFI ○</div>
-          <div id="capVolX"   style="font-size:9px;padding:3px 8px;border-radius:1px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);color:var(--text-dim);">VOL EX ○</div>
+          <div id="capOFI"  style="font-size:9px;padding:3px 8px;border-radius:1px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);color:var(--text-dim);">OFI</div>
+          <div id="capVolX" style="font-size:9px;padding:3px 8px;border-radius:1px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);color:var(--text-dim);">VOL EX</div>
         </div>
         <div style="display:flex;gap:6px;">
-          <div id="capVWAP"   style="font-size:9px;padding:3px 8px;border-radius:1px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);color:var(--text-dim);">VWAP ○</div>
-          <div id="capSupp"   style="font-size:9px;padding:3px 8px;border-radius:1px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);color:var(--text-dim);">SUPPORT ○</div>
+          <div id="capVWAP" style="font-size:9px;padding:3px 8px;border-radius:1px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);color:var(--text-dim);">VWAP</div>
+          <div id="capSupp" style="font-size:9px;padding:3px 8px;border-radius:1px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);color:var(--text-dim);">SUPPORT</div>
         </div>
-        <div id="capDaily" style="font-size:9px;padding:3px 8px;border-radius:1px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);color:var(--text-dim);text-align:center;">DAILY TREND ○</div>
+        <div id="capDaily" style="font-size:9px;padding:3px 8px;border-radius:1px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);color:var(--text-dim);text-align:center;">DAILY TREND</div>
       </div>
     </div>
   </div>
-  <style>
-    @keyframes capPulse {
-      0%,100% { box-shadow: 0 0 0 0 rgba(0,255,136,0.3); }
-      50%      { box-shadow: 0 0 20px 4px rgba(0,255,136,0.15); }
-    }
-  </style>
+  <style>@keyframes capPulse{0%,100%{box-shadow:0 0 0 0 rgba(0,255,136,0.3);}50%{box-shadow:0 0 20px 4px rgba(0,255,136,0.15);}}</style>
 
   <!-- PRECISION ENTRY PANEL — full width -->
   <div class="panel" id="entry-panel" style="grid-column:1/-1;border:2px solid rgba(0,255,136,0.35);background:rgba(0,15,5,0.98);">
