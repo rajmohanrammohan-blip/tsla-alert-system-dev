@@ -2084,6 +2084,14 @@ def calculate_unusual_options_activity(ticker_symbol, current_price):
         print(f"  [UOA] Got {len(expiries)} expiries: {list(expiries)[:3]}", flush=True)
 
         # Scan nearest 4 expiries — captures weekly and monthly flow
+        # Detect if market is closed (volume will be 0)
+        _after_hours_mode = False
+        try:
+            _test_chain = tkr.option_chain(expiries[0])
+            _test_vol = _test_chain.calls["volume"].sum() + _test_chain.puts["volume"].sum()
+            _after_hours_mode = (_test_vol == 0)
+            if _after_hours_mode: print(f"  [UOA] After-hours mode — using OI-based detection", flush=True)
+        except: pass
         scan_expiries = expiries[:4]
         result["expiries_scanned"] = len(scan_expiries)
 
@@ -2130,7 +2138,9 @@ def calculate_unusual_options_activity(ticker_symbol, current_price):
                     moneyness = "ITM" if strike < current_price else "ATM" if abs(strike - current_price)/current_price < 0.02 else "OTM"
 
                     vol_oi_ratio = volume / max(oi, 1)
-                    premium_usd    = volume * mid * 100       # total dollars on this strike
+                    eff_vol        = volume if volume > 0 else 0
+                    premium_usd    = eff_vol * mid * 100 if eff_vol > 0 else oi * mid * 100 * 0.01
+                    oi_size_flag   = (oi * mid * 100) >= 500_000
                     total_call_prem += premium_usd
 
                     # Update heatmap
@@ -2139,8 +2149,8 @@ def calculate_unusual_options_activity(ticker_symbol, current_price):
                     heatmap[s]["call_premium"]  += premium_usd
                     heatmap[s]["call_vol_oi"]    = max(heatmap[s]["call_vol_oi"], vol_oi_ratio)
 
-                    # Whale check: >$500K on single strike/expiry
-                    if premium_usd >= 500_000:
+                    # Whale check: >$500K on single strike/expiry OR large OI position
+                    if premium_usd >= 500_000 or (volume == 0 and oi_size_flag):
                         whale_alerts.append({
                             "type":        "CALL",
                             "strike":      strike,
@@ -2159,7 +2169,7 @@ def calculate_unusual_options_activity(ticker_symbol, current_price):
                         })
 
                     # Unusual: vol/OI ≥ 5×
-                    if vol_oi_ratio >= 5:
+                    if vol_oi_ratio >= 5 or (volume == 0 and oi_size_flag):
                         all_unusual.append({
                             "type":        "CALL",
                             "strike":      strike,
@@ -2194,7 +2204,9 @@ def calculate_unusual_options_activity(ticker_symbol, current_price):
                     moneyness = "ITM" if strike > current_price else "ATM" if abs(strike - current_price)/current_price < 0.02 else "OTM"
 
                     vol_oi_ratio = volume / max(oi, 1)
-                    premium_usd    = volume * mid * 100
+                    eff_vol        = volume if volume > 0 else 0
+                    premium_usd    = eff_vol * mid * 100 if eff_vol > 0 else oi * mid * 100 * 0.01
+                    oi_size_flag   = (oi * mid * 100) >= 500_000
                     total_put_prem += premium_usd
 
                     # Update heatmap
@@ -2203,7 +2215,7 @@ def calculate_unusual_options_activity(ticker_symbol, current_price):
                     heatmap[s]["put_premium"] += premium_usd
                     heatmap[s]["put_vol_oi"]   = max(heatmap[s]["put_vol_oi"], vol_oi_ratio)
 
-                    if premium_usd >= 500_000:
+                    if premium_usd >= 500_000 or (volume == 0 and oi_size_flag):
                         whale_alerts.append({
                             "type":        "PUT",
                             "strike":      strike,
@@ -2221,7 +2233,7 @@ def calculate_unusual_options_activity(ticker_symbol, current_price):
                             "severity":    "WHALE" if premium_usd >= 2_000_000 else "LARGE",
                         })
 
-                    if vol_oi_ratio >= 5:
+                    if vol_oi_ratio >= 5 or (volume == 0 and oi_size_flag):
                         all_unusual.append({
                             "type":        "PUT",
                             "strike":      strike,
@@ -2334,7 +2346,8 @@ def calculate_unusual_options_activity(ticker_symbol, current_price):
         result["uoa_reasons"] = reasons
 
         if whale_count >= 2 or extreme_count >= 1:
-            result["uoa_signal"] = f"🚨 WHALE ACTIVITY DETECTED — {result['net_flow']}"
+            mkt_note = " (OI-BASED)" if _after_hours_mode else ""
+            result["uoa_signal"] = f"🚨 WHALE ACTIVITY DETECTED{mkt_note} — {result['net_flow']}"
         elif len(all_unusual) >= 5:
             result["uoa_signal"] = f"⚡ UNUSUAL SWEEP FLOW — {result['net_flow']}"
         elif len(all_unusual) >= 2:
@@ -7540,16 +7553,6 @@ function renderCapBounce(cap) {
 
 function renderUOAPanel(uoa) {
   if(!uoa) return;
-  // DEBUG — show what data arrived
-  var dbgEl = document.getElementById('uoaDebugLine');
-  if(dbgEl) {
-    var wLen = (uoa.whale_alerts||[]).length;
-    var nf = uoa.net_flow || 'NONE';
-    var tcp = uoa.total_call_premium || 0;
-    dbgEl.textContent = 'DATA: net_flow=' + nf + ' whales=' + wLen + ' callPrem=$' + (tcp/1e6).toFixed(1) + 'M';
-    dbgEl.style.color = wLen > 0 ? '#00ff88' : '#ff3355';
-  }
-  console.log('[UOA] renderUOAPanel called, keys:', Object.keys(uoa), 'whales:', (uoa.whale_alerts||[]).length, 'net_flow:', uoa.net_flow);
   var G='#00ff88', R='#ff3355', P='#b388ff', GO='var(--gold)';
   var fmt$ = function(v) {
     if(!v && v!==0) return '-';
@@ -10727,7 +10730,6 @@ setTimeout(pollSpockStatus, 5000);
         <div style="font-size:9px;letter-spacing:3px;color:var(--text-dim);">NET FLOW DIRECTION</div>
         <div id="uoaFlow" style="font-family:var(--font-mono);font-size:24px;font-weight:700;color:#b388ff;">—</div>
         <div id="uoaSignal" style="font-size:10px;color:var(--text-dim);line-height:1.4;">Scanning...</div>
-        <div id="uoaDebugLine" style="font-size:8px;color:#ff9800;margin-top:4px;font-family:monospace;">waiting for data...</div>
         <!-- Call vs Put bar -->
         <div style="margin-top:4px;">
           <div style="display:flex;justify-content:space-between;font-size:9px;margin-bottom:4px;">
