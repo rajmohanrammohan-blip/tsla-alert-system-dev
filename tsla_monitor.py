@@ -7540,132 +7540,111 @@ function renderCapBounce(cap) {
 
 function renderUOAPanel(uoa) {
   if(!uoa) return;
-  const G = '#00ff88', R = '#ff3355', P = '#b388ff', GO = 'var(--gold)';
-  const fmt$ = v => {
-    if(!v && v !== 0) return '-';
-    if(Math.abs(v) >= 1e6) return '$' + (v/1e6).toFixed(2) + 'M';
-    if(Math.abs(v) >= 1e3) return '$' + (v/1e3).toFixed(0) + 'K';
-    return '$' + v;
+  var G='#00ff88', R='#ff3355', P='#b388ff', GO='var(--gold)';
+  var fmt$ = function(v) {
+    if(!v && v!==0) return '-';
+    if(Math.abs(v)>=1e6) return '$'+(v/1e6).toFixed(2)+'M';
+    if(Math.abs(v)>=1e3) return '$'+(v/1e3).toFixed(0)+'K';
+    return '$'+v;
   };
-  const sevColor = {EXTREME:'#ff1744', WHALE:'#ff1744', 'VERY HIGH':'#ff6d00', HIGH:GO, LARGE:'#ff6d00'};
+  var sevColor = {EXTREME:'#ff1744',WHALE:'#ff1744','VERY HIGH':'#ff6d00',HIGH:GO,LARGE:'#ff6d00'};
 
-  // Flow card
-  const flowEl = document.getElementById('uoaFlow');
-  if(flowEl) { flowEl.textContent = uoa.net_flow||'-'; flowEl.style.color = uoa.flow_color||P; }
-  const sigEl = document.getElementById('uoaSignal');
-  if(sigEl) sigEl.textContent = uoa.uoa_signal||'-';
-  const fc = document.getElementById('uoaFlowCard');
-  if(fc) fc.style.borderColor = uoa.flow_color || 'rgba(180,100,255,0.4)';
+  var flowEl=document.getElementById('uoaFlow');
+  if(flowEl){flowEl.textContent=uoa.net_flow||'-';flowEl.style.color=uoa.flow_color||P;}
+  var sigEl=document.getElementById('uoaSignal');
+  if(sigEl) sigEl.textContent=uoa.uoa_signal||'-';
+  var fc=document.getElementById('uoaFlowCard');
+  if(fc) fc.style.borderColor=uoa.flow_color||'rgba(180,100,255,0.4)';
 
-  // Call/Put % bar
-  const callPct = uoa.call_put_premium_ratio || 50;
-  const putPct  = 100 - callPct;
-  const cpEl = document.getElementById('uoaCallPct');
-  const ppEl = document.getElementById('uoaPutPct');
-  if(cpEl) { cpEl.textContent = callPct.toFixed(1)+'%'; cpEl.style.color = callPct > 55 ? G : callPct < 45 ? 'var(--text-dim)' : G; }
-  if(ppEl) { ppEl.textContent = putPct.toFixed(1)+'%';  ppEl.style.color = putPct > 55 ? R : putPct < 45 ? 'var(--text-dim)' : R; }
-  const fb = document.getElementById('uoaFlowBar');
-  if(fb) { fb.style.width = callPct+'%'; fb.style.background = callPct > 55 ? G : callPct < 45 ? R : 'var(--gold)'; }
+  var callPct=uoa.call_put_premium_ratio||50;
+  var putPct=100-callPct;
+  var cpEl=document.getElementById('uoaCallPct');
+  var ppEl=document.getElementById('uoaPutPct');
+  if(cpEl){cpEl.textContent=callPct.toFixed(1)+'%';cpEl.style.color=callPct>55?G:callPct<45?'var(--text-dim)':G;}
+  if(ppEl){ppEl.textContent=putPct.toFixed(1)+'%';ppEl.style.color=putPct>55?R:putPct<45?'var(--text-dim)':R;}
+  var fb=document.getElementById('uoaFlowBar');
+  if(fb){fb.style.width=callPct+'%';fb.style.background=callPct>55?G:callPct<45?R:'var(--gold)';}
 
-  // Counts
-  const wc = document.getElementById('uoaWhaleCount');
-  if(wc) { wc.textContent = (uoa.whale_alerts||[]).length; wc.style.color = (uoa.whale_alerts||[]).length >= 2 ? '#ff6d00' : P; }
-  const uc = document.getElementById('uoaUnusualCount');
-  if(uc) { uc.textContent = uoa.total_unusual||0; uc.style.color = (uoa.total_unusual||0) >= 5 ? '#ff6d00' : GO; }
+  var wc=document.getElementById('uoaWhaleCount');
+  if(wc){wc.textContent=(uoa.whale_alerts||[]).length;wc.style.color=(uoa.whale_alerts||[]).length>=2?'#ff6d00':P;}
+  var uc=document.getElementById('uoaUnusualCount');
+  if(uc){uc.textContent=uoa.total_unusual||0;uc.style.color=(uoa.total_unusual||0)>=5?'#ff6d00':GO;}
 
-  // Premiums
-  const cpremEl = document.getElementById('uoaCallPrem');
-  if(cpremEl) cpremEl.textContent = fmt$(uoa.total_call_premium);
-  const ppremEl = document.getElementById('uoaPutPrem');
-  if(ppremEl) ppremEl.textContent = fmt$(uoa.total_put_premium);
+  var cpremEl=document.getElementById('uoaCallPrem');
+  if(cpremEl) cpremEl.textContent=fmt$(uoa.total_call_premium);
+  var ppremEl=document.getElementById('uoaPutPrem');
+  if(ppremEl) ppremEl.textContent=fmt$(uoa.total_put_premium);
 
-  // -- Whale list --
-  const wlEl = document.getElementById('uoaWhaleList');
+  var wlEl=document.getElementById('uoaWhaleList');
   if(wlEl) {
-    const whales = uoa.whale_alerts || [];
-    wlEl.innerHTML = whales.length
-      ? whales.map(w => {
-          const c = w.type === 'CALL' ? G : R;
-          const sc = sevColor[w.severity] || GO;
-          return `<div style="background:var(--bg2);border:1px solid ${c}25;border-left:3px solid ${c};
-                               padding:8px 10px;border-radius:1px;">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
-              <span style="font-family:var(--font-mono);font-size:11px;font-weight:700;color:${c};">
-                ${w.type} $${w.strike}
-              </span>
-              <span style="font-family:var(--font-mono);font-size:13px;font-weight:700;color:${sc};">
-                ${w.premium_fmt}
-              </span>
-            </div>
-            <div style="display:flex;gap:8px;flex-wrap:wrap;font-size:8px;color:var(--text-dim);">
-              <span>Exp: <strong style="color:var(--text-primary);">${w.expiry}</strong> (${w.dte}DTE)</span>
-              <span>Vol: <strong style="color:${c};">${w.volume.toLocaleString()}</strong></span>
-              <span>OI: ${w.oi.toLocaleString()}</span>
-              <span>Vol/OI: <strong style="color:${sc};">${w.vol_oi}-</strong></span>
-              <span>IV: ${w.iv}%</span>
-              <span style="border:1px solid ${c};padding:1px 5px;border-radius:1px;">${w.moneyness}</span>
-              <span style="border:1px solid ${sc};color:${sc};padding:1px 5px;border-radius:1px;">${w.severity}</span>
-            </div>
-          </div>`;
-        }).join('')
-      : '<div style="font-size:10px;color:var(--text-dim);">No whale trades detected this cycle</div>';
+    var whales=uoa.whale_alerts||[];
+    if(whales.length) {
+      wlEl.innerHTML=whales.map(function(w){
+        var c2=w.type==='CALL'?G:R;
+        var sc=sevColor[w.severity]||GO;
+        return '<div style="background:var(--bg2);border:1px solid '+c2+'25;border-left:3px solid '+c2+';padding:8px 10px;border-radius:1px;">'
+          +'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">'
+          +'<span style="font-family:var(--font-mono);font-size:11px;font-weight:700;color:'+c2+';">'+w.type+' $'+w.strike+'</span>'
+          +'<span style="font-family:var(--font-mono);font-size:13px;font-weight:700;color:'+sc+';">'+w.premium_fmt+'</span>'
+          +'</div>'
+          +'<div style="display:flex;gap:8px;flex-wrap:wrap;font-size:8px;color:var(--text-dim);">'
+          +'<span>Exp: <strong style="color:var(--text-primary);">'+w.expiry+'</strong> ('+w.dte+'DTE)</span>'
+          +'<span>Vol: <strong style="color:'+c2+';">'+w.volume.toLocaleString()+'</strong></span>'
+          +'<span>OI: '+w.oi.toLocaleString()+'</span>'
+          +'<span>Vol/OI: <strong style="color:'+sc+';">'+w.vol_oi+'x</strong></span>'
+          +'<span>IV: '+w.iv+'%</span>'
+          +'<span style="border:1px solid '+c2+';padding:1px 5px;border-radius:1px;">'+w.moneyness+'</span>'
+          +'<span style="border:1px solid '+sc+';color:'+sc+';padding:1px 5px;border-radius:1px;">'+w.severity+'</span>'
+          +'</div></div>';
+      }).join('');
+    } else {
+      wlEl.innerHTML='<div style="font-size:10px;color:var(--text-dim);">No whale trades detected this cycle</div>';
+    }
   }
 
-  // -- Unusual calls --
   function renderUnusualList(elId, items, typeColor) {
-    const el = document.getElementById(elId);
+    var el=document.getElementById(elId);
     if(!el) return;
-    el.innerHTML = items.length
-      ? items.map(u => `
-          <div style="background:var(--bg2);border-left:2px solid ${typeColor};padding:6px 8px;border-radius:1px;">
-            <div style="display:flex;justify-content:space-between;margin-bottom:2px;">
-              <span style="font-family:var(--font-mono);font-size:10px;font-weight:700;color:${typeColor};">
-                $${u.strike} <span style="font-size:8px;">${u.expiry}</span>
-              </span>
-              <span style="font-family:var(--font-mono);font-size:10px;color:${sevColor[u.severity]||GO};">
-                ${u.vol_oi}- Vol/OI
-              </span>
-            </div>
-            <div style="display:flex;gap:6px;font-size:8px;color:var(--text-dim);">
-              <span>Vol: <strong style="color:${typeColor};">${u.volume.toLocaleString()}</strong></span>
-              <span>OI: ${u.oi.toLocaleString()}</span>
-              <span>Prem: <strong style="color:${sevColor[u.severity]||GO};">${u.premium_fmt}</strong></span>
-              <span style="border:1px solid ${typeColor}33;padding:0 4px;">${u.moneyness}</span>
-              <span style="color:${sevColor[u.severity]||GO};">${u.severity}</span>
-            </div>
-          </div>`)
-        .join('')
-      : `<div style="font-size:10px;color:var(--text-dim);">No unusual activity</div>`;
+    if(items.length) {
+      el.innerHTML=items.map(function(u){
+        return '<div style="background:var(--bg2);border-left:2px solid '+typeColor+';padding:6px 8px;border-radius:1px;">'
+          +'<div style="display:flex;justify-content:space-between;margin-bottom:2px;">'
+          +'<span style="font-family:var(--font-mono);font-size:10px;font-weight:700;color:'+typeColor+';">$'+u.strike+' <span style="font-size:8px;">'+u.expiry+'</span></span>'
+          +'<span style="font-family:var(--font-mono);font-size:10px;color:'+(sevColor[u.severity]||GO)+';">'+u.vol_oi+'x Vol/OI</span>'
+          +'</div>'
+          +'<div style="display:flex;gap:6px;font-size:8px;color:var(--text-dim);">'
+          +'<span>Vol: <strong style="color:'+typeColor+';">'+u.volume.toLocaleString()+'</strong></span>'
+          +'<span>OI: '+u.oi.toLocaleString()+'</span>'
+          +'<span>Prem: <strong style="color:'+(sevColor[u.severity]||GO)+';">'+u.premium_fmt+'</strong></span>'
+          +'<span style="border:1px solid '+typeColor+'33;padding:0 4px;">'+u.moneyness+'</span>'
+          +'<span style="color:'+(sevColor[u.severity]||GO)+';">'+u.severity+'</span>'
+          +'</div></div>';
+      }).join('');
+    } else {
+      el.innerHTML='<div style="font-size:10px;color:var(--text-dim);">No unusual activity</div>';
+    }
   }
   renderUnusualList('uoaCallList', uoa.unusual_calls||[], G);
-  renderUnusualList('uoaPutList',  uoa.unusual_puts ||[], R);
+  renderUnusualList('uoaPutList',  uoa.unusual_puts||[], R);
 
-  // -- Flow reasons --
-  const rEl = document.getElementById('uoaReasons');
+  var rEl=document.getElementById('uoaReasons');
   if(rEl) {
-    const reasons = uoa.uoa_reasons || [];
-    rEl.innerHTML = reasons.length
-      ? reasons.map(r => `<div style="font-size:10px;color:var(--text-primary);padding:6px 8px;
-          background:rgba(180,100,255,0.08);border-left:2px solid ${P};border-radius:1px;">
-          ${r}</div>`).join('')
-      : '<div style="font-size:10px;color:var(--text-dim);">No notable flow signals this cycle</div>';
-  }
-
-  // -- Premium heatmap chart --
-  if(uoa.strike_heatmap && uoa.strike_heatmap.length && uoaHeatChart) {
-    const hm = uoa.strike_heatmap;
-    uoaHeatChart.data.labels              = hm.map(h => '$'+h.strike);
-    uoaHeatChart.data.datasets[0].data   = hm.map(h => Math.round(h.call_premium/1000));
-    uoaHeatChart.data.datasets[1].data   = hm.map(h => -Math.round(h.put_premium/1000)); // negative for visual split
-    uoaHeatChart.update('none');
-  }
-
-  // -- Add UOA to ticker bar (most active strike) --
-  if(uoa.total_unusual > 0 || (uoa.whale_alerts||[]).length > 0) {
-    const tc = document.getElementById('tickerContent');
-    if(tc && tc.innerHTML.includes('Initialising')) {
-      // Will be handled by updateTickerBar on next cycle
+    var reasons=uoa.uoa_reasons||[];
+    if(reasons.length) {
+      rEl.innerHTML=reasons.map(function(r){
+        return '<div style="font-size:10px;color:var(--text-primary);padding:6px 8px;background:rgba(180,100,255,0.08);border-left:2px solid '+P+';border-radius:1px;">'+r+'</div>';
+      }).join('');
+    } else {
+      rEl.innerHTML='<div style="font-size:10px;color:var(--text-dim);">No notable flow signals this cycle</div>';
     }
+  }
+
+  if(uoa.strike_heatmap && uoa.strike_heatmap.length && uoaHeatChart) {
+    var hm=uoa.strike_heatmap;
+    uoaHeatChart.data.labels=hm.map(function(h){return '$'+h.strike;});
+    uoaHeatChart.data.datasets[0].data=hm.map(function(h){return Math.round(h.call_premium/1000);});
+    uoaHeatChart.data.datasets[1].data=hm.map(function(h){return -Math.round(h.put_premium/1000);});
+    uoaHeatChart.update('none');
   }
 }
 
@@ -10724,118 +10703,111 @@ setTimeout(pollSpockStatus, 5000);
 
   <!-- UNUSUAL OPTIONS ACTIVITY PANEL — full width -->
   <div class="panel" id="uoa-panel" style="grid-column:1/-1;border:2px solid rgba(180,100,255,0.35);background:rgba(10,5,20,0.98);">
-    <div class="panel-title" onclick="togglePanel('uoa-panel')" style="cursor:pointer;" title="Click to collapse" style="color:#b388ff;margin-bottom:18px;">
-      🔍 Unusual Options Activity — Whale &amp; Sweep Detection
-      <span style="font-size:9px;color:var(--text-dim);letter-spacing:2px;margin-left:12px;">VOL/OI RATIO · PREMIUM FLOW · WHALE ALERTS · CALL/PUT BIAS · STRIKE SWEEPS</span>
-     <span class="panel-collapse-btn" id="btn-uoa-panel">▾</span></div>
-
-    <!-- TOP ROW: 5 key numbers -->
-    <div style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr 1fr;gap:12px;margin-bottom:18px;">
-
-      <!-- Net flow signal — big -->
-      <div id="uoaFlowCard" style="background:rgba(180,100,255,0.08);border:2px solid rgba(180,100,255,0.4);
-           padding:20px;border-radius:2px;text-align:center;display:flex;flex-direction:column;justify-content:center;gap:8px;">
-        <div style="font-size:9px;letter-spacing:3px;color:var(--text-dim);">NET FLOW DIRECTION</div>
-        <div id="uoaFlow" style="font-family:var(--font-mono);font-size:24px;font-weight:700;color:#b388ff;">—</div>
-        <div id="uoaSignal" style="font-size:10px;color:var(--text-dim);line-height:1.4;">Scanning...</div>
-        <!-- Call vs Put bar -->
-        <div style="margin-top:4px;">
-          <div style="display:flex;justify-content:space-between;font-size:9px;margin-bottom:4px;">
-            <span style="color:#00ff88;">CALLS</span>
-            <span id="uoaCallPct" style="font-family:var(--font-mono);color:#00ff88;">—%</span>
-            <span id="uoaPutPct"  style="font-family:var(--font-mono);color:#ff3355;">—%</span>
-            <span style="color:#ff3355;">PUTS</span>
-          </div>
-          <div style="height:8px;background:var(--bg2);border-radius:4px;overflow:hidden;">
-            <div id="uoaFlowBar" style="height:100%;background:linear-gradient(90deg,#00ff88,#ff3355);width:50%;transition:width 0.8s;border-radius:4px;"></div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Whale count -->
-      <div style="background:var(--bg3);border:1px solid rgba(180,100,255,0.3);padding:16px;border-radius:2px;text-align:center;">
-        <div style="font-size:9px;letter-spacing:2px;color:#b388ff;margin-bottom:6px;">🐋 WHALE TRADES</div>
-        <div id="uoaWhaleCount" style="font-family:var(--font-mono);font-size:36px;font-weight:700;color:#b388ff;">0</div>
-        <div style="font-size:9px;margin-top:4px;color:var(--text-dim);">&gt;$500K single strike</div>
-      </div>
-
-      <!-- Total unusual -->
-      <div style="background:var(--bg3);border:1px solid rgba(180,100,255,0.3);padding:16px;border-radius:2px;text-align:center;">
-        <div style="font-size:9px;letter-spacing:2px;color:#b388ff;margin-bottom:6px;">⚡ UNUSUAL STRIKES</div>
-        <div id="uoaUnusualCount" style="font-family:var(--font-mono);font-size:36px;font-weight:700;color:var(--gold);">0</div>
-        <div style="font-size:9px;margin-top:4px;color:var(--text-dim);">vol/OI &gt; 5×</div>
-      </div>
-
-      <!-- Call premium -->
-      <div style="background:var(--bg3);border:1px solid rgba(0,255,136,0.3);padding:16px;border-radius:2px;text-align:center;">
-        <div style="font-size:9px;letter-spacing:2px;color:#00ff88;margin-bottom:6px;">CALL PREMIUM</div>
-        <div id="uoaCallPrem" style="font-family:var(--font-mono);font-size:18px;font-weight:700;color:#00ff88;">—</div>
-        <div style="font-size:9px;margin-top:4px;color:var(--text-dim);">total $ in calls</div>
-      </div>
-
-      <!-- Put premium -->
-      <div style="background:var(--bg3);border:1px solid rgba(255,51,85,0.3);padding:16px;border-radius:2px;text-align:center;">
-        <div style="font-size:9px;letter-spacing:2px;color:#ff3355;margin-bottom:6px;">PUT PREMIUM</div>
-        <div id="uoaPutPrem" style="font-family:var(--font-mono);font-size:18px;font-weight:700;color:#ff3355;">—</div>
-        <div style="font-size:9px;margin-top:4px;color:var(--text-dim);">total $ in puts</div>
-      </div>
-
+    <div class="panel-title" onclick="togglePanel('uoa-panel')" style="cursor:pointer;" title="Click to collapse">
+      🔍 Unusual Options Activity <span style="font-size:9px;color:var(--text-dim);">VOL/OI RATIO · PREMIUM FLOW · WHALE ALERTS · CALL/PUT BIAS · STRIKE SWEEPS</span>
+      <span class="panel-collapse-btn" id="btn-uoa-panel">▾</span>
     </div>
 
-    <!-- MIDDLE: Whale alerts + Unusual calls + Unusual puts -->
-    <div style="display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:12px;margin-bottom:14px;">
+    <!-- TOP ROW: Flow + Counts + Premiums -->
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:12px;margin-bottom:16px;">
 
-      <!-- Whale / Large premium alerts -->
-      <div style="background:var(--bg3);border:1px solid rgba(180,100,255,0.3);padding:14px;border-radius:2px;">
-        <div style="font-size:9px;letter-spacing:2px;color:#b388ff;margin-bottom:10px;text-transform:uppercase;">🐋 Whale Alerts — &gt;$500K Premium</div>
-        <div id="uoaWhaleList" style="display:flex;flex-direction:column;gap:7px;max-height:220px;overflow-y:auto;">
-          <div style="font-size:10px;color:var(--text-dim);">Scanning options chain...</div>
+      <!-- Net Flow -->
+      <div id="uoaFlowCard" style="background:var(--bg2);border:1px solid rgba(180,100,255,0.4);border-radius:2px;padding:12px 16px;">
+        <div style="font-size:8px;letter-spacing:2px;color:var(--text-dim);margin-bottom:6px;">NET FLOW DIRECTION</div>
+        <div id="uoaFlow" style="font-family:var(--font-mono);font-size:14px;font-weight:700;color:#b388ff;">—</div>
+        <div id="uoaSignal" style="font-size:9px;color:var(--text-dim);margin-top:4px;">Scanning...</div>
+        <!-- Call/Put bar -->
+        <div style="margin-top:10px;display:flex;align-items:center;gap:6px;">
+          <span id="uoaCallPct" style="font-family:var(--font-mono);font-size:10px;color:#00ff88;">—%</span>
+          <span style="font-size:8px;color:var(--text-dim);">CALLS</span>
+          <div style="flex:1;height:4px;background:rgba(255,255,255,0.1);border-radius:2px;overflow:hidden;">
+            <div id="uoaFlowBar" style="height:100%;width:50%;background:#00ff88;transition:width 0.5s;"></div>
+          </div>
+          <span style="font-size:8px;color:var(--text-dim);">PUTS</span>
+          <span id="uoaPutPct" style="font-family:var(--font-mono);font-size:10px;color:#ff3355;">—%</span>
         </div>
       </div>
 
-      <!-- Unusual calls -->
-      <div style="background:var(--bg3);border:1px solid rgba(0,255,136,0.2);padding:14px;border-radius:2px;">
-        <div style="font-size:9px;letter-spacing:2px;color:#00ff88;margin-bottom:10px;text-transform:uppercase;">🟢 Unusual Call Activity</div>
-        <div id="uoaCallList" style="display:flex;flex-direction:column;gap:6px;max-height:220px;overflow-y:auto;">
+      <!-- Whale Count -->
+      <div style="background:var(--bg2);border:1px solid rgba(255,109,0,0.3);border-radius:2px;padding:12px 16px;">
+        <div style="font-size:8px;letter-spacing:2px;color:var(--text-dim);margin-bottom:6px;">🐋 WHALE TRADES</div>
+        <div id="uoaWhaleCount" style="font-family:var(--font-mono);font-size:28px;font-weight:700;color:#b388ff;">0</div>
+        <div style="font-size:9px;color:var(--text-dim);margin-top:2px;">&gt;$500K single strike</div>
+      </div>
+
+      <!-- Unusual Count -->
+      <div style="background:var(--bg2);border:1px solid rgba(255,179,0,0.3);border-radius:2px;padding:12px 16px;">
+        <div style="font-size:8px;letter-spacing:2px;color:var(--text-dim);margin-bottom:6px;">⚡ UNUSUAL STRIKES</div>
+        <div id="uoaUnusualCount" style="font-family:var(--font-mono);font-size:28px;font-weight:700;color:var(--gold);">0</div>
+        <div style="font-size:9px;color:var(--text-dim);margin-top:2px;">vol/OI &gt; 5×</div>
+      </div>
+
+      <!-- Premium Split -->
+      <div style="background:var(--bg2);border:1px solid rgba(255,255,255,0.08);border-radius:2px;padding:12px 16px;">
+        <div style="font-size:8px;letter-spacing:2px;color:var(--text-dim);margin-bottom:8px;">PREMIUM FLOW</div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+          <span style="font-size:9px;color:#00ff88;">CALL PREMIUM</span>
+          <span id="uoaCallPrem" style="font-family:var(--font-mono);font-size:11px;font-weight:700;color:#00ff88;">—</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;">
+          <span style="font-size:9px;color:#ff3355;">PUT PREMIUM</span>
+          <span id="uoaPutPrem" style="font-family:var(--font-mono);font-size:11px;font-weight:700;color:#ff3355;">—</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- WHALE ALERTS LIST -->
+    <div style="margin-bottom:16px;">
+      <div style="font-size:9px;letter-spacing:2px;color:#ff6d00;margin-bottom:8px;">🐋 Whale Alerts — &gt;$500K Premium</div>
+      <div id="uoaWhaleList" style="display:flex;flex-direction:column;gap:6px;">
+        <div style="font-size:10px;color:var(--text-dim);">Scanning options chain...</div>
+      </div>
+    </div>
+
+    <!-- UNUSUAL CALLS + PUTS -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;">
+      <div>
+        <div style="font-size:9px;letter-spacing:2px;color:#00ff88;margin-bottom:8px;">🟢 Unusual Call Activity</div>
+        <div id="uoaCallList" style="display:flex;flex-direction:column;gap:5px;">
           <div style="font-size:10px;color:var(--text-dim);">No unusual call activity</div>
         </div>
       </div>
-
-      <!-- Unusual puts -->
-      <div style="background:var(--bg3);border:1px solid rgba(255,51,85,0.2);padding:14px;border-radius:2px;">
-        <div style="font-size:9px;letter-spacing:2px;color:#ff3355;margin-bottom:10px;text-transform:uppercase;">🔴 Unusual Put Activity</div>
-        <div id="uoaPutList" style="display:flex;flex-direction:column;gap:6px;max-height:220px;overflow-y:auto;">
+      <div>
+        <div style="font-size:9px;letter-spacing:2px;color:#ff3355;margin-bottom:8px;">🔴 Unusual Put Activity</div>
+        <div id="uoaPutList" style="display:flex;flex-direction:column;gap:5px;">
           <div style="font-size:10px;color:var(--text-dim);">No unusual put activity</div>
         </div>
       </div>
-
     </div>
 
-    <!-- BOTTOM: Premium heatmap chart + Reasons -->
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;border-top:1px solid var(--border);padding-top:12px;">
-
-      <!-- Strike premium heatmap (Chart.js bar) -->
-      <div style="background:var(--bg3);border:1px solid var(--border);padding:14px;border-radius:2px;">
-        <div style="font-size:9px;letter-spacing:2px;color:#b388ff;margin-bottom:8px;text-transform:uppercase;">💰 Premium by Strike — Call vs Put Flow</div>
-        <div style="position:relative;height:180px;"><canvas id="uoaHeatmapChart"></canvas></div>
-      </div>
-
-      <!-- Flow reasons + legend -->
-      <div style="background:var(--bg3);border:1px solid var(--border);padding:14px;border-radius:2px;">
-        <div style="font-size:9px;letter-spacing:2px;color:#b388ff;margin-bottom:10px;text-transform:uppercase;">📡 Flow Intelligence</div>
-        <div id="uoaReasons" style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px;"></div>
-        <div style="padding-top:10px;border-top:1px solid var(--border);font-size:9px;color:var(--text-dim);line-height:1.9;">
-          <div style="color:#b388ff;margin-bottom:4px;letter-spacing:1px;">HOW TO READ OPTIONS FLOW</div>
-          <strong style="color:var(--text-primary);">Vol/OI &gt; 5×</strong> — new position, not a roll. Someone just opened a fresh bet.<br>
-          <strong style="color:var(--text-primary);">Vol/OI &gt; 20×</strong> — aggressive sweep. Trader paid market price, didn't wait for fills.<br>
-          <strong style="color:var(--text-primary);">&gt;$500K premium</strong> — institutional or whale size. Not retail.<br>
-          <strong style="color:var(--text-primary);">ITM options</strong> — higher conviction. OTM = lottery tickets.<br>
-          <strong style="color:var(--text-primary);">Net call heavy</strong> — smart money expects a move up within expiry window.
-        </div>
-      </div>
-
+    <!-- HEATMAP CHART -->
+    <div style="margin-bottom:16px;">
+      <div style="font-size:9px;letter-spacing:2px;color:var(--text-dim);margin-bottom:8px;">💰 Premium by Strike — Call vs Put Flow</div>
+      <div style="height:140px;"><canvas id="uoaHeatmapChart"></canvas></div>
     </div>
+
+    <!-- FLOW REASONS -->
+    <div style="margin-bottom:16px;">
+      <div style="font-size:9px;letter-spacing:2px;color:var(--text-dim);margin-bottom:8px;">📡 Flow Intelligence</div>
+      <div id="uoaReasons" style="display:flex;flex-direction:column;gap:5px;">
+        <div style="font-size:10px;color:var(--text-dim);">Awaiting options scan...</div>
+      </div>
+    </div>
+
+    <!-- HOW TO READ -->
+    <div style="background:rgba(180,100,255,0.06);border:1px solid rgba(180,100,255,0.15);border-radius:2px;padding:12px 16px;">
+      <div style="font-size:8px;letter-spacing:2px;color:#b388ff;margin-bottom:8px;">HOW TO READ OPTIONS FLOW</div>
+      <div style="font-size:9px;color:var(--text-dim);line-height:1.7;">
+        <strong style="color:var(--text-primary);">Vol/OI &gt; 5×</strong> — new position, not a roll. Someone just opened a fresh bet.<br>
+        <strong style="color:var(--text-primary);">Vol/OI &gt; 20×</strong> — aggressive sweep. Trader paid market price, didn't wait for fills.<br>
+        <strong style="color:var(--text-primary);">&gt;$500K premium</strong> — institutional or whale size. Not retail.<br>
+        <strong style="color:var(--text-primary);">ITM options</strong> — higher conviction. OTM = lottery tickets.<br>
+        <strong style="color:var(--text-primary);">Net call heavy</strong> — smart money expects a move up within expiry window.
+      </div>
+    </div>
+
   </div>
+
 
   <!-- CAPITULATION BOUNCE ALERT BANNER -->
   <div id="capBounceAlert" style="display:none;grid-column:1/-1;
