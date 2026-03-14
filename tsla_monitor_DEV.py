@@ -1,3 +1,4 @@
+
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║           TSLA SMART ALERT SYSTEM — Bloomberg-Style         ║
@@ -121,7 +122,7 @@ _spock_cache = {
     "quick_read":       None,
     "quick_running":    False,
 }
-SPOCK_COOLDOWN = 180  # seconds between auto-triggers
+SPOCK_COOLDOWN = 600  # seconds between auto-triggers
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -4833,11 +4834,7 @@ def run_analysis():
                 f"Signals: {' | '.join(cap_rs[:3])}",
                 alert_key="cap_bounce"
             )
-            if not _spock_cache.get("running"):
-                import threading as _ct
-                _ct.Thread(target=call_spock,
-                    kwargs={"trigger":"capitulation_bounce","ticker":TICKER},daemon=True).start()
-                print(f"  SPOCK auto-triggered: capitulation bounce",flush=True)
+            # SPOCK auto-trigger on capitulation disabled to save API costs
         state["_prev_cap_detected"] = curr_cap
 
         # ── ML Directional Signal ─────────────────────────────
@@ -5627,7 +5624,7 @@ def call_spock(trigger="manual", portfolio=100000, shares=0, entry_price=0, tick
 
         payload = _json.dumps({
             "model": "claude-sonnet-4-6",
-            "max_tokens": 600,
+            "max_tokens": 400,
             "messages": [{"role": "user", "content": prompt}]
         }).encode("utf-8")
 
