@@ -1,4 +1,3 @@
-
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║           TSLA SMART ALERT SYSTEM — Bloomberg-Style         ║
@@ -2141,7 +2140,7 @@ def calculate_unusual_options_activity(ticker_symbol, current_price):
 
                     vol_oi_ratio = volume / max(oi, 1)
                     eff_vol        = volume if volume > 0 else 0
-                    premium_usd    = eff_vol * mid * 100 if eff_vol > 0 else oi * mid * 100 * 0.01
+                    premium_usd    = eff_vol * mid * 100 if eff_vol > 0 else oi * mid * 100 * 0.10
                     oi_size_flag   = (oi * mid * 100) >= 500_000
                     total_call_prem += premium_usd
 
@@ -2152,7 +2151,8 @@ def calculate_unusual_options_activity(ticker_symbol, current_price):
                     heatmap[s]["call_vol_oi"]    = max(heatmap[s]["call_vol_oi"], vol_oi_ratio)
 
                     # Whale check: >$500K on single strike/expiry OR large OI position
-                    if premium_usd >= 500_000 or (volume == 0 and oi_size_flag):
+                    _whale_thresh = 200_000 if _after_hours_mode else 500_000
+                    if premium_usd >= _whale_thresh or (volume == 0 and oi_size_flag):
                         whale_alerts.append({
                             "type":        "CALL",
                             "strike":      strike,
@@ -2207,7 +2207,7 @@ def calculate_unusual_options_activity(ticker_symbol, current_price):
 
                     vol_oi_ratio = volume / max(oi, 1)
                     eff_vol        = volume if volume > 0 else 0
-                    premium_usd    = eff_vol * mid * 100 if eff_vol > 0 else oi * mid * 100 * 0.01
+                    premium_usd    = eff_vol * mid * 100 if eff_vol > 0 else oi * mid * 100 * 0.10
                     oi_size_flag   = (oi * mid * 100) >= 500_000
                     total_put_prem += premium_usd
 
@@ -2217,7 +2217,8 @@ def calculate_unusual_options_activity(ticker_symbol, current_price):
                     heatmap[s]["put_premium"] += premium_usd
                     heatmap[s]["put_vol_oi"]   = max(heatmap[s]["put_vol_oi"], vol_oi_ratio)
 
-                    if premium_usd >= 500_000 or (volume == 0 and oi_size_flag):
+                    _whale_thresh = 200_000 if _after_hours_mode else 500_000
+                    if premium_usd >= _whale_thresh or (volume == 0 and oi_size_flag):
                         whale_alerts.append({
                             "type":        "PUT",
                             "strike":      strike,
@@ -7677,6 +7678,7 @@ function renderCapBounce(cap) {
 
 function renderUOAPanel(uoa) {
   if(!uoa) return;
+  try {
   var G='#00ff88', R='#ff3355', P='#b388ff', GO='var(--gold)';
   var fmt$ = function(v) {
     if(!v && v!==0) return '-';
@@ -7782,6 +7784,11 @@ function renderUOAPanel(uoa) {
     uoaHeatChart.data.datasets[0].data=hm.map(function(h){return Math.round(h.call_premium/1000);});
     uoaHeatChart.data.datasets[1].data=hm.map(function(h){return -Math.round(h.put_premium/1000);});
     uoaHeatChart.update('none');
+  }
+  } catch(e) {
+    console.error('[UOA] renderUOAPanel crash:', e.message, e.stack);
+    var wl=document.getElementById('uoaWhaleList');
+    if(wl) wl.innerHTML='<div style="color:#ff3355;font-size:9px;">Render error: '+e.message+'</div>';
   }
 }
 
