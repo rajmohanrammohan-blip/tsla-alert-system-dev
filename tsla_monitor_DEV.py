@@ -5816,8 +5816,17 @@ _ml_model_cache = None
 def _load_ml_model():
     global _ml_model_cache
     if _ml_model_cache is not None: return _ml_model_cache
-    import pickle
-    for path in ["tsla_model.pkl", "/app/tsla_model.pkl", "./tsla_model.pkl"]:
+    import pickle, os
+    # Railway deploys to /app by default; also check cwd and script dir
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    _paths = [
+        "tsla_model.pkl",
+        "./tsla_model.pkl",
+        "/app/tsla_model.pkl",
+        os.path.join(_script_dir, "tsla_model.pkl"),
+        os.path.join(os.getcwd(), "tsla_model.pkl"),
+    ]
+    for path in _paths:
         try:
             with open(path, "rb") as f:
                 _ml_model_cache = pickle.load(f)
@@ -5826,7 +5835,8 @@ def _load_ml_model():
         except FileNotFoundError:
             continue
         except Exception as e:
-            print(f"  ⚠️  ML model load error: {e}", flush=True)
+            print(f"  ⚠️ ML model load error at {path}: {e}", flush=True)
+    print(f"  ❌ tsla_model.pkl not found. Searched: {_paths}", flush=True)
     return None
 
 def _get_ml_signal(features_dict):
@@ -9271,7 +9281,7 @@ function renderPOCStats(poc, price) {
   }
 }
 
-
+async function fetchState() {
   try {
     var resp = await fetch('/api/state');
     if(!resp.ok){ console.warn('fetchState HTTP ' + resp.status); return; }
