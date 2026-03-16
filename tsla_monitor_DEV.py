@@ -95,6 +95,7 @@ state = {
     "uoa_data":  {},   # Unusual options activity — sweeps, whales, flow
     "ml_signal": {"signal":"HOLD","confidence":0,"probability":0.5,"available":False},
     "dark_pool": {},   # Dark pool levels
+    "poc_data":  {},   # Volume Profile: POC, VAH, VAL
     "spy_data":  {},   # SPY/macro market context
     "news_data": {},   # Real-time news sentiment
     "ext_data":  {},   # Pre/post market + overnight activity
@@ -4640,20 +4641,72 @@ def run_analysis():
         # vol_history comes from sizing (CTA engine computes rolling vol)
         vol_history = sizing.get("vol_history", [])
 
-        # vol_profile — price×volume distribution for last 60 days
+        # vol_profile — Volume Profile with POC, VAH, VAL (last 60 days)
         vol_profile = []
+        poc_data    = {}
         try:
             price_bins = {}
+            _bin_size  = 1.0   # $1 price buckets
             for i in range(-60, 0):
-                p_mid  = round((float(highs.iloc[i]) + float(lows.iloc[i])) / 2, 0)
-                vol_at = float(volumes.iloc[i])
-                price_bins[p_mid] = price_bins.get(p_mid, 0) + vol_at
+                _h = float(highs.iloc[i])
+                _l = float(lows.iloc[i])
+                _v = float(volumes.iloc[i])
+                # Distribute volume proportionally across the bar's range
+                _steps = max(int((_h - _l) / _bin_size), 1)
+                _v_per_step = _v / _steps
+                for _s in range(_steps):
+                    _bucket = round(_l + (_s + 0.5) * (_h - _l) / _steps, 0)
+                    price_bins[_bucket] = price_bins.get(_bucket, 0) + _v_per_step
+
+            # Sort by price for chart display
+            _sorted_bins = sorted(price_bins.items(), key=lambda x: x[0])
+            _total_vol   = sum(v for _, v in _sorted_bins)
+
+            # POC = highest volume price level
+            _poc_price   = max(price_bins, key=price_bins.get) if price_bins else 0
+            _poc_vol     = price_bins.get(_poc_price, 0)
+
+            # Value Area = 70% of total volume centered around POC
+            # Walk outward from POC adding bins until 70% is captured
+            _va_target   = _total_vol * 0.70
+            _va_vol      = _poc_vol
+            _bins_sorted_by_price = [p for p, _ in _sorted_bins]
+            _poc_idx     = _bins_sorted_by_price.index(_poc_price) if _poc_price in _bins_sorted_by_price else len(_bins_sorted_by_price) // 2
+            _lo_idx      = _poc_idx
+            _hi_idx      = _poc_idx
+            while _va_vol < _va_target and (_lo_idx > 0 or _hi_idx < len(_bins_sorted_by_price) - 1):
+                _add_lo = price_bins.get(_bins_sorted_by_price[_lo_idx - 1], 0) if _lo_idx > 0 else 0
+                _add_hi = price_bins.get(_bins_sorted_by_price[_hi_idx + 1], 0) if _hi_idx < len(_bins_sorted_by_price) - 1 else 0
+                if _add_hi >= _add_lo and _hi_idx < len(_bins_sorted_by_price) - 1:
+                    _hi_idx += 1; _va_vol += _add_hi
+                elif _lo_idx > 0:
+                    _lo_idx -= 1; _va_vol += _add_lo
+                else:
+                    break
+            _vah = _bins_sorted_by_price[_hi_idx] if _bins_sorted_by_price else 0
+            _val = _bins_sorted_by_price[_lo_idx] if _bins_sorted_by_price else 0
+
             vol_profile = sorted(
                 [{"price_mid": k, "volume": round(v)} for k, v in price_bins.items()],
                 key=lambda x: x["price_mid"]
             )
-        except Exception:
+
+            poc_data = {
+                "poc":        float(_poc_price),
+                "poc_vol":    round(_poc_vol),
+                "vah":        float(_vah),
+                "val":        float(_val),
+                "total_vol":  round(_total_vol),
+                "va_pct":     70,
+                "price_vs_poc": round((price - _poc_price) / (_poc_price + 1e-9) * 100, 2) if _poc_price else 0,
+                "above_poc":  price > _poc_price,
+                "in_va":      _val <= price <= _vah,
+            }
+            print(f"  📊 Volume Profile: POC=${_poc_price} | VAH=${_vah} | VAL=${_val} | Price {'above' if poc_data['above_poc'] else 'below'} POC", flush=True)
+        except Exception as _vpe:
+            print(f"  ⚠️ vol_profile error: {_vpe}")
             vol_profile = []
+            poc_data    = {}
 
         # macd_history — last 60 days of MACD line, signal, histogram
         macd_history = []
@@ -4694,6 +4747,7 @@ def run_analysis():
             "spy_data":           spy_data,
             "vol_history":        vol_history,
             "vol_profile":        vol_profile,
+            "poc_data":           poc_data,
             "macd_history":       macd_history,
             "signal_reasons":     reasons,
             "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -4840,6 +4894,38 @@ def run_analysis():
 
         # ── ML Directional Signal ─────────────────────────────
         try:
+            _dv_ft = dv_result.get("features", {})
+            _now_h = datetime.now().hour + datetime.now().minute / 60
+            _vol_ma12 = float(volumes.rolling(12).mean().iloc[-1] + 1)
+            _vol_now  = float(volumes.iloc[-1])
+            # Compute ATR ratio from available DV features (atr5/atr20)
+            _atr5  = float(_dv_ft.get("atr5",  0.01) or 0.01)
+            _atr20 = float(_dv_ft.get("atr20", 0.01) or 0.01)
+            _atr_ratio = _atr5 / (_atr20 + 1e-9)
+            # Realized vol proxy: recent std of returns annualised to intraday
+            _ret_std = float(closes.pct_change().iloc[-20:].std() or 0.01)
+            # OFI zscore: ofi_ratio is already a normalised ratio
+            _ofi_ratio = float(_dv_ft.get("ofi_ratio", 0) or 0)
+            # VWAP dist: use indicators vwap if available
+            _vwap_val  = float(indicators.get("vwap", price) or price)
+            _vwap_dist = (price - _vwap_val) / (_vwap_val + 1e-9) if _vwap_val else 0
+            # Daily trend: price vs ema50/ema200
+            _ema50  = float(indicators.get("ema50",  price) or price)
+            _ema200 = float(indicators.get("ema200", price) or price)
+            _trend_score = float(_dv_ft.get("trend_score", 0) or 0)
+            # BB position: (price - bb_lower) / (bb_upper - bb_lower)
+            _bb_upper = float(indicators.get("bb_upper", price*1.05) or price*1.05)
+            _bb_lower = float(indicators.get("bb_lower", price*0.95) or price*0.95)
+            _bb_pct   = (price - _bb_lower) / (_bb_upper - _bb_lower + 1e-9)
+            # Dist from session high/low (20-bar)
+            _high20 = float(closes.iloc[-20:].max() or price)
+            _low20  = float(closes.iloc[-20:].min() or price)
+            _dist_high = (price - _high20) / (_high20 + 1e-9)
+            _dist_low  = (price - _low20)  / (_low20  + 1e-9)
+            # Daily ret so far (open → now, using 78 5min bars ≈ 1 trading day)
+            _open_ref  = float(closes.iloc[-78] if len(closes) > 78 else closes.iloc[0])
+            _daily_ret = (price - _open_ref) / (_open_ref + 1e-9)
+
             _ml_features = {
                 "ret_1b":      float(closes.pct_change(1).iloc[-1] or 0),
                 "ret_3b":      float(closes.pct_change(3).iloc[-1] or 0),
@@ -4850,34 +4936,34 @@ def run_analysis():
                 "rsi_6":       float(indicators.get("rsi", 50)),
                 "rsi_ob":      1 if indicators.get("rsi", 50) > 70 else 0,
                 "rsi_os":      1 if indicators.get("rsi", 50) < 30 else 0,
-                "macd_hist":   float(indicators.get("macd_hist", 0)),
-                "vix":         float(spy_data.get("vix_current", 20)),
-                "vix_high":    1 if spy_data.get("vix_current", 20) > 25 else 0,
-                "vol_ratio":   float(volumes.iloc[-1] / (volumes.rolling(12).mean().iloc[-1] + 1)),
-                "atr_ratio":   float(dv_result.get("features", {}).get("atr_ratio", 0.01)),
-                "realized_vol":float(dv_result.get("features", {}).get("realized_vol", 0.5)),
-                "ofi_6b":      float(dv_result.get("features", {}).get("ofi_6b", 0)),
-                "ofi_zscore":  float(dv_result.get("features", {}).get("ofi_zscore", 0)),
-                "vwap_dist":   float(dv_result.get("features", {}).get("vwap_dist", 0)),
-                "above_vwap":  1 if dv_result.get("features", {}).get("vwap_dist", 0) > 0 else 0,
-                "tsla_spy_corr": float(spy_data.get("tsla_spy_corr", 0)),
-                "spy_ret_1b":  float(spy_data.get("spy_chg_pct", 0) / 100),
-                "daily_ret_so_far": float((price - float(closes.iloc[-78] if len(closes) > 78 else closes.iloc[0])) / (float(closes.iloc[-78] if len(closes) > 78 else closes.iloc[0]) + 1e-9)),
-                "above_daily_ma20": 1 if dv_result.get("features", {}).get("daily_trend_intact", True) else 0,
-                "daily_trend_up":   1 if dv_result.get("features", {}).get("daily_trend_intact", True) else 0,
-                "time_of_day": float(datetime.now().hour + datetime.now().minute / 60),
-                "is_open":     1 if 9.5 <= (datetime.now().hour + datetime.now().minute/60) < 10.25 else 0,
-                "is_close":    1 if 15.25 <= (datetime.now().hour + datetime.now().minute/60) < 16.0 else 0,
-                "is_lunch":    1 if 11.75 <= (datetime.now().hour + datetime.now().minute/60) < 13.0 else 0,
+                "macd_hist":   float(indicators.get("macd_hist", 0) or 0),
+                "vix":         float(spy_data.get("vix", 20) or 20),          # FIXED: was vix_current
+                "vix_high":    1 if float(spy_data.get("vix", 20) or 20) > 25 else 0,
+                "vol_ratio":   _vol_now / _vol_ma12,
+                "atr_ratio":   _atr_ratio,                                     # FIXED: computed from atr5/atr20
+                "realized_vol":_ret_std,                                        # FIXED: computed from returns
+                "ofi_6b":      _ofi_ratio,                                     # FIXED: was ofi_6b (doesn't exist)
+                "ofi_zscore":  _ofi_ratio,                                     # FIXED: use ofi_ratio as proxy
+                "vwap_dist":   _vwap_dist,                                     # FIXED: computed from indicators.vwap
+                "above_vwap":  1 if _vwap_dist > 0 else 0,
+                "tsla_spy_corr": float(spy_data.get("correlation_60d", 0) or 0),  # FIXED: was tsla_spy_corr
+                "spy_ret_1b":  float((spy_data.get("spy_change_pct", 0) or 0) / 100),  # FIXED: was spy_chg_pct
+                "daily_ret_so_far": _daily_ret,
+                "above_daily_ma20": 1 if price > _ema50 else 0,               # FIXED: use ema50 as proxy
+                "daily_trend_up":   1 if _ema50 > _ema200 else 0,             # FIXED: golden cross
+                "time_of_day": _now_h,
+                "is_open":     1 if 9.5 <= _now_h < 10.25 else 0,
+                "is_close":    1 if 15.25 <= _now_h < 16.0 else 0,
+                "is_lunch":    1 if 11.75 <= _now_h < 13.0 else 0,
                 "day_of_week": datetime.now().weekday(),
-                "bb_pct":      float(dv_result.get("features", {}).get("bb_pct", 0.5)),
-                "trend_score": float(dv_result.get("features", {}).get("trend_score", 0)),
-                "above_ema9":  1 if float(dv_result.get("features", {}).get("trend_score", 0)) >= 2 else 0,
-                "above_ema21": 1 if float(dv_result.get("features", {}).get("trend_score", 0)) >= 1 else 0,
-                "dist_from_high": float(dv_result.get("features", {}).get("dist_from_high", 0)),
-                "dist_from_low":  float(dv_result.get("features", {}).get("dist_from_low", 0)),
-                "absorption":  float(dv_result.get("features", {}).get("absorption", 0)),
-                "vol_surge":   1 if float(volumes.iloc[-1] / (volumes.rolling(12).mean().iloc[-1] + 1)) > 2 else 0,
+                "bb_pct":      _bb_pct,                                        # FIXED: computed from BB bands
+                "trend_score": _trend_score,
+                "above_ema9":  1 if _trend_score >= 2 else 0,
+                "above_ema21": 1 if _trend_score >= 1 else 0,
+                "dist_from_high": _dist_high,                                  # FIXED: computed from closes
+                "dist_from_low":  _dist_low,
+                "absorption":  float(_dv_ft.get("absorption", 0) or 0),
+                "vol_surge":   1 if _vol_now / _vol_ma12 > 2 else 0,
             }
             ml_signal = _get_ml_signal(_ml_features)
             state["ml_signal"] = ml_signal
@@ -5250,7 +5336,7 @@ def call_spock_quickread(ticker=None):
         s=state; price=s.get("price",0); dv=s.get("darthvader",{})
         dv_state=dv.get("tsla_state",{}); risk=dv.get("risk_mode","NORMAL")
         probs=dv.get("probabilistic_signals",{}); rsi=s.get("indicators",{}).get("rsi",50)
-        vix=s.get("spy_data",{}).get("vix_current",0)
+        vix=s.get("spy_data",{}).get("vix",0)
         ext=s.get("ext_data",{}); session=ext.get("session","REGULAR")
         from datetime import datetime as _dt
         now=_dt.now(); month_name=now.strftime("%B"); day_of_week=now.strftime("%A")
@@ -7203,16 +7289,37 @@ let volBarsChart = null; if(volBarsCtx) volBarsChart = new Chart(volBarsCtx, {
   }
 });
 
-// -- Volume Profile (horizontal bar - price vs volume) --
-const _vp=document.getElementById('volProfileChart'); const volProfileCtx=_vp?_vp.getContext('2d'):null;
-let volProfileChart = null; if(volProfileCtx) volProfileChart = new Chart(volProfileCtx, {
+// -- POC Profile Chart (dedicated panel) --
+const _poc2=document.getElementById('pocProfileChart'); const pocProfileCtx=_poc2?_poc2.getContext('2d'):null;
+let pocProfileChart = null; if(pocProfileCtx) pocProfileChart = new Chart(pocProfileCtx, {
   type: 'bar',
-  data: { labels:[], datasets:[{ label:'Vol @ Price', data:[], backgroundColor:'rgba(201,168,76,0.5)', borderWidth:0, borderRadius:1 }]},
+  data: { labels:[], datasets:[{ label:'Vol @ Price', data:[], backgroundColor:[], borderWidth:0, borderRadius:2 }]},
   options: { responsive:true, maintainAspectRatio:false, indexAxis:'y',
     plugins:{ legend:{display:false}, tooltip:{ callbacks:{ label: ctx=>'Vol: '+(ctx.parsed.x/1e6).toFixed(1)+'M' }}},
     scales:{ x:{ grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:7},
                callback:v => (v/1e6).toFixed(0)+'M'} },
-             y:{ grid:{display:false}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:7}} }}
+             y:{ grid:{display:false}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:8}} }}
+  }
+});
+
+// -- Volume Profile (horizontal bar - price vs volume) --
+const _vp=document.getElementById('volProfileChart'); const volProfileCtx=_vp?_vp.getContext('2d'):null;
+let volProfileChart = null; if(volProfileCtx) volProfileChart = new Chart(volProfileCtx, {
+  type: 'bar',
+  data: { labels:[], datasets:[
+    { label:'Vol @ Price', data:[], backgroundColor:[], borderWidth:0, borderRadius:1 }
+  ]},
+  options: { responsive:true, maintainAspectRatio:false, indexAxis:'y',
+    plugins:{
+      legend:{display:false},
+      tooltip:{ callbacks:{ label: ctx=>'Vol: '+(ctx.parsed.x/1e6).toFixed(1)+'M' }},
+      annotation:{ annotations:{} }
+    },
+    scales:{
+      x:{ grid:{color:'#1e2540'}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:7},
+             callback:v => (v/1e6).toFixed(0)+'M'} },
+      y:{ grid:{display:false}, ticks:{color:'#4a5280',font:{family:'Share Tech Mono',size:7}} }
+    }
   }
 });
 
@@ -7533,15 +7640,64 @@ function updateUI(s) {
     volBarsChart.update('none');
   }
   if(s.vol_profile?.length) {
-    const vp = s.vol_profile;
-    volProfileChart.data.labels = vp.map(v=>'$'+v.price_mid);
-    volProfileChart.data.datasets[0].data = vp.map(v=>v.volume);
-    // Highlight the POC (Point of Control - highest volume price)
-    const maxVol = Math.max(...vp.map(v=>v.volume));
-    volProfileChart.data.datasets[0].backgroundColor = vp.map(v=>
-      v.volume === maxVol ? '#c9a84c' : 'rgba(201,168,76,0.35)'
-    );
+    var vp  = s.vol_profile;
+    var poc = s.poc_data || {};
+    var pocPrice = poc.poc  || 0;
+    var vahPrice = poc.vah  || 0;
+    var valPrice = poc.val  || 0;
+    var curPrice = s.price  || 0;
+
+    volProfileChart.data.labels = vp.map(function(v){ return '$'+v.price_mid; });
+    volProfileChart.data.datasets[0].data   = vp.map(function(v){ return v.volume; });
+
+    // Color coding: POC=gold, VAH/VAL zone=teal, above POC=green tint, below=red tint
+    volProfileChart.data.datasets[0].backgroundColor = vp.map(function(v) {
+      var p = v.price_mid;
+      if(Math.abs(p - pocPrice) < 0.6)   return '#c9a84c';           // POC — gold
+      if(p >= valPrice && p <= vahPrice)  return 'rgba(0,229,255,0.45)'; // Value Area — teal
+      if(p > pocPrice)                    return 'rgba(0,255,136,0.3)'; // above POC — green
+      return 'rgba(255,51,85,0.3)';                                    // below POC — red
+    });
+
+    // Add POC/VAH/VAL horizontal lines via annotation plugin
+    if(volProfileChart.options.plugins && volProfileChart.options.plugins.annotation) {
+      var labels = volProfileChart.data.labels;
+      function labelIdx(price) {
+        var target = '$'+price;
+        var closest = 0; var minDist = 9999;
+        labels.forEach(function(l, i) {
+          var d = Math.abs(parseFloat(l.replace('$','')) - price);
+          if(d < minDist) { minDist=d; closest=i; }
+        });
+        return closest;
+      }
+      volProfileChart.options.plugins.annotation.annotations = {
+        pocLine: { type:'line', yMin:labelIdx(pocPrice), yMax:labelIdx(pocPrice),
+          borderColor:'#c9a84c', borderWidth:2, borderDash:[],
+          label:{ display:true, content:'POC $'+pocPrice, color:'#c9a84c',
+                  font:{family:'Share Tech Mono',size:8}, position:'end',
+                  backgroundColor:'rgba(0,0,0,0.7)', padding:{x:4,y:2} }},
+        vahLine: { type:'line', yMin:labelIdx(vahPrice), yMax:labelIdx(vahPrice),
+          borderColor:'rgba(0,229,255,0.8)', borderWidth:1, borderDash:[4,3],
+          label:{ display:true, content:'VAH $'+vahPrice, color:'#00e5ff',
+                  font:{family:'Share Tech Mono',size:8}, position:'end',
+                  backgroundColor:'rgba(0,0,0,0.7)', padding:{x:4,y:2} }},
+        valLine: { type:'line', yMin:labelIdx(valPrice), yMax:labelIdx(valPrice),
+          borderColor:'rgba(0,229,255,0.8)', borderWidth:1, borderDash:[4,3],
+          label:{ display:true, content:'VAL $'+valPrice, color:'#00e5ff',
+                  font:{family:'Share Tech Mono',size:8}, position:'end',
+                  backgroundColor:'rgba(0,0,0,0.7)', padding:{x:4,y:2} }},
+        curLine: { type:'line', yMin:labelIdx(curPrice), yMax:labelIdx(curPrice),
+          borderColor:'rgba(255,255,255,0.5)', borderWidth:1, borderDash:[2,3],
+          label:{ display:true, content:'NOW $'+curPrice, color:'#fff',
+                  font:{family:'Share Tech Mono',size:8}, position:'start',
+                  backgroundColor:'rgba(0,0,0,0.7)', padding:{x:4,y:2} }},
+      };
+    }
     volProfileChart.update('none');
+
+    // Update POC stats display
+    renderPOCStats(poc, s.price||0);
   }
 
   // -- Volume indicators --
@@ -7636,6 +7792,7 @@ function updateUI(s) {
     function(){if(s.darthvader)renderDarthVader(s.darthvader);},
     function(){window._lastState=s;renderMLPanel(s.ml_signal||{});},
     function(){try{renderCapBounce(s.capitulation||null);}catch(e){}},
+    function(){try{renderPOCPanel(s.poc_data||{},s.vol_profile||[],s.price||0);}catch(e){}},
   ].forEach(function(fn,i){try{fn();}catch(e){console.warn('Panel['+i+']: '+e.message);}});
 }
 
@@ -9060,7 +9217,7 @@ function renderMLPanel(ml) {
   var factEl=document.getElementById('mlFactors');
   if(factEl){
     var factors=[];
-    var vix=(s2.spy_data||{}).vix_current||0;
+    var vix=(s2.spy_data||{}).vix||0;
     var rsi=(s2.indicators||{}).rsi||50;
     if(feat.ofi_zscore>1.5) factors.push({label:'OFI surge',col:G});
     if(rsi>70) factors.push({label:'RSI overbought ('+Math.round(rsi)+')',col:R});
@@ -9076,7 +9233,45 @@ function renderMLPanel(ml) {
   }
 }
 
-async function fetchState() {
+function renderPOCStats(poc, price) {
+  if(!poc || !poc.poc) return;
+  var G='#00ff88', R='#ff3355', C='#00e5ff', GO='#c9a84c';
+
+  var pocEl=document.getElementById('pocPrice');
+  if(pocEl){pocEl.textContent='$'+poc.poc; pocEl.style.color=GO;}
+
+  var vahEl=document.getElementById('pocVAH');
+  if(vahEl){vahEl.textContent='$'+poc.vah; vahEl.style.color=C;}
+
+  var valEl=document.getElementById('pocVAL');
+  if(valEl){valEl.textContent='$'+poc.val; valEl.style.color=C;}
+
+  var relEl=document.getElementById('pocRelative');
+  if(relEl){
+    var abv=price>poc.poc;
+    relEl.textContent=(abv?'ABOVE':'BELOW')+' POC ('+Math.abs(poc.price_vs_poc).toFixed(1)+'%)';
+    relEl.style.color=abv?G:R;
+  }
+
+  var vaEl=document.getElementById('pocInVA');
+  if(vaEl){
+    var inva=poc.in_va;
+    vaEl.textContent=inva?'INSIDE VALUE AREA':'OUTSIDE VALUE AREA';
+    vaEl.style.color=inva?G:GO;
+  }
+
+  var structEl=document.getElementById('pocStructure');
+  if(structEl){
+    var txt, col;
+    if(price>poc.vah){txt='BULLISH — Price accepted above value';col=G;}
+    else if(price<poc.val){txt='BEARISH — Price rejected below value';col=R;}
+    else if(price>poc.poc){txt='NEUTRAL/BULL — Inside VA, above POC';col='#69f0ae';}
+    else{txt='NEUTRAL/BEAR — Inside VA, below POC';col='#ff8a65';}
+    structEl.textContent=txt; structEl.style.color=col;
+  }
+}
+
+
   try {
     var resp = await fetch('/api/state');
     if(!resp.ok){ console.warn('fetchState HTTP ' + resp.status); return; }
@@ -10331,7 +10526,41 @@ setTimeout(pollSpockStatus, 5000);
       </div>
       <div id="chartVolume"   style="flex:1;position:relative;display:none;flex-direction:column;gap:4px;">
         <canvas id="volBarsChart"   style="flex:1;"></canvas>
-        <canvas id="volProfileChart" style="flex:0 0 100px;"></canvas>
+        <!-- Volume Profile + POC Stats row -->
+        <div style="display:grid;grid-template-columns:1fr 220px;gap:8px;height:160px;">
+          <canvas id="volProfileChart" style="width:100%;height:160px;"></canvas>
+          <!-- POC Stats sidebar -->
+          <div id="pocStatsPanel" style="background:var(--bg2);border:1px solid rgba(201,168,76,0.4);
+               border-radius:2px;padding:10px;display:flex;flex-direction:column;gap:6px;">
+            <div style="font-size:8px;letter-spacing:2px;color:#c9a84c;margin-bottom:2px;">📊 VOL PROFILE</div>
+            <div style="display:flex;justify-content:space-between;font-size:9px;">
+              <span style="color:var(--text-dim);">POC</span>
+              <span id="pocPrice" style="font-family:var(--font-mono);font-weight:700;color:#c9a84c;">—</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;font-size:9px;">
+              <span style="color:var(--text-dim);">VAH (70%)</span>
+              <span id="pocVAH" style="font-family:var(--font-mono);color:#00e5ff;">—</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;font-size:9px;">
+              <span style="color:var(--text-dim);">VAL (70%)</span>
+              <span id="pocVAL" style="font-family:var(--font-mono);color:#00e5ff;">—</span>
+            </div>
+            <div style="border-top:1px solid rgba(255,255,255,0.06);padding-top:5px;">
+              <div id="pocRelative" style="font-size:9px;font-family:var(--font-mono);font-weight:700;">—</div>
+              <div id="pocInVA" style="font-size:8px;margin-top:3px;color:var(--text-dim);">—</div>
+            </div>
+            <div style="border-top:1px solid rgba(255,255,255,0.06);padding-top:5px;">
+              <div style="font-size:8px;color:var(--text-dim);margin-bottom:3px;">STRUCTURE</div>
+              <div id="pocStructure" style="font-size:9px;line-height:1.4;">—</div>
+            </div>
+            <div style="margin-top:auto;font-size:7px;color:var(--text-dim);line-height:1.5;">
+              POC = most traded price<br>
+              VAH/VAL = 70% of vol zone<br>
+              Above VAH = bullish acceptance<br>
+              Below VAL = bearish rejection
+            </div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -10638,6 +10867,90 @@ setTimeout(pollSpockStatus, 5000);
         <div style="font-size:8px;color:var(--text-dim);">vacuum risk</div>
       </div>
 
+    </div>
+  </div>
+
+  <!-- ═══ POC / VOLUME PROFILE PANEL ═══ -->
+  <div class="panel" id="poc-panel" style="grid-column:1/-1;border:1px solid rgba(201,168,76,0.5);background:rgba(15,12,0,0.98);">
+    <div class="panel-title" onclick="togglePanel('poc-panel')" style="cursor:pointer;">
+      📊 Volume Profile — POC · Value Area · Market Structure
+      <span style="font-size:9px;color:var(--text-dim);letter-spacing:2px;margin-left:12px;">60-DAY · $1 PRICE BUCKETS · 70% VALUE AREA</span>
+      <span class="panel-collapse-btn" id="btn-poc-panel">▾</span>
+    </div>
+
+    <!-- TOP ROW: Key POC numbers -->
+    <div style="display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:16px;">
+
+      <div style="background:rgba(201,168,76,0.12);border:2px solid rgba(201,168,76,0.6);padding:14px;border-radius:2px;text-align:center;">
+        <div style="font-size:8px;letter-spacing:3px;color:#c9a84c;margin-bottom:5px;">POC</div>
+        <div id="pocPanelPrice" style="font-family:var(--font-mono);font-size:22px;font-weight:700;color:#c9a84c;">—</div>
+        <div style="font-size:8px;color:var(--text-dim);margin-top:4px;">Most traded price (60d)</div>
+      </div>
+
+      <div style="background:rgba(0,229,255,0.08);border:1px solid rgba(0,229,255,0.4);padding:14px;border-radius:2px;text-align:center;">
+        <div style="font-size:8px;letter-spacing:3px;color:#00e5ff;margin-bottom:5px;">VAH</div>
+        <div id="pocPanelVAH" style="font-family:var(--font-mono);font-size:20px;font-weight:700;color:#00e5ff;">—</div>
+        <div style="font-size:8px;color:var(--text-dim);margin-top:4px;">Value Area High (70%)</div>
+      </div>
+
+      <div style="background:rgba(0,229,255,0.08);border:1px solid rgba(0,229,255,0.4);padding:14px;border-radius:2px;text-align:center;">
+        <div style="font-size:8px;letter-spacing:3px;color:#00e5ff;margin-bottom:5px;">VAL</div>
+        <div id="pocPanelVAL" style="font-family:var(--font-mono);font-size:20px;font-weight:700;color:#00e5ff;">—</div>
+        <div style="font-size:8px;color:var(--text-dim);margin-top:4px;">Value Area Low (70%)</div>
+      </div>
+
+      <div style="background:var(--bg3);border:1px solid var(--border);padding:14px;border-radius:2px;text-align:center;">
+        <div style="font-size:8px;letter-spacing:3px;color:var(--text-dim);margin-bottom:5px;">PRICE vs POC</div>
+        <div id="pocPanelRelative" style="font-family:var(--font-mono);font-size:15px;font-weight:700;">—</div>
+        <div id="pocPanelRelPct" style="font-size:10px;color:var(--text-dim);margin-top:4px;">—</div>
+      </div>
+
+      <div style="background:var(--bg3);border:1px solid var(--border);padding:14px;border-radius:2px;text-align:center;">
+        <div style="font-size:8px;letter-spacing:3px;color:var(--text-dim);margin-bottom:5px;">VALUE AREA</div>
+        <div id="pocPanelInVA" style="font-family:var(--font-mono);font-size:13px;font-weight:700;">—</div>
+        <div style="font-size:8px;color:var(--text-dim);margin-top:4px;">Price inside 70% zone?</div>
+      </div>
+
+      <div style="background:var(--bg3);border:1px solid var(--border);padding:14px;border-radius:2px;text-align:center;">
+        <div style="font-size:8px;letter-spacing:3px;color:var(--text-dim);margin-bottom:5px;">STRUCTURE</div>
+        <div id="pocPanelStructure" style="font-family:var(--font-mono);font-size:11px;font-weight:700;line-height:1.4;">—</div>
+      </div>
+
+    </div>
+
+    <!-- CHART + LEGEND ROW -->
+    <div style="display:grid;grid-template-columns:1fr 260px;gap:14px;">
+
+      <!-- Volume Profile horizontal bar chart -->
+      <div style="background:var(--bg3);border:1px solid var(--border);padding:12px;border-radius:2px;">
+        <div style="font-size:8px;letter-spacing:2px;color:#c9a84c;margin-bottom:8px;">VOLUME BY PRICE — 60 DAYS</div>
+        <div style="position:relative;height:260px;">
+          <canvas id="pocProfileChart"></canvas>
+        </div>
+      </div>
+
+      <!-- Right column: interpretation + key levels -->
+      <div style="display:flex;flex-direction:column;gap:10px;">
+
+        <!-- Key levels card -->
+        <div style="background:var(--bg3);border:1px solid var(--border);padding:12px;border-radius:2px;flex:1;">
+          <div style="font-size:8px;letter-spacing:2px;color:#c9a84c;margin-bottom:10px;">KEY LEVELS</div>
+          <div id="pocKeyLevels" style="display:flex;flex-direction:column;gap:6px;"></div>
+        </div>
+
+        <!-- Interpretation guide -->
+        <div style="background:rgba(201,168,76,0.05);border:1px solid rgba(201,168,76,0.2);padding:12px;border-radius:2px;">
+          <div style="font-size:8px;letter-spacing:2px;color:#c9a84c;margin-bottom:8px;">HOW TO TRADE IT</div>
+          <div style="font-size:9px;color:var(--text-dim);line-height:1.8;">
+            <span style="color:#c9a84c;">POC</span> = institutional magnet. Price returns here.<br>
+            <span style="color:#00e5ff;">Above VAH</span> = bullish acceptance. Breakout.<br>
+            <span style="color:#00e5ff;">Below VAL</span> = bearish rejection. Breakdown.<br>
+            <span style="color:#fff;">In Value Area</span> = range. Fade extremes.<br>
+            <span style="color:#ff9800;">POC as support</span> = first bounce target on dips.
+          </div>
+        </div>
+
+      </div>
     </div>
   </div>
 
