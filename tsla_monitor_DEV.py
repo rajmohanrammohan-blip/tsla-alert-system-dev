@@ -5410,6 +5410,138 @@ def api_refresh():
     threading.Thread(target=run_analysis).start()
     return jsonify({"status": "refreshing"})
 
+
+@app.route("/api/ml/retrain")
+def api_ml_retrain():
+    """Retrain ML model directly on Railway using live yfinance data."""
+    import threading as _thr
+    def _do_retrain():
+        global _ml_model_cache, _ml_load_errors
+        print("[ML-RETRAIN] Starting retrain on Railway...", flush=True)
+        try:
+            import numpy as np, pickle, os
+            from sklearn.preprocessing import StandardScaler
+            from sklearn.model_selection import cross_val_score
+
+            # Fetch 6 months of daily TSLA data
+            hist = yf.Ticker("TSLA").history(period="6mo", interval="1d")
+            if hist.empty or len(hist) < 60:
+                print("[ML-RETRAIN] ❌ Not enough data", flush=True); return
+
+            closes  = hist["Close"].astype(float)
+            highs   = hist["High"].astype(float)
+            lows    = hist["Low"].astype(float)
+            volumes = hist["Volume"].astype(float)
+            n = len(closes)
+
+            # Build features + labels
+            X_rows, y_rows = [], []
+            for i in range(20, n - 1):
+                c = closes.iloc
+                h = highs.iloc
+                l = lows.iloc
+                v = volumes.iloc
+                price  = float(c[i])
+                # Features
+                ret1  = (float(c[i]) / float(c[i-1]) - 1) if float(c[i-1]) > 0 else 0
+                ret3  = (float(c[i]) / float(c[i-3]) - 1) if float(c[i-3]) > 0 else 0
+                ret6  = (float(c[i]) / float(c[i-6]) - 1) if float(c[i-6]) > 0 else 0
+                ret12 = (float(c[i]) / float(c[i-12]) - 1) if float(c[i-12]) > 0 else 0
+                # RSI
+                delta = closes.diff()
+                gain  = delta.where(delta>0,0).rolling(14).mean()
+                loss  = -delta.where(delta<0,0).rolling(14).mean()
+                rsi14 = float((100 - 100/(1 + gain/loss.replace(0,1e-9))).iloc[i])
+                # Vol
+                vol_ma = float(volumes.iloc[i-12:i].mean() or 1)
+                vol_r  = float(v[i]) / vol_ma
+                # ATR
+                tr5  = float(np.mean([max(float(h[j])-float(l[j]), abs(float(h[j])-float(c[j-1])), abs(float(l[j])-float(c[j-1]))) for j in range(i-5,i)]))
+                tr20 = float(np.mean([max(float(h[j])-float(l[j]), abs(float(h[j])-float(c[j-1])), abs(float(l[j])-float(c[j-1]))) for j in range(i-20,i)]))
+                atr_r = tr5 / (tr20 + 1e-9)
+                # BB
+                ma20  = float(closes.iloc[i-20:i].mean())
+                std20 = float(closes.iloc[i-20:i].std() or 1)
+                bb_pct = (price - (ma20 - 2*std20)) / (4*std20 + 1e-9)
+                # Trend
+                trend = sum(1 if float(c[j]) > float(c[j-1]) else -1 for j in range(i-10,i))
+                # Time
+                tod = closes.index[i].hour + closes.index[i].minute/60 if hasattr(closes.index[i], 'hour') else 12.0
+                dow = closes.index[i].weekday() if hasattr(closes.index[i], 'weekday') else 2
+                # 20d high/low dist
+                h20 = float(highs.iloc[i-20:i].max() or price)
+                l20 = float(lows.iloc[i-20:i].min() or price)
+                dist_h = (price - h20) / (h20 + 1e-9)
+                dist_l = (price - l20) / (l20 + 1e-9)
+
+                row = [ret1, ret3, ret6, ret12,
+                       rsi14, 1 if rsi14>70 else 0, 1 if rsi14<30 else 0,
+                       vol_r, atr_r, float(std20/price),
+                       bb_pct, trend,
+                       tod, 1 if 9.5<=tod<10.25 else 0, 1 if 15.25<=tod<16 else 0,
+                       1 if 11.75<=tod<13 else 0, dow,
+                       dist_h, dist_l, 1 if price > ma20 else 0]
+                X_rows.append(row)
+                # Label: did price go up next bar?
+                y_rows.append(1 if float(c[i+1]) > float(c[i]) else 0)
+
+            X = np.array(X_rows)
+            y = np.array(y_rows)
+            feat_cols = ["ret1","ret3","ret6","ret12","rsi14","rsi_ob","rsi_os",
+                         "vol_ratio","atr_ratio","realized_vol","bb_pct","trend_score",
+                         "time_of_day","is_open","is_close","is_lunch","day_of_week",
+                         "dist_from_high","dist_from_low","above_ma20"]
+
+            scaler = StandardScaler()
+            X_s = scaler.fit_transform(X)
+
+            # Try LightGBM first, fallback to RandomForest
+            model_name = "LightGBM"
+            try:
+                from lightgbm import LGBMClassifier
+                model = LGBMClassifier(n_estimators=200, learning_rate=0.05,
+                                       max_depth=4, random_state=42, verbose=-1)
+            except ImportError:
+                from sklearn.ensemble import RandomForestClassifier
+                model = RandomForestClassifier(n_estimators=200, max_depth=4, random_state=42)
+                model_name = "RandomForest"
+
+            model.fit(X_s, y)
+            cv_scores = cross_val_score(model, X_s, y, cv=5, scoring="roc_auc")
+            auc = float(np.mean(cv_scores))
+
+            # Compute entry threshold
+            probs = model.predict_proba(X_s)[:,1]
+            entry_thresh = 0.60
+
+            pkg = {
+                "model":        model,
+                "scaler":       scaler,
+                "feature_cols": feat_cols,
+                "model_name":   model_name,
+                "auc":          round(auc, 3),
+                "n_samples":    len(X),
+                "entry_thresh": entry_thresh,
+                "trained_on":   datetime.now().strftime("%Y-%m-%d %H:%M"),
+            }
+
+            # Save to disk
+            pkl_path = "/app/tsla_model.pkl"
+            with open(pkl_path, "wb") as f:
+                pickle.dump(pkg, f)
+
+            _ml_model_cache = pkg
+            _ml_load_errors = []
+            print(f"[ML-RETRAIN] ✅ Done — {model_name} AUC={auc:.3f} on {len(X)} samples. Saved to {pkl_path}", flush=True)
+
+        except Exception as e:
+            import traceback
+            print(f"[ML-RETRAIN] ❌ Error: {e}", flush=True)
+            traceback.print_exc()
+
+    _thr.Thread(target=_do_retrain, daemon=True).start()
+    return jsonify({"status": "started", "message": "Retraining ML model on Railway... check /api/debug/ml in ~60s"})
+
 @app.route("/api/debug/ml")
 def api_debug_ml():
     """Show exactly why ML model is or isn't working."""
@@ -5434,6 +5566,7 @@ def api_debug_ml():
     except: result["app_files"] = []
     # 3. Try loading and report
     result["model_loaded"]  = _ml_model_cache is not None
+    result["load_errors"]   = _ml_load_errors
     if _ml_model_cache:
         result["model_keys"]  = list(_ml_model_cache.keys()) if isinstance(_ml_model_cache, dict) else str(type(_ml_model_cache))
         result["feature_cols"] = _ml_model_cache.get("feature_cols", [])
@@ -5844,11 +5977,25 @@ def detect_algo_activity():
 
 # ── ML Directional Signal (trained LightGBM model) ───────────────
 _ml_model_cache = None
+_ml_load_errors = []
 
 def _load_ml_model():
     global _ml_model_cache
     if _ml_model_cache is not None: return _ml_model_cache
-    import pickle, os
+    import pickle, os, subprocess, sys
+
+    # Auto-install lightgbm + xgboost if not present (Railway doesn't have them by default)
+    for _pkg in ["lightgbm", "xgboost"]:
+        try:
+            __import__(_pkg)
+        except ImportError:
+            print(f"  [ML] Installing {_pkg}...", flush=True)
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", _pkg, "--quiet"])
+                print(f"  [ML] ✅ {_pkg} installed", flush=True)
+            except Exception as _ie:
+                print(f"  [ML] ⚠️ Could not install {_pkg}: {_ie}", flush=True)
+
     # Railway deploys to /app by default; also check cwd and script dir
     _script_dir = os.path.dirname(os.path.abspath(__file__))
     _paths = [
@@ -5858,6 +6005,7 @@ def _load_ml_model():
         os.path.join(_script_dir, "tsla_model.pkl"),
         os.path.join(os.getcwd(), "tsla_model.pkl"),
     ]
+    _load_errors = []
     for path in _paths:
         try:
             with open(path, "rb") as f:
@@ -5867,8 +6015,14 @@ def _load_ml_model():
         except FileNotFoundError:
             continue
         except Exception as e:
-            print(f"  ⚠️ ML model load error at {path}: {e}", flush=True)
-    print(f"  ❌ tsla_model.pkl not found. Searched: {_paths}", flush=True)
+            _err = f"{path}: {type(e).__name__}: {str(e)[:200]}"
+            _load_errors.append(_err)
+            print(f"  ⚠️ ML model load error — {_err}", flush=True)
+            break  # same file at all paths, no point retrying
+    # Store errors for debug endpoint
+    global _ml_load_errors
+    _ml_load_errors = _load_errors
+    print(f"  ❌ tsla_model.pkl failed to load. Errors: {_load_errors}", flush=True)
     return None
 
 def _get_ml_signal(features_dict):
