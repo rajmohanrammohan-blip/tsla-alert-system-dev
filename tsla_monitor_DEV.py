@@ -5410,6 +5410,38 @@ def api_refresh():
     threading.Thread(target=run_analysis).start()
     return jsonify({"status": "refreshing"})
 
+@app.route("/api/debug/ml")
+def api_debug_ml():
+    """Show exactly why ML model is or isn't working."""
+    import os, pickle
+    result = {}
+    # 1. Check all candidate paths
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    _paths = [
+        "tsla_model.pkl", "./tsla_model.pkl", "/app/tsla_model.pkl",
+        os.path.join(_script_dir, "tsla_model.pkl"),
+        os.path.join(os.getcwd(), "tsla_model.pkl"),
+    ]
+    result["cwd"]         = os.getcwd()
+    result["script_dir"]  = _script_dir
+    result["paths_checked"] = {}
+    for p in _paths:
+        result["paths_checked"][p] = os.path.exists(p)
+    # 2. List files in cwd and /app
+    try: result["cwd_files"]  = [f for f in os.listdir(os.getcwd()) if f.endswith('.pkl') or 'model' in f.lower()]
+    except: result["cwd_files"] = []
+    try: result["app_files"]  = [f for f in os.listdir("/app") if f.endswith('.pkl') or 'model' in f.lower()]
+    except: result["app_files"] = []
+    # 3. Try loading and report
+    result["model_loaded"]  = _ml_model_cache is not None
+    if _ml_model_cache:
+        result["model_keys"]  = list(_ml_model_cache.keys()) if isinstance(_ml_model_cache, dict) else str(type(_ml_model_cache))
+        result["feature_cols"] = _ml_model_cache.get("feature_cols", [])
+        result["auc"]          = _ml_model_cache.get("auc", 0)
+    # 4. Show last ML signal from state
+    result["ml_signal"] = state.get("ml_signal", {})
+    return jsonify(result)
+
 @app.route("/api/debug/options")
 def api_debug_options():
     ticker_sym=request.args.get("ticker",TICKER)
@@ -12136,6 +12168,15 @@ setTimeout(pollSpockStatus, 5000);
 def start_background_threads():
     time.sleep(3)  # short wait for gunicorn to bind port
     print("[STARTUP] Starting background monitor threads...", flush=True)
+    # Pre-load ML model so first analysis has it ready
+    try:
+        pkg = _load_ml_model()
+        if pkg:
+            print(f"[STARTUP] ✅ ML model ready: {pkg.get('model_name','?')} AUC={pkg.get('auc',0):.3f} features={len(pkg.get('feature_cols',[]))}", flush=True)
+        else:
+            print("[STARTUP] ❌ ML model NOT found — check tsla_model.pkl is committed to GitHub repo", flush=True)
+    except Exception as _mle:
+        print(f"[STARTUP] ML model load error: {_mle}", flush=True)
     # Run first analysis immediately so dashboard populates fast
     try:
         print("[STARTUP] Running first analysis...", flush=True)
