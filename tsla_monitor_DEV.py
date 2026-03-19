@@ -5498,7 +5498,7 @@ def _run_ml_retrain():
             from lightgbm import LGBMClassifier
             model = LGBMClassifier(n_estimators=200, learning_rate=0.05,
                                    max_depth=4, random_state=42, verbose=-1)
-        except ImportError:
+        except (ImportError, OSError):
             from sklearn.ensemble import RandomForestClassifier
             model = RandomForestClassifier(n_estimators=200, max_depth=4, random_state=42)
             model_name = "RandomForest"
@@ -5985,17 +5985,30 @@ def _load_ml_model():
     if _ml_model_cache is not None: return _ml_model_cache
     import pickle, os, subprocess, sys
 
-    # Auto-install lightgbm + xgboost if not present (Railway doesn't have them by default)
-    for _pkg in ["lightgbm", "xgboost"]:
+
+    # Fix missing libgomp.so.1 (required by LightGBM on Railway/Debian containers)
+    try:
+        import ctypes
+        ctypes.CDLL("libgomp.so.1")
+    except OSError:
+        print("  [ML] libgomp.so.1 missing -- installing libgomp1 via apt...", flush=True)
         try:
-            __import__(_pkg)
-        except ImportError:
-            print(f"  [ML] Installing {_pkg}...", flush=True)
-            try:
-                subprocess.check_call([sys.executable, "-m", "pip", "install", _pkg, "--quiet"])
-                print(f"  [ML] ✅ {_pkg} installed", flush=True)
-            except Exception as _ie:
-                print(f"  [ML] ⚠️ Could not install {_pkg}: {_ie}", flush=True)
+            subprocess.check_call(["apt-get", "install", "-y", "-q", "libgomp1"],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print("  [ML] libgomp1 installed", flush=True)
+        except Exception as _ae:
+            print("  [ML] apt install libgomp1 failed: " + str(_ae), flush=True)
+
+    # Auto-install lightgbm if not present (Railway doesn't have it by default)
+    try:
+        import lightgbm as _lgbm_test  # noqa
+    except (ImportError, OSError):
+        print("  [ML] Installing lightgbm...", flush=True)
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "lightgbm", "--quiet"])
+            print("  [ML] lightgbm installed", flush=True)
+        except Exception as _ie:
+            print("  [ML] Could not install lightgbm: " + str(_ie), flush=True)
 
     # Railway deploys to /app by default; also check cwd and script dir
     _script_dir = os.path.dirname(os.path.abspath(__file__))
