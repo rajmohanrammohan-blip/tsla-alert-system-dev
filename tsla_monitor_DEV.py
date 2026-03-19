@@ -7828,14 +7828,14 @@ function updateUI(s) {
   if(s.macd_history&&s.macd_history.length&&macdLineChart&&macdHistChart){try{var mh=s.macd_history;macdLineChart.data.labels=mh.map(m=>m.date.slice(5));macdLineChart.data.datasets[0].data=mh.map(m=>m.macd);macdLineChart.data.datasets[1].data=mh.map(m=>m.signal);macdLineChart.update('none');macdHistChart.data.labels=mh.map(m=>m.date.slice(5));macdHistChart.data.datasets[0].data=mh.map(m=>m.hist);macdHistChart.data.datasets[0].backgroundColor=mh.map(m=>m.color+'cc');macdHistChart.update('none');}catch(e){console.warn('macdCharts:'+e.message);}}
 
   // -- Volume Charts --
-  if(s.vol_history?.length) {
-    const vh = s.vol_history;
-    volBarsChart.data.labels = vh.map(v=>v.date.slice(5));
-    volBarsChart.data.datasets[0].data = vh.map(v=>v.volume);
-    volBarsChart.data.datasets[0].backgroundColor = vh.map(v=>v.color+'99');
+  if(s.vol_history&&s.vol_history.length&&volBarsChart) {
+    var vh = s.vol_history;
+    volBarsChart.data.labels = vh.map(function(v){return v.date.slice(5);});
+    volBarsChart.data.datasets[0].data = vh.map(function(v){return v.volume;});
+    volBarsChart.data.datasets[0].backgroundColor = vh.map(function(v){return v.color+'99';});
     volBarsChart.update('none');
   }
-  if(s.vol_profile?.length) {
+  if(s.vol_profile&&s.vol_profile.length&&volProfileChart) {
     var vp  = s.vol_profile;
     var poc = s.poc_data || {};
     var pocPrice = poc.poc  || 0;
@@ -7902,11 +7902,11 @@ function updateUI(s) {
   setDot('dot-vol', ind2.volume_ratio>1.5?'bull':ind2.volume_ratio<0.7?'bear':'neut');
 
   // -- Signal Reasons --
-  const reasonsEl = document.getElementById('signalReasons');
-  if(reasonsEl && s.signal_reasons?.length) {
-    reasonsEl.innerHTML = s.signal_reasons.slice(0,5).map(r=>
-      `<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-dim);background:var(--bg2);border:1px solid var(--border);padding:3px 10px;border-radius:2px;white-space:nowrap;">${r}</span>`
-    ).join('');
+  var reasonsEl = document.getElementById('signalReasons');
+  if(reasonsEl && s.signal_reasons && s.signal_reasons.length) {
+    reasonsEl.innerHTML = s.signal_reasons.slice(0,5).map(function(r){
+      return '<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-dim);background:var(--bg2);border:1px solid var(--border);padding:3px 10px;border-radius:2px;white-space:nowrap;">'+r+'</span>';
+    }).join('');
   }
 
   // -- Ichimoku Cloud Chart --
@@ -7937,38 +7937,38 @@ function updateUI(s) {
 
   // -- Alert Log --
   // -- Alert log with richer display --
-  const logEl = document.getElementById('alertLog');
-  if(logEl) logEl.innerHTML = s.alerts_log?.length
-    ? s.alerts_log.map(a => {
-        const isSell = a.signal?.includes('EXIT') || a.signal?.includes('SELL');
-        const isBuy  = a.signal === 'BUY';
-        const bdr    = isSell ? '#ff3355' : isBuy ? '#00ff88' : 'var(--gold)';
-        return `<div class="alert-item" style="border-left:3px solid ${bdr};padding-left:10px;margin-bottom:8px;">
-          <div style="display:flex;justify-content:space-between;align-items:center;">
-            <span style="font-family:var(--font-mono);font-size:12px;color:${bdr};font-weight:700;">${a.signal} @ $${a.price}</span>
-            <span style="font-size:9px;color:var(--text-dim);">${a.time}</span>
-          </div>
-          <div style="font-size:10px;color:var(--text-dim);margin-top:3px;">${a.reason}</div>
-          <div style="display:flex;gap:8px;margin-top:4px;flex-wrap:wrap;">
-            <span style="font-size:9px;font-family:var(--font-mono);color:var(--gold);">Strength: ${a.strength}/100</span>
-            ${a.gex ? `<span style="font-size:9px;font-family:var(--font-mono);color:#b388ff;">GEX: ${a.gex}</span>` : ''}
-            ${a.max_pain ? `<span style="font-size:9px;font-family:var(--font-mono);color:var(--gold);">MaxPain: $${a.max_pain}</span>` : ''}
-            ${a.hmm ? `<span style="font-size:9px;font-family:var(--font-mono);color:var(--text-dim);">HMM: ${a.hmm}</span>` : ''}
-          </div>
-        </div>`;
+  var logEl = document.getElementById('alertLog');
+  if(logEl) logEl.innerHTML = (s.alerts_log && s.alerts_log.length)
+    ? s.alerts_log.map(function(a) {
+        var isSell = (a.signal&&(a.signal.indexOf('EXIT')>=0||a.signal.indexOf('SELL')>=0));
+        var isBuy  = a.signal === 'BUY';
+        var bdr    = isSell ? '#ff3355' : isBuy ? '#00ff88' : 'var(--gold)';
+        return '<div class="alert-item" style="border-left:3px solid '+bdr+';padding-left:10px;margin-bottom:8px;">'
+          + '<div style="display:flex;justify-content:space-between;align-items:center;">'
+          + '<span style="font-family:var(--font-mono);font-size:12px;color:'+bdr+';font-weight:700;">'+a.signal+' @ $'+a.price+'</span>'
+          + '<span style="font-size:9px;color:var(--text-dim);">'+a.time+'</span>'
+          + '</div>'
+          + '<div style="font-size:10px;color:var(--text-dim);margin-top:3px;">'+a.reason+'</div>'
+          + '<div style="display:flex;gap:8px;margin-top:4px;flex-wrap:wrap;">'
+          + '<span style="font-size:9px;font-family:var(--font-mono);color:var(--gold);">Strength: '+a.strength+'/100</span>'
+          + (a.gex ? '<span style="font-size:9px;font-family:var(--font-mono);color:#b388ff;">GEX: '+a.gex+'</span>' : '')
+          + (a.max_pain ? '<span style="font-size:9px;font-family:var(--font-mono);color:var(--gold);">MaxPain: $'+a.max_pain+'</span>' : '')
+          + (a.hmm ? '<span style="font-size:9px;font-family:var(--font-mono);color:var(--text-dim);">HMM: '+a.hmm+'</span>' : '')
+          + '</div></div>';
       }).join('')
     : '<div class="no-alerts">Monitoring... no signals yet.</div>';
 
   // -- Last alert ticker in header --
-  if(s.alerts_log?.length) {
-    const last = s.alerts_log[0];
-    const tickerEl = document.getElementById('lastAlertTicker');
-    if(tickerEl) tickerEl.textContent = `${last.signal} @ $${last.price} - ${last.reason?.slice(0,50)}`;
+  if(s.alerts_log && s.alerts_log.length) {
+    var last = s.alerts_log[0];
+    var tickerEl = document.getElementById('lastAlertTicker');
+    if(tickerEl) tickerEl.textContent = last.signal+' @ $'+last.price+' - '+(last.reason?last.reason.slice(0,50):'');
   }
 
   // -- Institutional --
-  document.getElementById('instList').innerHTML = s.institutional?.length
-    ? s.institutional.map(i=>`<div class="inst-item"><div class="inst-name">${i.institution}</div><div class="inst-meta">Form ${i.form} - Filed ${i.date}</div><span class="inst-badge ${badgeClass(i.action)}">${i.action}</span></div>`).join('')
+  var instListEl = document.getElementById('instList');
+  if(instListEl) instListEl.innerHTML = (s.institutional && s.institutional.length)
+    ? s.institutional.map(function(i){return '<div class="inst-item"><div class="inst-name">'+i.institution+'</div><div class="inst-meta">Form '+i.form+' - Filed '+i.date+'</div><span class="inst-badge '+badgeClass(i.action)+'">'+i.action+'</span></div>';}).join('')
     : '<div class="no-alerts">Loading 13F data...</div>';
 
   document.getElementById('lastUpdated').textContent = s.last_updated ? 'Updated '+s.last_updated : '-';
