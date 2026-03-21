@@ -6129,21 +6129,30 @@ def _get_ml_signal(features_dict):
     empty = {"signal":"HOLD","confidence":0,"probability":0.5,"available":False}
     try:
         import numpy as np
+        import pandas as pd
         pkg = _load_ml_model()
         if pkg is None: return empty
         cols  = pkg["feature_cols"]
-        X_row = np.array([[features_dict.get(c, 0) for c in cols]])
-        X_s   = pkg["scaler"].transform(X_row)
-        prob  = float(pkg["model"].predict_proba(X_s)[0][1])
+        # Use DataFrame with named columns so LightGBM gets the feature names it was fitted with
+        row_data = {c: float(features_dict.get(c, 0) or 0) for c in cols}
+        X_df  = pd.DataFrame([row_data], columns=cols)
+        X_s   = pkg["scaler"].transform(X_df)
+        # Pass as DataFrame to predict_proba so LGBM feature names match
+        X_s_df = pd.DataFrame(X_s, columns=cols)
+        prob  = float(pkg["model"].predict_proba(X_s_df)[0][1])
         thresh = pkg.get("entry_thresh", 0.60)
         if prob >= thresh:           signal = "BUY"
         elif prob <= (1 - thresh):   signal = "SELL"
         else:                        signal = "HOLD"
         confidence = round(abs(prob - 0.5) * 200)
+        # Log how many features matched vs defaulted to 0
+        matched = sum(1 for c in cols if c in features_dict and features_dict[c] != 0)
         return {"signal":signal,"confidence":confidence,
                 "probability":round(prob,3),"available":True,
                 "model":pkg.get("model_name","LightGBM"),
-                "auc":round(pkg.get("auc",0),3)}
+                "auc":round(pkg.get("auc",0),3),
+                "features_matched": matched,
+                "features_total": len(cols)}
     except Exception as e:
         return {**empty, "error": str(e)[:60]}
 
@@ -12393,11 +12402,22 @@ setTimeout(pollSpockStatus, 5000);
 def start_background_threads():
     time.sleep(3)  # short wait for gunicorn to bind port
     print("[STARTUP] Starting background monitor threads...", flush=True)
-    # Pre-load ML model so first analysis has it ready
+    # Pre-load ML model — check feature compatibility and retrain if needed
+    _EXPECTED_ML_FEATURES = ['ret_1b', 'ret_3b', 'ret_6b', 'ret_12b', 'ret_48b', 'rsi_14', 'rsi_6', 'rsi_ob', 'rsi_os', 'macd_hist', 'vix', 'vix_high', 'vol_ratio', 'atr_ratio', 'realized_vol', 'ofi_6b', 'ofi_zscore', 'vwap_dist', 'above_vwap', 'tsla_spy_corr', 'spy_ret_1b', 'daily_ret_so_far', 'above_daily_ma20', 'daily_trend_up', 'time_of_day', 'is_open', 'is_close', 'is_lunch', 'day_of_week', 'bb_pct', 'trend_score', 'above_ema9', 'above_ema21', 'dist_from_high', 'dist_from_low', 'absorption', 'vol_surge']
     try:
         pkg = _load_ml_model()
         if pkg:
-            print(f"[STARTUP] ✅ ML model ready: {pkg.get('model_name','?')} AUC={pkg.get('auc',0):.3f} features={len(pkg.get('feature_cols',[]))}", flush=True)
+            loaded_cols = pkg.get("feature_cols", [])
+            # Check if loaded model's features match what run_analysis sends
+            missing = [c for c in _EXPECTED_ML_FEATURES if c not in loaded_cols]
+            extra   = [c for c in loaded_cols if c not in _EXPECTED_ML_FEATURES]
+            if missing or extra:
+                print(f"[STARTUP] ⚠️ ML feature mismatch — loaded:{len(loaded_cols)} expected:{len(_EXPECTED_ML_FEATURES)} missing:{missing[:5]} — retraining...", flush=True)
+                global _ml_model_cache
+                _ml_model_cache = None  # clear stale cache
+                threading.Thread(target=_run_ml_retrain, daemon=True).start()
+            else:
+                print(f"[STARTUP] ✅ ML model ready: {pkg.get('model_name','?')} AUC={pkg.get('auc',0):.3f} features={len(loaded_cols)}", flush=True)
         else:
             print("[STARTUP] ❌ ML model NOT found — auto-training now (takes ~60s)...", flush=True)
             threading.Thread(target=_run_ml_retrain, daemon=True).start()
