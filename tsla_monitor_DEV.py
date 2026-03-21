@@ -4967,8 +4967,10 @@ def run_analysis():
             }
             ml_signal = _get_ml_signal(_ml_features)
             state["ml_signal"] = ml_signal
+            print(f"  [ML] signal={ml_signal.get('signal')} confidence={ml_signal.get('confidence')} available={ml_signal.get('available')} matched={ml_signal.get('features_matched','?')}/{ml_signal.get('features_total','?')} err={ml_signal.get('error','')}", flush=True)
         except Exception as _ml_e:
             state["ml_signal"] = {"signal":"HOLD","confidence":0,"probability":0.5,"available":False,"error":str(_ml_e)[:60]}
+            print(f"  [ML] EXCEPTION: {_ml_e}", flush=True)
 
         # ── Entry signal WhatsApp alert ──
         prev_entry = state.get("_prev_entry_score", 0)
@@ -6153,7 +6155,7 @@ def _get_ml_signal(features_dict):
                          "is_close","is_lunch","day_of_week","bb_pct","trend_score",
                          "above_ema9","above_ema21","dist_from_high","dist_from_low",
                          "absorption","vol_surge"])
-        if not _expected.issubset(set(cols)):
+        if _expected != set(cols):
             return {**empty, "error": "stale model — retrain in progress"}
         # Use DataFrame with named columns so LightGBM gets the feature names it was fitted with
         row_data = {c: float(features_dict.get(c, 0) or 0) for c in cols}
@@ -12435,7 +12437,7 @@ def start_background_threads():
             missing = [c for c in _EXPECTED_ML_FEATURES if c not in loaded_cols]
             extra   = [c for c in loaded_cols if c not in _EXPECTED_ML_FEATURES]
             if missing or extra:
-                print(f"[STARTUP] ⚠️ ML feature mismatch — loaded:{len(loaded_cols)} expected:{len(_EXPECTED_ML_FEATURES)} missing:{missing[:5]} — retraining...", flush=True)
+                print(f"[STARTUP] ⚠️ ML feature mismatch — loaded:{len(loaded_cols)} expected:{len(_EXPECTED_ML_FEATURES)} missing:{missing[:3]} extra:{extra[:3]} — retraining...", flush=True)
                 global _ml_model_cache
                 _ml_model_cache = None  # clear stale cache
                 threading.Thread(target=_run_ml_retrain, daemon=True).start()
