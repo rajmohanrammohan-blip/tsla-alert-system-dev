@@ -5578,8 +5578,10 @@ def _run_ml_retrain():
 
         assert len(feat_cols) == X.shape[1], f"Feature count mismatch: {len(feat_cols)} names vs {X.shape[1]} cols"
 
+        import pandas as _pd_rt
         scaler = StandardScaler()
-        X_s = scaler.fit_transform(X)
+        X_df_train = _pd_rt.DataFrame(X, columns=feat_cols)
+        X_s = scaler.fit_transform(X_df_train)
 
         # Try LightGBM, fallback to RandomForest
         model_name = "LightGBM"
@@ -5592,8 +5594,9 @@ def _run_ml_retrain():
             model = RandomForestClassifier(n_estimators=200, max_depth=4, random_state=42)
             model_name = "RandomForest"
 
-        model.fit(X_s, y)
-        cv_scores = cross_val_score(model, X_s, y, cv=5, scoring="roc_auc")
+        X_s_df = _pd_rt.DataFrame(X_s, columns=feat_cols)
+        model.fit(X_s_df, y)
+        cv_scores = cross_val_score(model, X_s_df, y, cv=5, scoring="roc_auc")
         auc = float(np.mean(cv_scores))
 
         pkg = {
