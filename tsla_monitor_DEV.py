@@ -5412,7 +5412,7 @@ def api_refresh():
 
 
 def _run_ml_retrain():
-    """Retrain ML model directly on Railway using live yfinance data. Runs in a thread."""
+    """Retrain ML model. Feature names MUST match _ml_features keys in run_analysis."""
     global _ml_model_cache, _ml_load_errors
     print("[ML-RETRAIN] Starting retrain on Railway...", flush=True)
     try:
@@ -5423,7 +5423,7 @@ def _run_ml_retrain():
         # Fetch 6 months of daily TSLA data
         hist = yf.Ticker("TSLA").history(period="6mo", interval="1d")
         if hist.empty or len(hist) < 60:
-            print("[ML-RETRAIN] ❌ Not enough data", flush=True); return
+            print("[ML-RETRAIN] Not enough data", flush=True); return
 
         closes  = hist["Close"].astype(float)
         highs   = hist["High"].astype(float)
@@ -5431,68 +5431,157 @@ def _run_ml_retrain():
         volumes = hist["Volume"].astype(float)
         n = len(closes)
 
-        # Build features + labels
+        # Pre-compute RSI series once (avoid recomputing per bar)
+        delta = closes.diff()
+        gain  = delta.where(delta > 0, 0).rolling(14).mean()
+        loss  = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        rsi_series = 100 - 100 / (1 + gain / loss.replace(0, 1e-9))
+
+        # Pre-compute EMA50 / EMA200 for golden-cross feature
+        ema50_s  = closes.ewm(span=50,  adjust=False).mean()
+        ema200_s = closes.ewm(span=200, adjust=False).mean()
+
         X_rows, y_rows = [], []
         for i in range(20, n - 1):
             c = closes.iloc
             h = highs.iloc
             l = lows.iloc
             v = volumes.iloc
-            price  = float(c[i])
-            # Features
-            ret1  = (float(c[i]) / float(c[i-1]) - 1) if float(c[i-1]) > 0 else 0
-            ret3  = (float(c[i]) / float(c[i-3]) - 1) if float(c[i-3]) > 0 else 0
-            ret6  = (float(c[i]) / float(c[i-6]) - 1) if float(c[i-6]) > 0 else 0
-            ret12 = (float(c[i]) / float(c[i-12]) - 1) if float(c[i-12]) > 0 else 0
-            # RSI
-            delta = closes.diff()
-            gain  = delta.where(delta>0,0).rolling(14).mean()
-            loss  = -delta.where(delta<0,0).rolling(14).mean()
-            rsi14 = float((100 - 100/(1 + gain/loss.replace(0,1e-9))).iloc[i])
-            # Vol
-            vol_ma = float(volumes.iloc[i-12:i].mean() or 1)
-            vol_r  = float(v[i]) / vol_ma
-            # ATR
-            tr5  = float(np.mean([max(float(h[j])-float(l[j]), abs(float(h[j])-float(c[j-1])), abs(float(l[j])-float(c[j-1]))) for j in range(i-5,i)]))
-            tr20 = float(np.mean([max(float(h[j])-float(l[j]), abs(float(h[j])-float(c[j-1])), abs(float(l[j])-float(c[j-1]))) for j in range(i-20,i)]))
-            atr_r = tr5 / (tr20 + 1e-9)
-            # BB
-            ma20  = float(closes.iloc[i-20:i].mean())
-            std20 = float(closes.iloc[i-20:i].std() or 1)
-            bb_pct = (price - (ma20 - 2*std20)) / (4*std20 + 1e-9)
-            # Trend
-            trend = sum(1 if float(c[j]) > float(c[j-1]) else -1 for j in range(i-10,i))
-            # Time
-            tod = closes.index[i].hour + closes.index[i].minute/60 if hasattr(closes.index[i], 'hour') else 12.0
-            dow = closes.index[i].weekday() if hasattr(closes.index[i], 'weekday') else 2
-            # 20d high/low dist
-            h20 = float(highs.iloc[i-20:i].max() or price)
-            l20 = float(lows.iloc[i-20:i].min() or price)
-            dist_h = (price - h20) / (h20 + 1e-9)
-            dist_l = (price - l20) / (l20 + 1e-9)
+            price = float(c[i])
 
-            row = [ret1, ret3, ret6, ret12,
-                   rsi14, 1 if rsi14>70 else 0, 1 if rsi14<30 else 0,
-                   vol_r, atr_r, float(std20/price),
-                   bb_pct, trend,
-                   tod, 1 if 9.5<=tod<10.25 else 0, 1 if 15.25<=tod<16 else 0,
-                   1 if 11.75<=tod<13 else 0, dow,
-                   dist_h, dist_l, 1 if price > ma20 else 0]
+            # ── Returns (match: ret_1b, ret_3b, ret_6b, ret_12b, ret_48b) ──
+            def ret(b): return (float(c[i]) / float(c[max(0,i-b)]) - 1) if float(c[max(0,i-b)]) > 0 else 0
+            ret_1b  = ret(1)
+            ret_3b  = ret(3)
+            ret_6b  = ret(6)
+            ret_12b = ret(12)
+            ret_48b = ret(min(48, i))
+
+            # ── RSI (match: rsi_14, rsi_6, rsi_ob, rsi_os) ──
+            rsi_14 = float(rsi_series.iloc[i])
+            rsi_6  = rsi_14   # proxy — daily bars don't have rsi_6 separately
+            rsi_ob = 1 if rsi_14 > 70 else 0
+            rsi_os = 1 if rsi_14 < 30 else 0
+
+            # ── MACD hist proxy (match: macd_hist) ──
+            ema12 = float(closes.iloc[max(0,i-12):i+1].ewm(span=12, adjust=False).mean().iloc[-1])
+            ema26 = float(closes.iloc[max(0,i-26):i+1].ewm(span=26, adjust=False).mean().iloc[-1])
+            macd_line = ema12 - ema26
+            sig_line  = float(closes.iloc[max(0,i-35):i+1].ewm(span=9, adjust=False).mean().iloc[-1])
+            macd_hist = macd_line - sig_line
+
+            # ── VIX proxy — use realized vol as stand-in (match: vix, vix_high) ──
+            ret_arr = [float(c[j])/float(c[j-1])-1 for j in range(max(1,i-19), i+1) if float(c[j-1])>0]
+            realized_vol = float(np.std(ret_arr) * (252**0.5)) if ret_arr else 0.3
+            vix       = realized_vol * 100   # scale to VIX-like units
+            vix_high  = 1 if vix > 25 else 0
+
+            # ── Volume (match: vol_ratio) ──
+            vol_ma12 = float(volumes.iloc[max(0,i-12):i].mean() or 1)
+            vol_ratio = float(v[i]) / vol_ma12
+            vol_surge = 1 if vol_ratio > 2 else 0
+
+            # ── ATR ratio (match: atr_ratio) ──
+            def tr(j): return max(float(h[j])-float(l[j]), abs(float(h[j])-float(c[j-1])), abs(float(l[j])-float(c[j-1])))
+            tr5  = float(np.mean([tr(j) for j in range(max(1,i-5), i+1)]))
+            tr20 = float(np.mean([tr(j) for j in range(max(1,i-20), i+1)]))
+            atr_ratio = tr5 / (tr20 + 1e-9)
+
+            # ── BB pct (match: bb_pct) ──
+            ma20  = float(closes.iloc[max(0,i-20):i].mean())
+            std20 = float(closes.iloc[max(0,i-20):i].std() or 1)
+            bb_pct = (price - (ma20 - 2*std20)) / (4*std20 + 1e-9)
+
+            # ── OFI proxy (match: ofi_6b, ofi_zscore) ──
+            ofi_6b    = ret_6b   # daily bars: use 6b return as OFI proxy
+            ofi_zscore = ret_6b / (realized_vol / (252**0.5) + 1e-9)
+
+            # ── VWAP proxy (match: vwap_dist, above_vwap) ──
+            vwap_proxy = float(closes.iloc[max(0,i-5):i+1].mean())
+            vwap_dist  = (price - vwap_proxy) / (vwap_proxy + 1e-9)
+            above_vwap = 1 if vwap_dist > 0 else 0
+
+            # ── SPY proxy (match: tsla_spy_corr, spy_ret_1b) ──
+            tsla_spy_corr = 0.75   # historical TSLA-SPY correlation constant
+            spy_ret_1b    = ret_1b * 0.5  # rough proxy
+
+            # ── Daily return so far (match: daily_ret_so_far) ──
+            daily_ret_so_far = ret_1b
+
+            # ── EMA / trend (match: above_daily_ma20, daily_trend_up, above_ema9, above_ema21) ──
+            ema50_v  = float(ema50_s.iloc[i])
+            ema200_v = float(ema200_s.iloc[i])
+            above_daily_ma20 = 1 if price > ema50_v else 0
+            daily_trend_up   = 1 if ema50_v > ema200_v else 0
+            trend_score = sum(1 if float(c[j]) > float(c[j-1]) else -1 for j in range(max(1,i-10), i+1))
+            above_ema9  = 1 if trend_score >= 2 else 0
+            above_ema21 = 1 if trend_score >= 1 else 0
+
+            # ── Time (match: time_of_day, is_open, is_close, is_lunch, day_of_week) ──
+            tod = closes.index[i].hour + closes.index[i].minute/60.0 if hasattr(closes.index[i], 'hour') else 12.0
+            dow = closes.index[i].weekday() if hasattr(closes.index[i], 'weekday') else 2
+            is_open  = 1 if 9.5  <= tod < 10.25 else 0
+            is_close = 1 if 15.25 <= tod < 16.0  else 0
+            is_lunch = 1 if 11.75 <= tod < 13.0  else 0
+
+            # ── High/low dist (match: dist_from_high, dist_from_low) ──
+            h20 = float(highs.iloc[max(0,i-20):i].max() or price)
+            l20 = float(lows.iloc[max(0,i-20):i].min() or price)
+            dist_from_high = (price - h20) / (h20 + 1e-9)
+            dist_from_low  = (price - l20) / (l20 + 1e-9)
+
+            # ── Absorption proxy (match: absorption) ──
+            absorption = float(abs(float(h[i]) - float(l[i])) / (price + 1e-9))
+
+            # Feature vector — keys MUST match _ml_features in run_analysis exactly
+            row = [
+                ret_1b, ret_3b, ret_6b, ret_12b, ret_48b,
+                rsi_14, rsi_6, rsi_ob, rsi_os,
+                macd_hist,
+                vix, vix_high,
+                vol_ratio, atr_ratio, realized_vol,
+                ofi_6b, ofi_zscore,
+                vwap_dist, above_vwap,
+                tsla_spy_corr, spy_ret_1b,
+                daily_ret_so_far,
+                above_daily_ma20, daily_trend_up,
+                tod, is_open, is_close, is_lunch, dow,
+                bb_pct, trend_score,
+                above_ema9, above_ema21,
+                dist_from_high, dist_from_low,
+                absorption, vol_surge,
+            ]
             X_rows.append(row)
-            # Label: did price go up next bar?
             y_rows.append(1 if float(c[i+1]) > float(c[i]) else 0)
 
         X = np.array(X_rows)
         y = np.array(y_rows)
-        feat_cols = ["ret1","ret3","ret6","ret12","rsi14","rsi_ob","rsi_os",
-                     "vol_ratio","atr_ratio","realized_vol","bb_pct","trend_score",
-                     "time_of_day","is_open","is_close","is_lunch","day_of_week",
-                     "dist_from_high","dist_from_low","above_ma20"]
+
+        # CRITICAL: these names must EXACTLY match the keys in _ml_features dict
+        feat_cols = [
+            "ret_1b", "ret_3b", "ret_6b", "ret_12b", "ret_48b",
+            "rsi_14", "rsi_6", "rsi_ob", "rsi_os",
+            "macd_hist",
+            "vix", "vix_high",
+            "vol_ratio", "atr_ratio", "realized_vol",
+            "ofi_6b", "ofi_zscore",
+            "vwap_dist", "above_vwap",
+            "tsla_spy_corr", "spy_ret_1b",
+            "daily_ret_so_far",
+            "above_daily_ma20", "daily_trend_up",
+            "time_of_day", "is_open", "is_close", "is_lunch", "day_of_week",
+            "bb_pct", "trend_score",
+            "above_ema9", "above_ema21",
+            "dist_from_high", "dist_from_low",
+            "absorption", "vol_surge",
+        ]
+
+        assert len(feat_cols) == X.shape[1], f"Feature count mismatch: {len(feat_cols)} names vs {X.shape[1]} cols"
 
         scaler = StandardScaler()
         X_s = scaler.fit_transform(X)
 
-        # Try LightGBM first, fallback to RandomForest
+        # Try LightGBM, fallback to RandomForest
         model_name = "LightGBM"
         try:
             from lightgbm import LGBMClassifier
@@ -5507,9 +5596,6 @@ def _run_ml_retrain():
         cv_scores = cross_val_score(model, X_s, y, cv=5, scoring="roc_auc")
         auc = float(np.mean(cv_scores))
 
-        # Compute entry threshold
-        entry_thresh = 0.60
-
         pkg = {
             "model":        model,
             "scaler":       scaler,
@@ -5517,22 +5603,21 @@ def _run_ml_retrain():
             "model_name":   model_name,
             "auc":          round(auc, 3),
             "n_samples":    len(X),
-            "entry_thresh": entry_thresh,
+            "entry_thresh": 0.60,
             "trained_on":   datetime.now().strftime("%Y-%m-%d %H:%M"),
         }
 
-        # Save to disk
         pkl_path = "/app/tsla_model.pkl"
         with open(pkl_path, "wb") as f:
             pickle.dump(pkg, f)
 
         _ml_model_cache = pkg
         _ml_load_errors = []
-        print(f"[ML-RETRAIN] ✅ Done — {model_name} AUC={auc:.3f} on {len(X)} samples. Saved to {pkl_path}", flush=True)
+        print(f"[ML-RETRAIN] Done - {model_name} AUC={auc:.3f} on {len(X)} samples, {len(feat_cols)} features. Saved.", flush=True)
 
     except Exception as e:
         import traceback
-        print(f"[ML-RETRAIN] ❌ Error: {e}", flush=True)
+        print(f"[ML-RETRAIN] Error: {e}", flush=True)
         traceback.print_exc()
 
 
@@ -7705,77 +7790,79 @@ function updateChartAnnotations(s) {
 // ---------------------------------------------------------------
 
 function updateTickerBar(s) {
-  const price  = s.price  || 0;
-  const signal = s.signal || 'HOLD';
-  const en     = s.entry_data || {};
-  const pk     = s.peak_data  || {};
-  const ex     = s.exit_data?.exit_analysis || {};
-  const sz     = s.sizing || {};
+  try {
+  var price  = s.price  || 0;
+  var signal = s.signal || 'HOLD';
+  var en     = s.entry_data || {};
+  var pk     = s.peak_data  || {};
+  var exA    = (s.exit_data && s.exit_data.exit_analysis) ? s.exit_data.exit_analysis : {};
+  var sz     = s.sizing || {};
 
   // Price + signal
-  const tpEl = document.getElementById('tickerPrice');
+  var tpEl = document.getElementById('tickerPrice');
   if(tpEl) tpEl.textContent = price ? '$'+price.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}) : '-';
 
-  const tsEl = document.getElementById('tickerSignal');
+  var tsEl = document.getElementById('tickerSignal');
   if(tsEl) {
-    const sigColors = {BUY:'#00ff88',SELL:'#ff3355',HOLD:'#ffb300'};
+    var sigColors = {BUY:'#00ff88',SELL:'#ff3355',HOLD:'#ffb300'};
     tsEl.textContent  = signal;
     tsEl.style.color  = sigColors[signal]||'#ffb300';
-    tsEl.style.border = `1px solid ${sigColors[signal]||'#ffb300'}`;
+    tsEl.style.border = '1px solid '+(sigColors[signal]||'#ffb300');
   }
 
-  // Build ticker items
-  const items = [];
+  var items = [];
 
   // Entry signals
   if((en.entry_score||0) >= 25) {
-    const c = (en.entry_score||0)>=65?'#00ff88':(en.entry_score||0)>=45?'#69f0ae':'#ffd600';
-    items.push(`<span style="color:${c};margin-right:32px;">- ENTRY ${en.entry_urgency||''} - Score ${en.entry_score||0}/100 - Deploy ${en.total_deploy_pct||0}%</span>`);
-    (en.tranche_plan||[]).forEach(t => {
-      items.push(`<span style="color:${c};margin-right:32px;">T${t.number} BUY ${t.pct_cap}% @ $${t.price} (${t.shares} shares)</span>`);
+    var ce = (en.entry_score||0)>=65?'#00ff88':(en.entry_score||0)>=45?'#69f0ae':'#ffd600';
+    items.push('<span style="color:'+ce+';margin-right:32px;">- ENTRY '+(en.entry_urgency||'')+' - Score '+(en.entry_score||0)+'/100 - Deploy '+(en.total_deploy_pct||0)+'%</span>');
+    (en.tranche_plan||[]).forEach(function(t){
+      items.push('<span style="color:'+ce+';margin-right:32px;">T'+t.number+' BUY '+t.pct_cap+'% @ $'+t.price+' ('+t.shares+' shares)</span>');
     });
   }
 
   // Peak signals
   if((pk.peak_score||0) >= 25) {
-    const c = (pk.peak_score||0)>=65?'#ff1744':(pk.peak_score||0)>=45?'#ff6d00':'#ffd600';
-    items.push(`<span style="color:${c};margin-right:32px;">- PEAK ${pk.peak_urgency||''} - Score ${pk.peak_score||0}/100</span>`);
-    (ex.sell_tranches||[]).forEach(t => {
-      items.push(`<span style="color:${c};margin-right:32px;">T${t.number} SELL ${t.pct_holding}% @ $${t.price} (+${t.gain_pct}%)</span>`);
+    var cp = (pk.peak_score||0)>=65?'#ff1744':(pk.peak_score||0)>=45?'#ff6d00':'#ffd600';
+    items.push('<span style="color:'+cp+';margin-right:32px;">- PEAK '+(pk.peak_urgency||'')+' - Score '+(pk.peak_score||0)+'/100</span>');
+    (exA.sell_tranches||[]).forEach(function(t){
+      items.push('<span style="color:'+cp+';margin-right:32px;">T'+t.number+' SELL '+t.pct_holding+'% @ $'+t.price+' (+'+t.gain_pct+'%)</span>');
     });
   }
 
   // Exit score
-  if((ex.exit_score||0) >= 25) {
-    items.push(`<span style="color:#ff6d00;margin-right:32px;">- EXIT ${ex.urgency||''} - Score ${ex.exit_score||0}/100 - Stop $${ex.stop_loss||'-'}</span>`);
+  if((exA.exit_score||0) >= 25) {
+    items.push('<span style="color:#ff6d00;margin-right:32px;">- EXIT '+(exA.urgency||'')+' - Score '+(exA.exit_score||0)+'/100 - Stop $'+(exA.stop_loss||'-')+'</span>');
   }
 
   // CTA sizing
   if(sz.sizing_signal && sz.sizing_signal !== 'HOLD') {
-    items.push(`<span style="color:#40c4ff;margin-right:32px;">- CTA ${sz.sizing_signal} - ${sz.final_exposure_pct||0}% of capital - ${sz.share_count||0} shares</span>`);
+    items.push('<span style="color:#40c4ff;margin-right:32px;">- CTA '+sz.sizing_signal+' - '+(sz.final_exposure_pct||0)+'% of capital - '+(sz.share_count||0)+' shares</span>');
   }
 
   // UOA flow
-  const uoa = s.uoa_data || {};
+  var uoa = s.uoa_data || {};
   if((uoa.whale_alerts||[]).length > 0) {
-    const wdir = uoa.net_flow || 'NEUTRAL';
-    const wc2  = (uoa.whale_alerts||[]).length;
-    items.push(`<span style="color:#b388ff;margin-right:32px;">- ${wc2} WHALE TRADE${wc2>1?'S':''} - ${wdir} FLOW - ${uoa.total_unusual||0} unusual strikes</span>`);
+    var wdir = uoa.net_flow || 'NEUTRAL';
+    var wc2  = (uoa.whale_alerts||[]).length;
+    items.push('<span style="color:#b388ff;margin-right:32px;">- '+wc2+' WHALE TRADE'+(wc2>1?'S':'')+' - '+wdir+' FLOW - '+(uoa.total_unusual||0)+' unusual strikes</span>');
   }
 
   // Max pain + VIX
-  const vix = s.spy_data?.vix;
-  if(vix) items.push(`<span style="color:#b388ff;margin-right:32px;">VIX ${vix} - ${s.spy_data?.vix_regime||''}</span>`);
-  const mp = s.mm_data?.max_pain;
-  if(mp) items.push(`<span style="color:#ce93d8;margin-right:32px;">- Max Pain $${mp}</span>`);
+  var spyd = s.spy_data || {};
+  var vix  = spyd.vix;
+  if(vix) items.push('<span style="color:#b388ff;margin-right:32px;">VIX '+vix+' - '+(spyd.vix_regime||'')+'</span>');
+  var mmd = s.mm_data || {};
+  var mp  = mmd.max_pain;
+  if(mp) items.push('<span style="color:#ce93d8;margin-right:32px;">- Max Pain $'+mp+'</span>');
 
-  // Fallback when no signals
   if(items.length === 0) {
-    items.push(`<span style="color:var(--text-dim);margin-right:32px;">No active buy or sell signals - monitoring all indicators</span>`);
+    items.push('<span style="color:var(--text-dim);margin-right:32px;">No active buy or sell signals - monitoring all indicators</span>');
   }
 
-  const tc = document.getElementById('tickerContent');
+  var tc = document.getElementById('tickerContent');
   if(tc) tc.innerHTML = items.join('<span style="color:var(--border);margin-right:32px;">|</span>');
+  } catch(e) { console.warn('tickerBar: '+e.message); }
 }
 
 function updateUI(s) {
@@ -8211,35 +8298,27 @@ function renderEntryPanel(en, portfolioValue) {
   if(trEl) {
     const tp = en.tranche_plan || [];
     if(tp.length === 0) {
-      trEl.innerHTML = `<div style="grid-column:1/-1;text-align:center;font-size:11px;color:var(--text-dim);padding:20px;">
-        No entry opportunity yet - waiting for setup to develop</div>`;
+      trEl.innerHTML = '<div style="grid-column:1/-1;text-align:center;font-size:11px;color:var(--text-dim);padding:20px;">No entry opportunity yet - waiting for setup to develop</div>';
     } else {
-      trEl.innerHTML = tp.map(t => `
-        <div style="background:var(--bg3);border:2px solid ${t.color}40;border-top:3px solid ${t.color};
-                     padding:16px;border-radius:2px;">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-            <span style="font-family:var(--font-mono);font-size:10px;font-weight:700;color:${t.color};">
-              T${t.number} - ${t.label}
-            </span>
-            <span style="font-family:var(--font-mono);font-size:18px;font-weight:700;color:${t.color};">
-              ${t.pct_cap}%
-            </span>
-          </div>
-          <div style="font-size:9px;color:var(--text-dim);margin-bottom:8px;line-height:1.5;">${t.trigger}</div>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px;">
-            <div style="text-align:center;background:var(--bg2);padding:8px;border-radius:2px;">
-              <div style="font-size:8px;color:var(--text-dim);">DOLLARS</div>
-              <div style="font-family:var(--font-mono);font-size:13px;color:${t.color};">${fmt$(t.dollars)}</div>
-            </div>
-            <div style="text-align:center;background:var(--bg2);padding:8px;border-radius:2px;">
-              <div style="font-size:8px;color:var(--text-dim);">SHARES</div>
-              <div style="font-family:var(--font-mono);font-size:13px;color:${t.color};">${t.shares.toLocaleString()}</div>
-            </div>
-          </div>
-          <div style="font-size:8px;color:var(--text-dim);line-height:1.5;border-top:1px solid var(--border);padding-top:6px;">
-            ${t.rationale}
-          </div>
-        </div>`).join('');
+      trEl.innerHTML = tp.map(function(t){
+        return '<div style="background:var(--bg3);border:2px solid '+t.color+'40;border-top:3px solid '+t.color+';padding:16px;border-radius:2px;">'
+          +'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">'
+          +'<span style="font-family:var(--font-mono);font-size:10px;font-weight:700;color:'+t.color+';">T'+t.number+' - '+t.label+'</span>'
+          +'<span style="font-family:var(--font-mono);font-size:18px;font-weight:700;color:'+t.color+';">'+t.pct_cap+'%</span>'
+          +'</div>'
+          +'<div style="font-size:9px;color:var(--text-dim);margin-bottom:8px;line-height:1.5;">'+t.trigger+'</div>'
+          +'<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px;">'
+          +'<div style="text-align:center;background:var(--bg2);padding:8px;border-radius:2px;">'
+          +'<div style="font-size:8px;color:var(--text-dim);">DOLLARS</div>'
+          +'<div style="font-family:var(--font-mono);font-size:13px;color:'+t.color+';">'+fmt$(t.dollars)+'</div>'
+          +'</div>'
+          +'<div style="text-align:center;background:var(--bg2);padding:8px;border-radius:2px;">'
+          +'<div style="font-size:8px;color:var(--text-dim);">SHARES</div>'
+          +'<div style="font-family:var(--font-mono);font-size:13px;color:'+t.color+';">'+t.shares.toLocaleString()+'</div>'
+          +'</div></div>'
+          +'<div style="font-size:8px;color:var(--text-dim);line-height:1.5;border-top:1px solid var(--border);padding-top:6px;">'+t.rationale+'</div>'
+          +'</div>';
+      }).join('');
     }
   }
 
@@ -8248,16 +8327,15 @@ function renderEntryPanel(en, portfolioValue) {
   if(slEl) {
     const sigs = en.signals || [];
     slEl.innerHTML = sigs.length
-      ? sigs.map(s => {
-          const c = sevColor[s.severity] || GO;
-          return `<div style="background:var(--bg2);border:1px solid ${c}30;border-left:3px solid ${c};
-                               padding:8px 10px;border-radius:1px;">
-            <div style="display:flex;justify-content:space-between;margin-bottom:3px;">
-              <span style="font-size:10px;font-weight:700;color:${c};">${s.name}</span>
-              <span style="font-family:var(--font-mono);font-size:9px;color:${c};">+${s.score}</span>
-            </div>
-            <div style="font-size:8px;color:var(--text-dim);line-height:1.4;">${s.detail}</div>
-          </div>`;
+      ? sigs.map(function(s){
+          var c = sevColor[s.severity] || GO;
+          return '<div style="background:var(--bg2);border:1px solid '+c+'30;border-left:3px solid '+c+';padding:8px 10px;border-radius:1px;">'
+            +'<div style="display:flex;justify-content:space-between;margin-bottom:3px;">'
+            +'<span style="font-size:10px;font-weight:700;color:'+c+';">'+s.name+'</span>'
+            +'<span style="font-family:var(--font-mono);font-size:9px;color:'+c+';">+'+s.score+'</span>'
+            +'</div>'
+            +'<div style="font-size:8px;color:var(--text-dim);line-height:1.4;">'+s.detail+'</div>'
+            +'</div>';
         }).join('')
       : '<div style="font-size:10px;color:var(--text-dim);">No bottom signals yet - price not at a buy zone</div>';
   }
@@ -8267,13 +8345,15 @@ function renderEntryPanel(en, portfolioValue) {
   if(supEl) {
     const lvls = en.support_levels || [];
     supEl.innerHTML = lvls.length
-      ? [...lvls].reverse().map((v, i) => `
-          <div style="display:flex;justify-content:space-between;align-items:center;
-                       padding:5px 8px;background:var(--bg2);border-radius:2px;
-                       border-left:3px solid ${i===0?G:i===1?'#69f0ae':GO};">
-            <span style="font-family:var(--font-mono);font-size:12px;color:${i===0?G:'var(--text-dim)'};">$${v}</span>
-            <span style="font-size:8px;color:var(--text-dim);">${i===0?'- nearest support':i===1?'- 2nd support':'- 3rd support'}</span>
-          </div>`).join('')
+      ? [...lvls].reverse().map(function(v,i){
+          var bc = i===0?G:i===1?'#69f0ae':GO;
+          var vc = i===0?G:'var(--text-dim)';
+          var lbl = i===0?'- nearest support':i===1?'- 2nd support':'- 3rd support';
+          return '<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 8px;background:var(--bg2);border-radius:2px;border-left:3px solid '+bc+';">'
+            +'<span style="font-family:var(--font-mono);font-size:12px;color:'+vc+';">$'+v+'</span>'
+            +'<span style="font-size:8px;color:var(--text-dim);">'+lbl+'</span>'
+            +'</div>';
+        }).join('')
       : '<div style="font-size:9px;color:var(--text-dim);">Computing support levels...</div>';
   }
 
@@ -8285,10 +8365,10 @@ function renderEntryPanel(en, portfolioValue) {
       const near = currentPrice && Math.abs(currentPrice - level) / currentPrice < 0.02;
       const below = currentPrice && level < currentPrice;
       const c = near ? G : below ? '#69f0ae' : 'var(--text-dim)';
-      return `<div style="display:flex;justify-content:space-between;font-size:9px;padding:2px 0;">
-        <span style="color:${c};">${label}</span>
-        <span style="font-family:var(--font-mono);color:${c};">${near ? '- NEAR ' : ''}$${level}</span>
-      </div>`;
+      return '<div style="display:flex;justify-content:space-between;font-size:9px;padding:2px 0;">'
+        +'<span style="color:'+c+';">'+label+'</span>'
+        +'<span style="font-family:var(--font-mono);color:'+c+';">'+(near?'- NEAR ':'')+'$'+level+'</span>'
+        +'</div>';
     }).join('');
   }
 
@@ -8307,14 +8387,14 @@ function renderEntryPanel(en, portfolioValue) {
       { check: score >= 65,                      label: "Entry score - 65 (BUY NOW)",                action: "Execute T1 + set T2 limit order" },
       { check: !!(en.invalidation),              label: "Stop set at invalidation level",             action: "Place stop at $" + (en.invalidation||'-') },
     ];
-    clEl.innerHTML = items.map(item => `
-      <div style="display:flex;align-items:flex-start;gap:10px;padding:5px 0;border-bottom:1px solid var(--border);">
-        <span style="font-size:14px;flex-shrink:0;">${item.check ? '-' : '-'}</span>
-        <div>
-          <div style="font-size:10px;color:${item.check ? G : 'var(--text-dim)'};">${item.label}</div>
-          <div style="font-size:8px;color:${item.check ? '#69f0ae' : 'var(--text-dim)40'};margin-top:2px;">- ${item.action}</div>
-        </div>
-      </div>`).join('');
+    clEl.innerHTML = items.map(function(item){
+      return '<div style="display:flex;align-items:flex-start;gap:10px;padding:5px 0;border-bottom:1px solid var(--border);">'
+        +'<span style="font-size:14px;flex-shrink:0;">-</span>'
+        +'<div>'
+        +'<div style="font-size:10px;color:'+(item.check?G:'var(--text-dim)')+';">'+item.label+'</div>'
+        +'<div style="font-size:8px;color:'+(item.check?'#69f0ae':'var(--text-dim)')+'40;margin-top:2px;">- '+item.action+'</div>'
+        +'</div></div>';
+    }).join('');
   }
 }
 
@@ -8364,16 +8444,15 @@ function renderPeakPanel(pk) {
       if(cmEl) cmEl.style.display = 'block';
     } else {
       if(cmEl) cmEl.style.display = 'none';
-      scEl.innerHTML = sigs.map(s => {
-        const c = sevColor[s.severity] || GO;
-        return `<div style="background:var(--bg3);border:1px solid var(--border);border-left:3px solid ${c};
-                             padding:12px;border-radius:1px;">
-          <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
-            <span style="font-size:11px;font-weight:700;color:${c};">${s.name}</span>
-            <span style="font-family:var(--font-mono);font-size:10px;color:${c};">+${s.score}</span>
-          </div>
-          <div style="font-size:9px;color:var(--text-dim);line-height:1.5;">${s.detail}</div>
-        </div>`;
+      scEl.innerHTML = sigs.map(function(s){
+        var c = sevColor[s.severity] || GO;
+        return '<div style="background:var(--bg3);border:1px solid var(--border);border-left:3px solid '+c+';padding:12px;border-radius:1px;">'
+          +'<div style="display:flex;justify-content:space-between;margin-bottom:4px;">'
+          +'<span style="font-size:11px;font-weight:700;color:'+c+';">'+s.name+'</span>'
+          +'<span style="font-family:var(--font-mono);font-size:10px;color:'+c+';">+'+s.score+'</span>'
+          +'</div>'
+          +'<div style="font-size:9px;color:var(--text-dim);line-height:1.5;">'+s.detail+'</div>'
+          +'</div>';
       }).join('');
     }
   }
@@ -8384,14 +8463,13 @@ function renderPeakPanel(pk) {
     const patterns = pk.candle_patterns || [];
     const barLabels = {"-1": "Today", "-2": "Yesterday", "-3": "2 days ago"};
     cpEl.innerHTML = patterns.length
-      ? patterns.map(p => {
-          const c = p.severity === 'HIGH' ? R : p.severity === 'MEDIUM' ? O : GO;
-          return `<div style="display:flex;justify-content:space-between;align-items:center;
-                               background:var(--bg2);border:1px solid ${c}40;padding:8px 10px;border-radius:2px;">
-            <span style="font-size:11px;color:${c};font-weight:700;">${p.pattern}</span>
-            <span style="font-size:9px;color:var(--text-dim);">${barLabels[String(p.bar)] || ''}</span>
-            <span style="font-size:9px;font-family:var(--font-mono);color:${c};border:1px solid ${c};padding:2px 6px;">${p.severity}</span>
-          </div>`;
+      ? patterns.map(function(p){
+          var c = p.severity === 'HIGH' ? R : p.severity === 'MEDIUM' ? O : GO;
+          return '<div style="display:flex;justify-content:space-between;align-items:center;background:var(--bg2);border:1px solid '+c+'40;padding:8px 10px;border-radius:2px;">'
+            +'<span style="font-size:11px;color:'+c+';font-weight:700;">'+p.pattern+'</span>'
+            +'<span style="font-size:9px;color:var(--text-dim);">'+(barLabels[String(p.bar)]||'')+'</span>'
+            +'<span style="font-size:9px;font-family:var(--font-mono);color:'+c+';border:1px solid '+c+';padding:2px 6px;">'+p.severity+'</span>'
+            +'</div>';
         }).join('')
       : '<div style="font-size:10px;color:var(--accent-green);">- No reversal candle patterns</div>';
   }
@@ -8408,14 +8486,14 @@ function renderPeakPanel(pk) {
       { check: score >= 65,                      label: "Peak score - 65 (SELL NOW zone)",           action: "Exit remaining position now" },
       { check: !!(pk.hard_stop),                 label: "Hard stop set below 3-day low",             action: "Place stop order at $" + (pk.hard_stop || '-') },
     ];
-    clEl.innerHTML = items.map(item => `
-      <div style="display:flex;align-items:flex-start;gap:10px;padding:6px 0;border-bottom:1px solid var(--border);">
-        <span style="font-size:14px;flex-shrink:0;">${item.check ? '-' : '-'}</span>
-        <div>
-          <div style="font-size:10px;color:${item.check ? G : 'var(--text-dim)'};">${item.label}</div>
-          <div style="font-size:9px;color:${item.check ? O : 'var(--text-dim)40'};margin-top:2px;">- ${item.action}</div>
-        </div>
-      </div>`).join('');
+    clEl.innerHTML = items.map(function(item){
+      return '<div style="display:flex;align-items:flex-start;gap:10px;padding:6px 0;border-bottom:1px solid var(--border);">'
+        +'<span style="font-size:14px;flex-shrink:0;">-</span>'
+        +'<div>'
+        +'<div style="font-size:10px;color:'+(item.check?G:'var(--text-dim)')+';">'+item.label+'</div>'
+        +'<div style="font-size:9px;color:'+(item.check?O:'var(--text-dim)')+'40;margin-top:2px;">- '+item.action+'</div>'
+        +'</div></div>';
+    }).join('');
   }
 }
 
@@ -8443,33 +8521,36 @@ function renderCTAPanel(sz, price) {
 
   const srEl = document.getElementById('shareRange');
   if(srEl) srEl.innerHTML = sz.conservative_shares != null
-    ? `<span style="color:${B};">${sz.conservative_shares.toLocaleString()}</span>
-       <span style="color:var(--text-dim);font-size:12px;"> - </span>
-       <span style="color:${O};">${sz.aggressive_shares.toLocaleString()}</span><br>
-       <span style="font-size:10px;color:var(--text-dim);">${fmt$(sz.conservative_exposure)} - ${fmt$(sz.aggressive_exposure)}</span>` : '-';
+    ? '<span style="color:'+B+';">'+sz.conservative_shares.toLocaleString()+'</span>'
+      +' <span style="color:var(--text-dim);font-size:12px;"> - </span>'
+      +' <span style="color:'+O+';">'+sz.aggressive_shares.toLocaleString()+'</span><br>'
+      +'<span style="font-size:10px;color:var(--text-dim);">'+fmt$(sz.conservative_exposure)+' - '+fmt$(sz.aggressive_exposure)+'</span>'
+    : '-';
 
   const drEl = document.getElementById('dailyRisk');
   if(drEl) drEl.textContent = fmt$(sz.dollar_at_risk);
   const siEl = document.getElementById('spyImpact');
   if(siEl) siEl.textContent = sz.max_loss_1pct_spy ? '-' + fmt$(sz.max_loss_1pct_spy) : '-';
   const sbEl = document.getElementById('spyBeta');
-  if(sbEl) sbEl.textContent = sz.corr_60d != null ? `beta: ${fmtN(sz.beta_20d||2,1)}x | corr: ${fmtN(sz.corr_60d,2)}` : '-';
+  if(sbEl) sbEl.textContent = sz.corr_60d != null ? 'beta: '+fmtN(sz.beta_20d||2,1)+'x | corr: '+fmtN(sz.corr_60d,2) : '-';
 
   // Factor table
   const ftEl = document.getElementById('ctaFactorTable');
   if(ftEl && sz.factor_table) {
-    ftEl.innerHTML = sz.factor_table.map(row => {
-      const isResult = row.factor.includes('-');
-      return `<div style="display:flex;justify-content:space-between;align-items:baseline;
-                           padding:${isResult?'6px 0 2px':'3px 0'};
-                           border-bottom:1px solid rgba(255,255,255,0.04);
-                           ${isResult?'border-top:1px solid rgba(0,255,136,0.3);margin-top:4px;':''}">
-        <span style="font-size:${isResult?'11':'9'}px;color:${isResult?G:'var(--text-dim)'};">${row.factor}</span>
-        <div style="text-align:right;">
-          <span style="font-family:var(--font-mono);font-size:${isResult?'13':'10'}px;color:${isResult?G:'var(--text-primary)'};">${row.value}</span>
-          <div style="font-size:8px;color:var(--text-dim);">${row.impact}</div>
-        </div>
-      </div>`;
+    ftEl.innerHTML = sz.factor_table.map(function(row){
+      var isResult = row.factor.includes('-');
+      var pad = isResult?'6px 0 2px':'3px 0';
+      var fsize = isResult?'11':'9';
+      var fc = isResult?G:'var(--text-dim)';
+      var vsize = isResult?'13':'10';
+      var vc = isResult?G:'var(--text-primary)';
+      var border = isResult?'border-top:1px solid rgba(0,255,136,0.3);margin-top:4px;':'';
+      return '<div style="display:flex;justify-content:space-between;align-items:baseline;padding:'+pad+';border-bottom:1px solid rgba(255,255,255,0.04);'+border+'">'
+        +'<span style="font-size:'+fsize+'px;color:'+fc+';">'+row.factor+'</span>'
+        +'<div style="text-align:right;">'
+        +'<span style="font-family:var(--font-mono);font-size:'+vsize+'px;color:'+vc+';">'+row.value+'</span>'
+        +'<div style="font-size:8px;color:var(--text-dim);">'+row.impact+'</div>'
+        +'</div></div>';
     }).join('');
   }
 
@@ -8478,25 +8559,26 @@ function renderCTAPanel(sz, price) {
   if(mmEl) {
     const mults = [
       { label:'Vol-Scaled Base', val: sz.vol_ratio, pct: Math.min((sz.vol_ratio||0)*50,100), color: G,
-        sub: `${((sz.asset_vol_annual||0)*100).toFixed(1)}% vol - ${((sz.vol_ratio||0)*100).toFixed(0)}% of portfolio` },
+        sub: ((sz.asset_vol_annual||0)*100).toFixed(1)+'% vol - '+((sz.vol_ratio||0)*100).toFixed(0)+'% of portfolio' },
       { label:'Trend Signal',    val: sz.trend_signal, pct: (sz.trend_signal||0)*100, color: B,
         sub: sz.trend_direction || '-' },
       { label:'Regime Mult',     val: sz.regime_multiplier, pct: (sz.regime_multiplier||0)*100, color: GO,
         sub: sz.regime_label || '-' },
       { label:'Corr Adjustment', val: sz.correlation_factor, pct: (sz.correlation_factor||0)*100, color: '#b388ff',
-        sub: `Corr=${fmtN(sz.corr_60d,2)}` },
+        sub: 'Corr='+fmtN(sz.corr_60d,2) },
     ];
-    mmEl.innerHTML = mults.map(m => `
-      <div>
-        <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
-          <span style="font-size:9px;color:var(--text-dim);">${m.label}</span>
-          <span style="font-family:var(--font-mono);font-size:10px;color:${m.color};">${fmtN(m.val,3)}</span>
-        </div>
-        <div style="background:var(--bg2);border-radius:2px;height:6px;overflow:hidden;">
-          <div style="height:100%;width:${m.pct.toFixed(1)}%;background:${m.color};transition:width 0.6s;border-radius:2px;"></div>
-        </div>
-        <div style="font-size:8px;color:var(--text-dim);margin-top:2px;">${m.sub}</div>
-      </div>`).join('');
+    mmEl.innerHTML = mults.map(function(m){
+      return '<div>'
+        +'<div style="display:flex;justify-content:space-between;margin-bottom:4px;">'
+        +'<span style="font-size:9px;color:var(--text-dim);">'+m.label+'</span>'
+        +'<span style="font-family:var(--font-mono);font-size:10px;color:'+m.color+';">'+fmtN(m.val,3)+'</span>'
+        +'</div>'
+        +'<div style="background:var(--bg2);border-radius:2px;height:6px;overflow:hidden;">'
+        +'<div style="height:100%;width:'+m.pct.toFixed(1)+'%;background:'+m.color+';transition:width 0.6s;border-radius:2px;"></div>'
+        +'</div>'
+        +'<div style="font-size:8px;color:var(--text-dim);margin-top:2px;">'+m.sub+'</div>'
+        +'</div>';
+    }).join('');
   }
 
   // Regime breakdown cards
@@ -8504,25 +8586,26 @@ function renderCTAPanel(sz, price) {
   if(rbEl && sz.regime_breakdown) {
     const rb = sz.regime_breakdown;
     const cards = [
-      { label:'HMM Regime',    val: rb.hmm?.regime||'-',    mult: rb.hmm?.multiplier,    sub: `Conf: ${((rb.hmm?.confidence||0)*100).toFixed(0)}%`, color: B },
+      { label:'HMM Regime',    val: (rb.hmm&&rb.hmm.regime)||'-',    mult: rb.hmm&&rb.hmm.multiplier,    sub: 'Conf: '+(((rb.hmm&&rb.hmm.confidence)||0)*100).toFixed(0)+'%', color: B },
       { label:'VIX Level',     val: rb.vix?.level||'-',     mult: rb.vix?.multiplier,    sub: 'Fear gauge',   color: R },
-      { label:'GEX Env',       val: `${(rb.gex?.value||0)>0?'+':''}${(rb.gex?.value||0).toFixed(0)}M`, mult: rb.gex?.multiplier, sub: 'Dealer flow', color: '#b388ff' },
+      { label:'GEX Env',       val: ((rb.gex&&rb.gex.value)||0)>0?'+'+((rb.gex&&rb.gex.value)||0).toFixed(0)+'M':((rb.gex&&rb.gex.value)||0).toFixed(0)+'M', mult: rb.gex&&rb.gex.multiplier, sub: 'Dealer flow', color: '#b388ff' },
       { label:'News',          val: rb.news?.signal||'-',   mult: rb.news?.multiplier,   sub: 'Sentiment',    color: GO },
-      { label:'Pre-Market',    val: `${(rb.premarket?.change_pct||0)>0?'+':''}${(rb.premarket?.change_pct||0).toFixed(1)}%`, mult: rb.premarket?.multiplier, sub: 'PM activity', color: '#40c4ff' },
+      { label:'Pre-Market',    val: ((rb.premarket&&rb.premarket.change_pct)||0)>0?'+'+((rb.premarket&&rb.premarket.change_pct)||0).toFixed(1)+'%':((rb.premarket&&rb.premarket.change_pct)||0).toFixed(1)+'%', mult: rb.premarket&&rb.premarket.multiplier, sub: 'PM activity', color: '#40c4ff' },
     ];
-    rbEl.innerHTML = cards.map(c => `
-      <div style="background:var(--bg2);border:1px solid var(--border);padding:10px;border-radius:2px;text-align:center;">
-        <div style="font-size:8px;letter-spacing:1px;color:${c.color};text-transform:uppercase;margin-bottom:4px;">${c.label}</div>
-        <div style="font-family:var(--font-mono);font-size:12px;font-weight:700;color:var(--text-primary);">${c.val}</div>
-        <div style="font-size:10px;color:${c.color};margin-top:2px;">-${fmtN(c.mult,2)}</div>
-        <div style="font-size:8px;color:var(--text-dim);">${c.sub}</div>
-      </div>`).join('');
+    rbEl.innerHTML = cards.map(function(c){
+      return '<div style="background:var(--bg2);border:1px solid var(--border);padding:10px;border-radius:2px;text-align:center;">'
+        +'<div style="font-size:8px;letter-spacing:1px;color:'+c.color+';text-transform:uppercase;margin-bottom:4px;">'+c.label+'</div>'
+        +'<div style="font-family:var(--font-mono);font-size:12px;font-weight:700;color:var(--text-primary);">'+c.val+'</div>'
+        +'<div style="font-size:10px;color:'+c.color+';margin-top:2px;">×'+fmtN(c.mult,2)+'</div>'
+        +'<div style="font-size:8px;color:var(--text-dim);">'+c.sub+'</div>'
+        +'</div>';
+    }).join('');
   }
 
   // Reasons
   const rnEl = document.getElementById('ctaReasons');
   if(rnEl) rnEl.innerHTML = (sz.sizing_reasons||[]).map(r =>
-    `<div style="font-size:10px;color:var(--text-dim);line-height:1.6;padding:4px 0;border-bottom:1px solid var(--border);">${r}</div>`
+    '<div style="font-size:10px;color:var(--text-dim);line-height:1.6;padding:4px 0;border-bottom:1px solid var(--border);">'+r+'</div>'
   ).join('') || '<div style="font-size:10px;color:var(--text-dim);">Computing...</div>';
 
   // Vol chart
@@ -8594,7 +8677,7 @@ function renderExtPanel(ext) {
   // High / Low / Volume
   const hlEl = document.getElementById('pmHighLow');
   if(hlEl) hlEl.innerHTML = ext.premarket_high
-    ? `<span style="color:${G};">H: $${ext.premarket_high}</span><br><span style="color:${R};">L: $${ext.premarket_low}</span>`
+    ? '<span style="color:'+G+';">H: $'+ext.premarket_high+'</span><br><span style="color:'+R+';">L: $'+ext.premarket_low+'</span>'
     : '-';
   const pvEl = document.getElementById('pmVol');
   if(pvEl) pvEl.textContent = ext.premarket_volume ? (ext.premarket_volume/1e6).toFixed(2)+'M vol' : '-';
@@ -8610,7 +8693,7 @@ function renderExtPanel(ext) {
   if(erEl) erEl.innerHTML = (ext.ext_reasons||[]).length
     ? ext.ext_reasons.map(r => {
         const pos = r.includes('-'); const neg = r.includes('-');
-        return `<div style="font-size:9px;color:${pos?G:neg?R:GO};line-height:1.6;border-left:2px solid ${pos?G:neg?R:GO};padding-left:6px;">${r}</div>`;
+        var ic2=pos?G:neg?R:GO; return '<div style="font-size:9px;color:'+ic2+';line-height:1.6;border-left:2px solid '+ic2+';padding-left:6px;">'+r+'</div>';
       }).join('')
     : '<div style="font-size:10px;color:var(--text-dim);">No extended hours signals</div>';
 
@@ -8657,31 +8740,20 @@ function newsCard(a, large=false) {
   const sentColor = sc >= 15 ? G : sc <= -15 ? R : GO;
   const srcColor  = a.source === 'SEC EDGAR' ? '#b388ff' : 'var(--text-dim)';
   const kw = (a.matched_keywords||[]).slice(0,3).map(k=>
-    `<span style="font-size:8px;background:var(--bg2);border:1px solid var(--border);padding:1px 5px;border-radius:2px;color:${sc>=0?G:R};white-space:nowrap;">${k}</span>`
+    '<span style="font-size:8px;background:var(--bg2);border:1px solid var(--border);padding:1px 5px;border-radius:2px;color:'+(sc>=0?G:R)+';white-space:nowrap;">'+k+'</span>'
   ).join('');
-  return `<div style="background:var(--bg3);border:1px solid var(--border);border-left:3px solid ${bdr};
-                      padding:${large?'12px':'9px'};border-radius:1px;transition:border-color 0.2s;"
-               onmouseover="this.style.borderColor='${bdr}'" onmouseout="this.style.borderLeftColor='${bdr}';this.style.borderTopColor='var(--border)';this.style.borderRightColor='var(--border)';this.style.borderBottomColor='var(--border)'">
-    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:5px;">
-      <a href="${a.url||'#'}" target="_blank" rel="noopener"
-         style="font-size:${large?'11px':'10px'};color:var(--text-primary);text-decoration:none;line-height:1.4;flex:1;"
-         onmouseover="this.style.color='${GO}'" onmouseout="this.style.color='var(--text-primary)'">
-        ${a.title}
-      </a>
-      <span style="font-family:var(--font-mono);font-size:11px;font-weight:700;color:${sentColor};white-space:nowrap;flex-shrink:0;">
-        ${sc > 0 ? '+' : ''}${sc}
-      </span>
-    </div>
-    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;">
-      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
-        <span style="font-size:9px;color:${srcColor};font-family:var(--font-mono);">${a.source}</span>
-        <span style="font-size:9px;color:var(--text-dim);">${a.date||''}</span>
-        ${a.impact_level ? `<span style="font-size:9px;color:${sentColor};">${a.impact_level}</span>` : ''}
-      </div>
-      <div style="display:flex;gap:4px;flex-wrap:wrap;">${kw}</div>
-    </div>
-    ${a.summary && large ? `<div style="font-size:9px;color:var(--text-dim);margin-top:6px;line-height:1.5;">${a.summary.slice(0,140)}...</div>` : ''}
-  </div>`;
+  return '<div style="background:var(--bg3);border:1px solid var(--border);border-left:3px solid '+bdr+';padding:10px 12px;border-radius:1px;margin-bottom:6px;">'
+    +'<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:5px;">'
+    +'<a href="'+a.url+'" target="_blank" rel="noopener" style="font-size:11px;font-weight:600;color:var(--text-primary);text-decoration:none;line-height:1.4;flex:1;">'+a.title+'</a>'
+    +'<span style="font-size:8px;color:var(--text-dim);white-space:nowrap;">'+a.source+' &bull; '+(a.time_ago||a.pub||'')+'</span>'
+    +'</div>'
+    +'<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">'
+    +sentChip(a.sentiment_label||'NEUTRAL', a.sentiment)
+    +(a.impact_level?'<span style="font-size:9px;color:'+sentColor+';">'+a.impact_level+'</span>':'')
+    +((a.tickers&&a.tickers.length)?a.tickers.map(function(t){return chip(t,sentColor);}).join(''):'')
+    +'</div>'
+    +(a.summary&&large?'<div style="font-size:9px;color:var(--text-dim);margin-top:6px;line-height:1.5;">'+a.summary.slice(0,180)+'...</div>':'')
+    +'</div>'
 }
 
 function renderNewsFeed(articles) {
@@ -8712,13 +8784,13 @@ function renderSPYPanel(spy) {
   const G = 'var(--accent-green)', R = 'var(--accent-red)', GO = 'var(--gold)', B = '#00b4ff', O = '#ff6d00';
   const gc = v => v > 0 ? G : v < 0 ? R : 'var(--text-dim)';
   function row(label, val, color) {
-    return `<div style="display:flex;justify-content:space-between;font-size:10px;padding:2px 0;">
-      <span style="color:var(--text-dim);">${label}</span>
-      <span style="font-family:var(--font-mono);color:${color||'var(--text-primary)'};">${val}</span>
-    </div>`;
+    return '<div style="display:flex;justify-content:space-between;font-size:10px;padding:2px 0;">'
+      +'<span style="color:var(--text-dim);">'+label+'</span>'
+      +'<span style="font-family:var(--font-mono);color:'+(color||'var(--text-primary)')+';">'+val+'</span>'
+      +'</div>';
   }
   function chip(text, color) {
-    return `<span style="font-size:9px;font-family:var(--font-mono);background:var(--bg2);border:1px solid ${color};color:${color};padding:3px 8px;border-radius:2px;white-space:nowrap;">${text}</span>`;
+    return '<span style="font-size:9px;font-family:var(--font-mono);background:var(--bg2);border:1px solid '+color+';color:'+color+';padding:3px 8px;border-radius:2px;white-space:nowrap;">'+text+'</span>';
   }
 
   // Macro signal
@@ -8726,7 +8798,7 @@ function renderSPYPanel(spy) {
   const mc = spy.macro_score >= 15 ? G : spy.macro_score <= -15 ? R : GO;
   if(ms) { ms.textContent = spy.macro_signal || '-'; ms.style.color = mc; }
   const msc = document.getElementById('macroScore');
-  if(msc) { msc.textContent = `Score: ${spy.macro_score > 0 ? '+':''}${spy.macro_score}`; msc.style.color = mc; }
+  if(msc) { msc.textContent = 'Score: '+(spy.macro_score > 0 ? '+':'')+''+(spy.macro_score)+''; msc.style.color = mc; }
 
   // SPY price + change
   const sp = document.getElementById('spyPrice');
@@ -8753,7 +8825,7 @@ function renderSPYPanel(spy) {
   if(em) { em.textContent = exp != null ? (exp > 0 ? '+' : '') + exp + '%' : '-'; em.style.color = gc(exp); }
   const am = document.getElementById('actualMove');
   const act = spy.actual_tsla_move;
-  if(am) { am.textContent = act != null ? `Actual: ${act > 0 ? '+' : ''}${act}%` : 'Actual: -'; am.style.color = gc(act); }
+  if(am) { am.textContent = act != null ? 'Actual: '+(act>0?'+':'')+act+'%' : 'Actual: -'; am.style.color = gc(act); }
 
   // RS signal
   const rs = document.getElementById('rsSignal');
@@ -8761,7 +8833,7 @@ function renderSPYPanel(spy) {
              spy.rs_signal === 'LAGGING' || spy.rs_signal === 'UNDERPERFORM' ? R : GO;
   if(rs) { rs.textContent = spy.rs_signal || '-'; rs.style.color = rc; }
   const rv = document.getElementById('rsVal');
-  if(rv && spy.relative_strength != null) rv.textContent = `TSLA ${spy.relative_strength > 0 ? '+' : ''}${spy.relative_strength}% vs SPY (20d)`;
+  if(rv && spy.relative_strength != null) rv.textContent = 'TSLA '+(spy.relative_strength > 0 ? '+' : '')+''+(spy.relative_strength)+'% vs SPY (20d)';
 
   // SPY key levels
   const sd = document.getElementById('spyDetails');
@@ -8790,7 +8862,7 @@ function renderSPYPanel(spy) {
   if(td) {
     const tc = spy.tlt_5d_change;
     td.textContent = tc != null
-      ? `5d change: ${tc > 0 ? '+' : ''}${tc}% - ${spy.bonds_signal || 'NEUTRAL'}`
+      ? '5d change: '+(tc>0?'+':'')+tc+'% - '+(spy.bonds_signal||'NEUTRAL')
       : 'No data';
     td.style.color = spy.bonds_signal === 'RISK-OFF ROTATION' ? O : 'var(--text-dim)';
   }
@@ -8823,12 +8895,12 @@ function renderSPYPanel(spy) {
 
 function renderMMPanel(mm, dp, price) {
   if(!mm || !Object.keys(mm).length) return;
-  const G = 'var(--accent-green)', R = 'var(--accent-red)', GO = 'var(--gold)', P = '#b388ff', O = '#ff6d00';
+  var G = 'var(--accent-green)', R = 'var(--accent-red)', GO = 'var(--gold)', P = '#b388ff', O = '#ff6d00';
   function row(label, val, color) {
-    return `<div style="display:flex;justify-content:space-between;align-items:center;font-size:10px;padding:3px 0;">
-      <span style="color:var(--text-dim);">${label}</span>
-      <span style="font-family:var(--font-mono);color:${color||'var(--text-primary)'};">${val}</span>
-    </div>`;
+    return '<div style="display:flex;justify-content:space-between;align-items:center;font-size:10px;padding:3px 0;">'
+      + '<span style="color:var(--text-dim);">'+label+'</span>'
+      + '<span style="font-family:var(--font-mono);color:'+(color||'var(--text-primary)')+';">'+val+'</span>'
+      + '</div>';
   }
 
   // -- GEX --
@@ -8866,25 +8938,35 @@ function renderMMPanel(mm, dp, price) {
   const expEl = document.getElementById('mmExpiry');
   if(expEl) expEl.textContent = mm.nearest_expiry || '-';
   const zdEl = document.getElementById('mmZeroDte');
-  if(zdEl) { zdEl.textContent = mm.zero_dte_risk ? '- 0DTE TODAY - unstable' : `${mm.days_to_expiry || '?'}d to expiry`; zdEl.style.color = mm.zero_dte_risk ? R : 'var(--text-dim)'; }
+  if(zdEl) { zdEl.textContent = mm.zero_dte_risk ? '- 0DTE TODAY - unstable' : (mm.days_to_expiry || '?')+'d to expiry'; zdEl.style.color = mm.zero_dte_risk ? R : 'var(--text-dim)'; }
 
   // -- Call Walls --
-  const cwEl = document.getElementById('mmCallWalls');
-  if(cwEl) cwEl.innerHTML = (mm.call_walls||[]).map((w,i) => `
-    <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 8px;background:rgba(255,51,85,${0.15 - i*0.03});border-left:2px solid rgba(255,51,85,${0.8-i*0.15});border-radius:1px;">
-      <span style="font-family:var(--font-mono);font-size:11px;color:#ff6688;">$${w.strike}</span>
-      <span style="font-size:9px;color:var(--text-dim);">${(w.oi/1000).toFixed(0)}K OI</span>
-      ${i===0?'<span style="font-size:8px;color:#ff3355;">- WALL</span>':''}
-    </div>`).join('') || '<div style="font-size:10px;color:var(--text-dim);">Loading...</div>';
+  var cwEl = document.getElementById('mmCallWalls');
+  if(cwEl) cwEl.innerHTML = (mm.call_walls&&mm.call_walls.length)
+    ? mm.call_walls.map(function(w,i){
+        var bg = 'rgba(255,51,85,'+(0.15-i*0.03)+')';
+        var bd = 'rgba(255,51,85,'+(0.8-i*0.15)+')';
+        return '<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 8px;background:'+bg+';border-left:2px solid '+bd+';border-radius:1px;">'
+          +'<span style="font-family:var(--font-mono);font-size:11px;color:#ff6688;">$'+w.strike+'</span>'
+          +'<span style="font-size:9px;color:var(--text-dim);">'+(w.oi/1000).toFixed(0)+'K OI</span>'
+          +(i===0?'<span style="font-size:8px;color:#ff3355;">- WALL</span>':'')
+          +'</div>';
+      }).join('')
+    : '<div style="font-size:10px;color:var(--text-dim);">Loading...</div>';
 
   // -- Put Walls --
-  const pwEl = document.getElementById('mmPutWalls');
-  if(pwEl) pwEl.innerHTML = (mm.put_walls||[]).map((w,i) => `
-    <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 8px;background:rgba(0,255,136,${0.12 - i*0.02});border-left:2px solid rgba(0,255,136,${0.7-i*0.15});border-radius:1px;">
-      <span style="font-family:var(--font-mono);font-size:11px;color:#00ff88;">$${w.strike}</span>
-      <span style="font-size:9px;color:var(--text-dim);">${(w.oi/1000).toFixed(0)}K OI</span>
-      ${i===0?'<span style="font-size:8px;color:#00ff88;">- FLOOR</span>':''}
-    </div>`).join('') || '<div style="font-size:10px;color:var(--text-dim);">Loading...</div>';
+  var pwEl = document.getElementById('mmPutWalls');
+  if(pwEl) pwEl.innerHTML = (mm.put_walls&&mm.put_walls.length)
+    ? mm.put_walls.map(function(w,i){
+        var bg = 'rgba(0,255,136,'+(0.12-i*0.02)+')';
+        var bd = 'rgba(0,255,136,'+(0.7-i*0.15)+')';
+        return '<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 8px;background:'+bg+';border-left:2px solid '+bd+';border-radius:1px;">'
+          +'<span style="font-family:var(--font-mono);font-size:11px;color:#00ff88;">$'+w.strike+'</span>'
+          +'<span style="font-size:9px;color:var(--text-dim);">'+(w.oi/1000).toFixed(0)+'K OI</span>'
+          +(i===0?'<span style="font-size:8px;color:#00ff88;">- FLOOR</span>':'')
+          +'</div>';
+      }).join('')
+    : '<div style="font-size:10px;color:var(--text-dim);">Loading...</div>';
 
   // -- GEX Chart --
   if(mm.gex_by_strike?.length) {
@@ -8902,21 +8984,26 @@ function renderMMPanel(mm, dp, price) {
   }
 
   // -- Dark Pool Levels --
-  const fmtDP = arr => arr?.length
-    ? arr.map(l => `<div style="display:flex;justify-content:space-between;font-size:10px;padding:3px 0;border-bottom:1px solid var(--border);">
-        <span style="font-family:var(--font-mono);color:${GO};">$${l.price}</span>
-        <span style="font-size:9px;color:var(--text-dim);">${(l.volume/1e6).toFixed(1)}M vol - ${l.strength}x avg</span>
-      </div>`).join('')
-    : '<div style="font-size:10px;color:var(--text-dim);">None detected</div>';
+  function fmtDP(arr) {
+    if(!arr||!arr.length) return '<div style="font-size:10px;color:var(--text-dim);">None detected</div>';
+    return arr.map(function(l){
+      return '<div style="display:flex;justify-content:space-between;font-size:10px;padding:3px 0;border-bottom:1px solid var(--border);">'
+        +'<span style="font-family:var(--font-mono);color:'+GO+';">$'+l.price+'</span>'
+        +'<span style="font-size:9px;color:var(--text-dim);">'+(l.volume/1e6).toFixed(1)+'M vol - '+l.strength+'x avg</span>'
+        +'</div>';
+    }).join('');
+  }
   const daEl = document.getElementById('dpAbove'); if(daEl) daEl.innerHTML = fmtDP(dp.nearest_above);
   const dbEl = document.getElementById('dpBelow'); if(dbEl) dbEl.innerHTML = fmtDP(dp.nearest_below);
 
-  const dgEl = document.getElementById('dpGaps');
-  if(dgEl) dgEl.innerHTML = dp.volume_gaps?.length
-    ? dp.volume_gaps.map(g => `<div style="font-size:10px;padding:3px 0;border-bottom:1px solid var(--border);">
-        <span style="font-family:var(--font-mono);color:${P};">$${g.price}</span>
-        <span style="font-size:9px;color:var(--text-dim);"> ${g.date} - ${g.vol_mult}x vol - ${g.gap_pct}% gap</span>
-      </div>`).join('')
+  var dgEl = document.getElementById('dpGaps');
+  if(dgEl) dgEl.innerHTML = (dp.volume_gaps&&dp.volume_gaps.length)
+    ? dp.volume_gaps.map(function(g){
+        return '<div style="font-size:10px;padding:3px 0;border-bottom:1px solid var(--border);">'
+          +'<span style="font-family:var(--font-mono);color:'+P+';">$'+g.price+'</span>'
+          +'<span style="font-size:9px;color:var(--text-dim);"> '+g.date+' - '+g.vol_mult+'x vol - '+g.gap_pct+'% gap</span>'
+          +'</div>';
+      }).join('')
     : '<div style="font-size:10px;color:var(--text-dim);">None detected</div>';
 }
 
@@ -8926,13 +9013,13 @@ function renderExitPanel(ex) {
   const G = 'var(--accent-green)', R = 'var(--accent-red)', GO = 'var(--gold)', O = '#ff6d00';
   const gc = v => v > 0 ? G : v < 0 ? R : 'var(--text-dim)';
   function row(label, val, color) {
-    return `<div style="display:flex;justify-content:space-between;font-size:10px;">
-      <span style="color:var(--text-dim);">${label}</span>
-      <span style="font-family:var(--font-mono);color:${color||'var(--text-primary)'};">${val}</span>
-    </div>`;
+    return '<div style="display:flex;justify-content:space-between;font-size:10px;">'
+      +'<span style="color:var(--text-dim);">'+label+'</span>'
+      +'<span style="font-family:var(--font-mono);color:'+(color||'var(--text-primary)')+';">'+val+'</span>'
+      +'</div>';
   }
   function chip(text, color) {
-    return `<span style="font-size:9px;font-family:var(--font-mono);background:var(--bg2);border:1px solid ${color};color:${color};padding:3px 8px;border-radius:2px;white-space:nowrap;">${text}</span>`;
+    return '<span style="font-size:9px;font-family:var(--font-mono);background:var(--bg2);border:1px solid '+color+';color:'+color+';padding:3px 8px;border-radius:2px;white-space:nowrap;">'+text+'</span>';
   }
 
   // Urgency
@@ -8981,16 +9068,19 @@ function renderExitPanel(ex) {
 
   // Resistance levels
   const res = ex.resistance || {};
-  const ra = document.getElementById('resistanceAbove');
-  if(ra) ra.innerHTML = (res.levels_above||[]).map((v,i) =>
-    `<div style="display:flex;justify-content:space-between;font-size:11px;">
-      <span style="font-family:var(--font-mono);color:${i===0?O:'var(--text-dim)'};">$${v}</span>
-      <span style="font-size:9px;color:var(--text-dim);">${i===0?'- nearest':''}</span>
-    </div>`).join('') || '<div style="font-size:10px;color:var(--text-dim);">None identified</div>';
-  const rb = document.getElementById('resistanceBelow');
-  if(rb) rb.innerHTML = (res.levels_below||[]).map(v =>
-    `<div style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim);">$${v}</div>`
-  ).join('') || '<div style="font-size:10px;color:var(--text-dim);">None identified</div>';
+  var ra = document.getElementById('resistanceAbove');
+  if(ra) ra.innerHTML = (res.levels_above&&res.levels_above.length)
+    ? res.levels_above.map(function(v,i){
+        return '<div style="display:flex;justify-content:space-between;font-size:11px;">'
+          +'<span style="font-family:var(--font-mono);color:'+(i===0?O:'var(--text-dim)')+';">$'+v+'</span>'
+          +'<span style="font-size:9px;color:var(--text-dim);">'+(i===0?'- nearest':'')+'</span>'
+          +'</div>';
+      }).join('')
+    : '<div style="font-size:10px;color:var(--text-dim);">None identified</div>';
+  var rb = document.getElementById('resistanceBelow');
+  if(rb) rb.innerHTML = (res.levels_below&&res.levels_below.length)
+    ? res.levels_below.map(function(v){return '<div style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim);">$'+v+'</div>';}).join('')
+    : '<div style="font-size:10px;color:var(--text-dim);">None identified</div>';
 
 
   // -- Sell Tranche Plan --
@@ -9009,43 +9099,32 @@ function renderExitPanel(ex) {
   const stEl = document.getElementById('sellTranches');
   if(stEl) {
     if(stp.length === 0) {
-      stEl.innerHTML = `<div style="grid-column:1/-1;text-align:center;padding:20px;font-size:11px;color:var(--text-dim);">
-        No sell target yet - waiting for exit score to develop</div>`;
+      stEl.innerHTML = '<div style="grid-column:1/-1;text-align:center;padding:20px;font-size:11px;color:var(--text-dim);">No sell target yet - waiting for exit score to develop</div>';
     } else {
-      stEl.innerHTML = stp.map(t => `
-        <div style="background:var(--bg3);border:2px solid ${t.color}40;border-top:3px solid ${t.color};
-                     padding:14px;border-radius:2px;">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-            <span style="font-family:var(--font-mono);font-size:9px;font-weight:700;color:${t.color};">
-              T${t.number} - ${t.label}
-            </span>
-            <span style="font-family:var(--font-mono);font-size:18px;font-weight:700;color:${t.color};">
-              ${t.pct_holding}%
-            </span>
-          </div>
-          <div style="text-align:center;margin:10px 0;">
-            <div style="font-family:var(--font-mono);font-size:22px;font-weight:700;color:${t.color};">
-              ${fmt$(t.price)}
-            </div>
-            <div style="font-size:10px;color:var(--accent-green);margin-top:2px;">
-              +${t.gain_pct}% from current
-            </div>
-          </div>
-          <div style="font-size:8px;color:var(--text-dim);margin-bottom:8px;line-height:1.4;">${t.trigger}</div>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-bottom:8px;">
-            <div style="background:var(--bg2);padding:6px;border-radius:2px;text-align:center;">
-              <div style="font-size:7px;color:var(--text-dim);">SELL % HELD</div>
-              <div style="font-family:var(--font-mono);font-size:12px;color:${t.color};">${t.pct_holding}%</div>
-            </div>
-            <div style="background:var(--bg2);padding:6px;border-radius:2px;text-align:center;">
-              <div style="font-size:7px;color:var(--text-dim);">TRAIL STOP</div>
-              <div style="font-family:var(--font-mono);font-size:12px;color:var(--accent-red);">${fmt$(t.trailing_stop)}</div>
-            </div>
-          </div>
-          <div style="font-size:8px;color:var(--text-dim);border-top:1px solid var(--border);padding-top:6px;line-height:1.5;">
-            ${t.rationale}
-          </div>
-        </div>`).join('');
+      stEl.innerHTML = stp.map(function(t){
+        return '<div style="background:var(--bg3);border:2px solid '+t.color+'40;border-top:3px solid '+t.color+';padding:14px;border-radius:2px;">'
+          +'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
+          +'<span style="font-family:var(--font-mono);font-size:9px;font-weight:700;color:'+t.color+';">T'+t.number+' - '+t.label+'</span>'
+          +'<span style="font-family:var(--font-mono);font-size:18px;font-weight:700;color:'+t.color+';">'+t.pct_holding+'%</span>'
+          +'</div>'
+          +'<div style="text-align:center;margin:10px 0;">'
+          +'<div style="font-family:var(--font-mono);font-size:22px;font-weight:700;color:'+t.color+';">'+fmt$(t.price)+'</div>'
+          +'<div style="font-size:10px;color:var(--accent-green);margin-top:2px;">+'+t.gain_pct+'% from current</div>'
+          +'</div>'
+          +'<div style="font-size:8px;color:var(--text-dim);margin-bottom:8px;line-height:1.4;">'+t.trigger+'</div>'
+          +'<div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-bottom:8px;">'
+          +'<div style="background:var(--bg2);padding:6px;border-radius:2px;text-align:center;">'
+          +'<div style="font-size:7px;color:var(--text-dim);">SELL % HELD</div>'
+          +'<div style="font-family:var(--font-mono);font-size:12px;color:'+t.color+';">'+t.pct_holding+'%</div>'
+          +'</div>'
+          +'<div style="background:var(--bg2);padding:6px;border-radius:2px;text-align:center;">'
+          +'<div style="font-size:7px;color:var(--text-dim);">TRAIL STOP</div>'
+          +'<div style="font-family:var(--font-mono);font-size:12px;color:var(--accent-red);">'+fmt$(t.trailing_stop)+'</div>'
+          +'</div>'
+          +'</div>'
+          +'<div style="font-size:8px;color:var(--text-dim);border-top:1px solid var(--border);padding-top:6px;line-height:1.5;">'+t.rationale+'</div>'
+          +'</div>';
+      }).join('');
     }
   }
 
@@ -9064,24 +9143,21 @@ function renderExitPanel(ex) {
 
     // Current price marker
     const cp = ea.current_price || 0;
-    let html = `<div style="position:absolute;left:${toX(cp)}%;top:0;bottom:0;
-                              border-left:2px solid #00ff88;transform:translateX(-50%);">
-      <div style="font-size:8px;font-family:var(--font-mono);color:#00ff88;white-space:nowrap;margin-top:2px;">NOW<br>${fmt$(cp)}</div>
-    </div>`;
+    var html = '<div style="position:absolute;left:'+toX(cp)+'%;top:0;bottom:0;border-left:2px solid #00ff88;transform:translateX(-50%);">'
+      +'<div style="font-size:8px;font-family:var(--font-mono);color:#00ff88;white-space:nowrap;margin-top:2px;">NOW<br>'+fmt$(cp)+'</div>'
+      +'</div>';
 
     // Tranche markers
-    stp.forEach(t => {
-      html += `<div style="position:absolute;left:${toX(t.price)}%;top:0;bottom:0;
-                             border-left:2px dashed ${t.color};transform:translateX(-50%);">
-        <div style="font-size:7px;font-family:var(--font-mono);color:${t.color};white-space:nowrap;margin-top:2px;">
-          T${t.number}<br>${fmt$(t.price)}</div>
-      </div>`;
+    stp.forEach(function(t) {
+      html += '<div style="position:absolute;left:'+toX(t.price)+'%;top:0;bottom:0;border-left:2px dashed '+t.color+';transform:translateX(-50%);">'
+        +'<div style="font-size:7px;font-family:var(--font-mono);color:'+t.color+';white-space:nowrap;margin-top:2px;">T'+t.number+'<br>'+fmt$(t.price)+'</div>'
+        +'</div>';
     });
 
     // Baseline
-    html = `<div style="position:relative;width:100%;height:48px;background:var(--bg2);border-radius:2px;overflow:hidden;">
-      <div style="position:absolute;bottom:0;left:0;right:0;height:2px;background:var(--border);"></div>
-      ${html}</div>`;
+    html = '<div style="position:relative;width:100%;height:48px;background:var(--bg2);border-radius:2px;overflow:hidden;">'
+      +'<div style="position:absolute;bottom:0;left:0;right:0;height:2px;background:var(--border);"></div>'
+      +html+'</div>';
     tslEl.innerHTML = html;
   }
 
@@ -9099,10 +9175,10 @@ function renderExitPanel(ex) {
   const divs = (ex.divergences || {}).found || [];
   const dl = document.getElementById('divergenceList');
   if(dl) dl.innerHTML = divs.length
-    ? divs.map(d => `<div style="font-size:10px;color:${R};line-height:1.4;">
-        <strong>${d.type}</strong><br>
-        <span style="color:var(--text-dim);">${d.detail}</span>
-      </div>`).join('')
+    ? divs.map(function(d){
+        return '<div style="font-size:10px;color:'+R+';line-height:1.4;"><strong>'+d.type+'</strong><br>'
+          +'<span style="color:var(--text-dim);">'+d.detail+'</span></div>';
+      }).join('')
     : '<div style="font-size:10px;color:var(--accent-green);">- No divergences - momentum intact</div>';
 
   // Distribution
@@ -9159,27 +9235,10 @@ function sigArrow(sig) {
 function modelCard(title, firm, signal, rows, description) {
   const color = sigColor(signal);
   const arrow = sigArrow(signal);
-  return `
-  <div style="background:var(--bg3);border:1px solid var(--border);border-left:3px solid ${color};
-              padding:14px;border-radius:1px;transition:all .2s;"
-       onmouseover="this.style.borderColor='${color}'" onmouseout="this.style.borderLeftColor='${color}';this.style.borderTopColor='var(--border)';this.style.borderRightColor='var(--border)';this.style.borderBottomColor='var(--border)'">
-    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px;">
-      <div>
-        <div style="font-family:var(--font-mono);font-size:11px;color:var(--text-primary);letter-spacing:1px;">${title}</div>
-        <div style="font-size:9px;color:var(--text-dim);letter-spacing:2px;margin-top:2px;">${firm}</div>
-      </div>
-      <div style="text-align:right;">
-        <div style="font-family:var(--font-mono);font-size:13px;color:${color};font-weight:700;">${arrow} ${signal||'-'}</div>
-      </div>
-    </div>
-    <div style="display:flex;flex-direction:column;gap:4px;margin-bottom:8px;">
-      ${rows.map(r=>`<div style="display:flex;justify-content:space-between;font-size:10px;">
-        <span style="color:var(--text-dim);">${r[0]}</span>
-        <span style="font-family:var(--font-mono);color:${r[2]||'var(--text-primary)'};">${r[1]}</span>
-      </div>`).join('')}
-    </div>
-    <div style="font-size:9px;color:var(--text-dim);line-height:1.5;border-top:1px solid var(--border);padding-top:6px;">${description}</div>
-  </div>`;
+  return '<div style="background:var(--bg2);border:1px solid var(--border);padding:12px;border-radius:2px;">'
+    +'<div style="font-size:8px;letter-spacing:2px;color:var(--text-dim);margin-bottom:8px;">'+name+'</div>'
+    +rows.map(function(r){return '<div style="display:flex;justify-content:space-between;font-size:10px;"><span style="color:var(--text-dim);">'+r.label+'</span><span style="font-family:var(--font-mono);color:'+(r.color||'var(--text-primary)')+';">'+r.val+'</span></div>';}).join('')
+    +'</div>'
 }
 
 function renderInstModels(m, ind) {
@@ -9294,9 +9353,7 @@ function renderInstModels(m, ind) {
   document.getElementById('confluenceLabel').textContent =
     bullCount + '/6 BULLISH - ' + bearCount + '/6 BEARISH';
   document.getElementById('modelVotes').innerHTML = votes.map(v=>
-    `<span style="font-size:9px;font-family:var(--font-mono);color:${v.bull?'var(--accent-green)':'var(--accent-red)'};">
-      ${v.bull?'-':'-'} ${v.label}
-    </span>`
+    '<span style="font-size:9px;font-family:var(--font-mono);color:'+(v.bull?'var(--accent-green)':'var(--accent-red)')+';">'+(v.bull?'+':'-')+v.val+'%</span>'
   ).join('');
 }
 
