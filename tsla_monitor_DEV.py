@@ -5618,6 +5618,14 @@ def _run_ml_retrain():
         _ml_load_errors = []
         print(f"[ML-RETRAIN] Done - {model_name} AUC={auc:.3f} on {len(X)} samples, {len(feat_cols)} features. Saved.", flush=True)
 
+        # Force an immediate re-analysis so the new model updates the dashboard state
+        try:
+            print("[ML-RETRAIN] Triggering re-analysis with new model...", flush=True)
+            run_analysis()
+            print("[ML-RETRAIN] Re-analysis complete — ML panel should now show live signal.", flush=True)
+        except Exception as _ra_e:
+            print(f"[ML-RETRAIN] Re-analysis error: {_ra_e}", flush=True)
+
     except Exception as e:
         import traceback
         print(f"[ML-RETRAIN] Error: {e}", flush=True)
@@ -6136,6 +6144,17 @@ def _get_ml_signal(features_dict):
         pkg = _load_ml_model()
         if pkg is None: return empty
         cols  = pkg["feature_cols"]
+        # Validate model features match what run_analysis sends — reject stale cached model
+        _expected = set(["ret_1b","ret_3b","ret_6b","ret_12b","ret_48b","rsi_14","rsi_6",
+                         "rsi_ob","rsi_os","macd_hist","vix","vix_high","vol_ratio",
+                         "atr_ratio","realized_vol","ofi_6b","ofi_zscore","vwap_dist",
+                         "above_vwap","tsla_spy_corr","spy_ret_1b","daily_ret_so_far",
+                         "above_daily_ma20","daily_trend_up","time_of_day","is_open",
+                         "is_close","is_lunch","day_of_week","bb_pct","trend_score",
+                         "above_ema9","above_ema21","dist_from_high","dist_from_low",
+                         "absorption","vol_surge"])
+        if not _expected.issubset(set(cols)):
+            return {**empty, "error": "stale model — retrain in progress"}
         # Use DataFrame with named columns so LightGBM gets the feature names it was fitted with
         row_data = {c: float(features_dict.get(c, 0) or 0) for c in cols}
         X_df  = pd.DataFrame([row_data], columns=cols)
@@ -9432,7 +9451,7 @@ function _resetQuickReadBar(){
 
 
 function renderMLPanel(ml) {
-  if(!ml) return;
+  if(!ml || typeof ml !== 'object') return;
   var G='#00ff88', R='#ff3355', C='#00e5ff', GO='var(--gold)';
   var sigColors={BUY:G, SELL:R, HOLD:C};
   var col = sigColors[ml.signal] || C;
@@ -9459,7 +9478,8 @@ function renderMLPanel(ml) {
   var statusEl=document.getElementById('mlStatus');
   if(statusEl){
     if(ml.available){statusEl.textContent='ACTIVE';statusEl.style.color=G;}
-    else{statusEl.textContent='NO MODEL FILE';statusEl.style.color=R;}
+    else if(ml.error){statusEl.textContent='ERROR: '+ml.error.slice(0,30);statusEl.style.color=R;}
+    else{statusEl.textContent='RETRAINING...';statusEl.style.color='#ffb300';}
   }
 
   // Regime context from state
