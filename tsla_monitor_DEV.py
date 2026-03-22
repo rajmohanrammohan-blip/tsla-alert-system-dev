@@ -7940,7 +7940,7 @@ function updateUI(s) {
   setText('ind-span-a', ichi.span_a??'-');
   setText('ind-span-b', ichi.span_b??'-');
   const cs = ichi.cloud_signal||'NEUTRAL';
-  setText('ind-cloud', cs + (ichi.cloud_details?.length ? ' - '+ichi.cloud_details[0] : ''));
+  setText('ind-cloud', cs + (ichi.cloud_details&&ichi.cloud_details.length ? ' - '+ichi.cloud_details[0] : ''));
   setDot('dot-cloud', cs==='BULLISH'?'bull':cs==='BEARISH'?'bear':'neut');
   setDot('dot-tenkan', ichi.tenkan>ichi.kijun?'bull':'bear');
   setDot('dot-kijun', ichi.tenkan>ichi.kijun?'bull':'bear');
@@ -8044,7 +8044,7 @@ function updateUI(s) {
   }
 
   // -- Ichimoku Cloud Chart --
-  if(typeof ichimokuChart!=='undefined' && ichimokuChart && ichi.history?.length) {
+  if(typeof ichimokuChart!=='undefined' && ichimokuChart && ichi.history && ichi.history.length) {
     try {
       var ih = ichi.history;
       ichimokuChart.data.labels = ih.map(p=>p.date.slice(5));
@@ -8058,7 +8058,7 @@ function updateUI(s) {
   }
 
   // -- HMM Regime Chart --
-  if(typeof hmmChart!=='undefined' && hmmChart && hmm.history?.length) {
+  if(typeof hmmChart!=='undefined' && hmmChart && hmm.history && hmm.history.length) {
     try {
       var hh = hmm.history;
       hmmChart.data.labels = hh.map((h,i)=>i%5===0?i:'');
@@ -8105,7 +8105,7 @@ function updateUI(s) {
     ? s.institutional.map(function(i){return '<div class="inst-item"><div class="inst-name">'+i.institution+'</div><div class="inst-meta">Form '+i.form+' - Filed '+i.date+'</div><span class="inst-badge '+badgeClass(i.action)+'">'+i.action+'</span></div>';}).join('')
     : '<div class="no-alerts">Loading 13F data...</div>';
 
-  document.getElementById('lastUpdated').textContent = s.last_updated ? 'Updated '+s.last_updated : '-';
+  var luEl = document.getElementById('lastUpdated'); if(luEl) luEl.textContent = s.last_updated ? 'Updated '+s.last_updated : '-';
 
   [
     function(){renderExitPanel(s.exit_data||{});},
@@ -9476,6 +9476,11 @@ function renderMLPanel(ml) {
 
   var aucEl=document.getElementById('mlAuc');
   if(aucEl&&ml.auc) aucEl.textContent=ml.auc;
+  var hdrEl=document.getElementById('mlPanelHeader');
+  if(hdrEl&&ml.auc&&ml.available) {
+    var nFeat = ml.features_total || 37;
+    hdrEl.textContent = (ml.model||'LIGHTGBM').toUpperCase()+' · '+nFeat+' FEATURES · AUC '+ml.auc+' · PROFIT FACTOR 1.53x';
+  }
 
   var statusEl=document.getElementById('mlStatus');
   if(statusEl){
@@ -10908,7 +10913,7 @@ setTimeout(pollSpockStatus, 5000);
   <div class="panel" id="ml-panel" style="grid-column:1/-1;border:2px solid rgba(0,229,255,0.3);background:rgba(0,10,20,0.98);">
     <div class="panel-title" onclick="togglePanel('ml-panel')" style="cursor:pointer;">
       🧠 ML DIRECTIONAL SIGNAL
-      <span style="font-size:9px;color:var(--text-dim);">LIGHTGBM · 54 FEATURES · AUC 0.537 · PROFIT FACTOR 1.53x</span>
+      <span id="mlPanelHeader" style="font-size:9px;color:var(--text-dim);">LIGHTGBM · 37 FEATURES · AUC — · PROFIT FACTOR 1.53x</span>
       <span class="panel-collapse-btn" id="btn-ml-panel">▾</span>
     </div>
     <div style="display:grid;grid-template-columns:180px 1fr 1fr 1fr;gap:16px;align-items:start;">
@@ -10950,7 +10955,7 @@ setTimeout(pollSpockStatus, 5000);
           </div>
           <div style="display:flex;justify-content:space-between;font-size:9px;">
             <span style="color:var(--text-dim);">MODEL AUC</span>
-            <span id="mlAuc" style="font-family:var(--font-mono);color:var(--gold);">0.537</span>
+            <span id="mlAuc" style="font-family:var(--font-mono);color:var(--gold);">—</span>
           </div>
           <div style="display:flex;justify-content:space-between;font-size:9px;">
             <span style="color:var(--text-dim);">MODEL STATUS</span>
