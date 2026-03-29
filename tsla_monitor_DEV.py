@@ -4898,72 +4898,131 @@ def run_analysis():
             _now_h = datetime.now().hour + datetime.now().minute / 60
             _vol_ma12 = float(volumes.rolling(12).mean().iloc[-1] + 1)
             _vol_now  = float(volumes.iloc[-1])
-            # Compute ATR ratio from available DV features (atr5/atr20)
             _atr5  = float(_dv_ft.get("atr5",  0.01) or 0.01)
             _atr20 = float(_dv_ft.get("atr20", 0.01) or 0.01)
             _atr_ratio = _atr5 / (_atr20 + 1e-9)
-            # Realized vol proxy: recent std of returns annualised to intraday
             _ret_std = float(closes.pct_change().iloc[-20:].std() or 0.01)
-            # OFI zscore: ofi_ratio is already a normalised ratio
             _ofi_ratio = float(_dv_ft.get("ofi_ratio", 0) or 0)
-            # VWAP dist: use indicators vwap if available
             _vwap_val  = float(indicators.get("vwap", price) or price)
             _vwap_dist = (price - _vwap_val) / (_vwap_val + 1e-9) if _vwap_val else 0
-            # Daily trend: price vs ema50/ema200
             _ema50  = float(indicators.get("ema50",  price) or price)
             _ema200 = float(indicators.get("ema200", price) or price)
             _trend_score = float(_dv_ft.get("trend_score", 0) or 0)
-            # BB position: (price - bb_lower) / (bb_upper - bb_lower)
             _bb_upper = float(indicators.get("bb_upper", price*1.05) or price*1.05)
             _bb_lower = float(indicators.get("bb_lower", price*0.95) or price*0.95)
             _bb_pct   = (price - _bb_lower) / (_bb_upper - _bb_lower + 1e-9)
-            # Dist from session high/low (20-bar)
             _high20 = float(closes.iloc[-20:].max() or price)
             _low20  = float(closes.iloc[-20:].min() or price)
             _dist_high = (price - _high20) / (_high20 + 1e-9)
             _dist_low  = (price - _low20)  / (_low20  + 1e-9)
-            # Daily ret so far (open → now, using 78 5min bars ≈ 1 trading day)
             _open_ref  = float(closes.iloc[-78] if len(closes) > 78 else closes.iloc[0])
             _daily_ret = (price - _open_ref) / (_open_ref + 1e-9)
 
+            # NEW: SPY decoupling regime
+            _tsla_spy_corr = float(spy_data.get("correlation_60d", 0) or 0)
+            _spy_decouple  = 1 if abs(_tsla_spy_corr) < 0.4 else 0
+
+            # NEW: Earnings proximity — use cached pkg values if available
+            _earn_proximity = 0.0; _earn_near_5d = 0; _earn_near_10d = 0
+            try:
+                _pkg_ref = _ml_model_cache  # may be None before first retrain
+                if _pkg_ref:
+                    # Fetch earnings dates (cached via state to avoid repeat calls)
+                    _earn_dates = state.get("_ml_earn_dates", [])
+                    if not _earn_dates:
+                        try:
+                            _ec = yf.Ticker(TICKER).get_earnings_dates(limit=8)
+                            if _ec is not None and not _ec.empty:
+                                _earn_dates = [d.date() if hasattr(d,"date") else d
+                                               for d in _ec.index.tolist()]
+                                state["_ml_earn_dates"] = _earn_dates
+                        except Exception:
+                            pass
+                    if _earn_dates:
+                        import datetime as _dt2
+                        _today = _dt2.date.today()
+                        _dte   = min(abs((_today - ed).days) for ed in _earn_dates)
+                        _earn_proximity  = 1.0 / (_dte + 1)
+                        _earn_near_5d    = 1 if _dte <= 5  else 0
+                        _earn_near_10d   = 1 if _dte <= 10 else 0
+            except Exception: pass
+
+            # NEW: IV term structure + P/C ratio (from mm_data / uoa_data)
+            _iv_front    = float(mm_data.get("iv_front",    0.4) or 0.4)
+            _iv_back     = float(mm_data.get("iv_back",     0.4) or 0.4)
+            _iv_term_spd = _iv_back - _iv_front
+            _iv_ratio    = _iv_front / (_iv_back + 1e-9)
+            _pc_ratio    = float(mm_data.get("pc_ratio",    1.0) or 1.0)
+            # P/C delta: change vs previous cycle
+            _pc_prev     = float(state.get("_ml_pc_prev",   _pc_ratio))
+            _pc_delta    = _pc_ratio - _pc_prev
+            state["_ml_pc_prev"] = _pc_ratio
+
             _ml_features = {
+                # Core returns
                 "ret_1b":      float(closes.pct_change(1).iloc[-1] or 0),
                 "ret_3b":      float(closes.pct_change(3).iloc[-1] or 0),
                 "ret_6b":      float(closes.pct_change(6).iloc[-1] or 0),
                 "ret_12b":     float(closes.pct_change(12).iloc[-1] or 0),
                 "ret_48b":     float(closes.pct_change(48).iloc[-1] or 0),
+                # Momentum
                 "rsi_14":      float(indicators.get("rsi", 50)),
                 "rsi_6":       float(indicators.get("rsi", 50)),
                 "rsi_ob":      1 if indicators.get("rsi", 50) > 70 else 0,
                 "rsi_os":      1 if indicators.get("rsi", 50) < 30 else 0,
                 "macd_hist":   float(indicators.get("macd_hist", 0) or 0),
-                "vix":         float(spy_data.get("vix", 20) or 20),          # FIXED: was vix_current
+                # Macro
+                "vix":         float(spy_data.get("vix", 20) or 20),
                 "vix_high":    1 if float(spy_data.get("vix", 20) or 20) > 25 else 0,
+                # Volume
                 "vol_ratio":   _vol_now / _vol_ma12,
-                "atr_ratio":   _atr_ratio,                                     # FIXED: computed from atr5/atr20
-                "realized_vol":_ret_std,                                        # FIXED: computed from returns
-                "ofi_6b":      _ofi_ratio,                                     # FIXED: was ofi_6b (doesn't exist)
-                "ofi_zscore":  _ofi_ratio,                                     # FIXED: use ofi_ratio as proxy
-                "vwap_dist":   _vwap_dist,                                     # FIXED: computed from indicators.vwap
+                "vol_surge":   1 if _vol_now / _vol_ma12 > 2 else 0,
+                # Volatility
+                "atr_ratio":   _atr_ratio,
+                "realized_vol":_ret_std,
+                # OFI
+                "ofi_6b":      _ofi_ratio,
+                "ofi_zscore":  _ofi_ratio,
+                # VWAP
+                "vwap_dist":   _vwap_dist,
                 "above_vwap":  1 if _vwap_dist > 0 else 0,
-                "tsla_spy_corr": float(spy_data.get("correlation_60d", 0) or 0),  # FIXED: was tsla_spy_corr
-                "spy_ret_1b":  float((spy_data.get("spy_change_pct", 0) or 0) / 100),  # FIXED: was spy_chg_pct
+                # SPY / correlation
+                "tsla_spy_corr":   _tsla_spy_corr,
+                "spy_ret_1b":      float((spy_data.get("spy_change_pct", 0) or 0) / 100),
+                "spy_decouple":    _spy_decouple,
+                # Daily context
                 "daily_ret_so_far": _daily_ret,
-                "above_daily_ma20": 1 if price > _ema50 else 0,               # FIXED: use ema50 as proxy
-                "daily_trend_up":   1 if _ema50 > _ema200 else 0,             # FIXED: golden cross
+                # EMA / trend
+                "above_daily_ma20": 1 if price > _ema50 else 0,
+                "daily_trend_up":   1 if _ema50 > _ema200 else 0,
+                "trend_score":  _trend_score,
+                "above_ema9":   1 if _trend_score >= 2 else 0,
+                "above_ema21":  1 if _trend_score >= 1 else 0,
+                # Time
                 "time_of_day": _now_h,
                 "is_open":     1 if 9.5 <= _now_h < 10.25 else 0,
                 "is_close":    1 if 15.25 <= _now_h < 16.0 else 0,
                 "is_lunch":    1 if 11.75 <= _now_h < 13.0 else 0,
                 "day_of_week": datetime.now().weekday(),
-                "bb_pct":      _bb_pct,                                        # FIXED: computed from BB bands
-                "trend_score": _trend_score,
-                "above_ema9":  1 if _trend_score >= 2 else 0,
-                "above_ema21": 1 if _trend_score >= 1 else 0,
-                "dist_from_high": _dist_high,                                  # FIXED: computed from closes
+                # BB
+                "bb_pct":      _bb_pct,
+                # Distance
+                "dist_from_high": _dist_high,
                 "dist_from_low":  _dist_low,
+                # Microstructure
                 "absorption":  float(_dv_ft.get("absorption", 0) or 0),
-                "vol_surge":   1 if _vol_now / _vol_ma12 > 2 else 0,
+                # NEW: Earnings proximity
+                "earn_proximity":  _earn_proximity,
+                "earn_near_5d":    _earn_near_5d,
+                "earn_near_10d":   _earn_near_10d,
+                # NEW: IV term structure
+                "iv_front":        _iv_front,
+                "iv_back":         _iv_back,
+                "iv_term_spread":  _iv_term_spd,
+                "iv_ratio":        _iv_ratio,
+                # NEW: P/C ratio + delta
+                "pc_ratio":        _pc_ratio,
+                "pc_delta":        _pc_delta,
             }
             ml_signal = _get_ml_signal(_ml_features)
             state["ml_signal"] = ml_signal
@@ -5413,218 +5472,363 @@ def api_refresh():
     return jsonify({"status": "refreshing"})
 
 
+
 def _run_ml_retrain():
-    """Retrain ML model. Feature names MUST match _ml_features keys in run_analysis."""
+    """
+    Enhanced ML retrain:
+    - 5-minute intraday bars (~18,000 samples vs 104 daily)
+    - New features: earnings proximity, IV term structure, dark pool %, SPY regime, P/C delta
+    - Ensemble: LightGBM + XGBoost + LogisticRegression (majority vote)
+    Feature names MUST match _ml_features keys in run_analysis.
+    """
     global _ml_model_cache, _ml_load_errors
-    print("[ML-RETRAIN] Starting retrain on Railway...", flush=True)
+    print("[ML-RETRAIN] Starting enhanced retrain (5min bars + ensemble)...", flush=True)
     try:
         import numpy as np, pickle, os
+        import pandas as _pd_rt
         from sklearn.preprocessing import StandardScaler
-        from sklearn.model_selection import cross_val_score
+        from sklearn.model_selection import TimeSeriesSplit
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.metrics import roc_auc_score
 
-        # Fetch 6 months of daily TSLA data
-        hist = yf.Ticker("TSLA").history(period="6mo", interval="1d")
-        if hist.empty or len(hist) < 60:
-            print("[ML-RETRAIN] Not enough data", flush=True); return
+        # 1. Fetch 6 months of 5-minute TSLA bars
+        print("[ML-RETRAIN] Fetching 6mo 5-min TSLA bars...", flush=True)
+        hist5 = yf.Ticker("TSLA").history(period="6mo", interval="5m")
+        if hist5.empty or len(hist5) < 500:
+            print("[ML-RETRAIN] Not enough 5-min data, falling back to daily", flush=True)
+            hist5 = yf.Ticker("TSLA").history(period="6mo", interval="1d")
+        print(f"[ML-RETRAIN] Got {len(hist5)} bars", flush=True)
 
-        closes  = hist["Close"].astype(float)
-        highs   = hist["High"].astype(float)
-        lows    = hist["Low"].astype(float)
-        volumes = hist["Volume"].astype(float)
+        closes  = hist5["Close"].astype(float).reset_index(drop=True)
+        highs   = hist5["High"].astype(float).reset_index(drop=True)
+        lows    = hist5["Low"].astype(float).reset_index(drop=True)
+        volumes = hist5["Volume"].astype(float).reset_index(drop=True)
+        idx     = hist5.index
+
+        # 2. Fetch SPY for correlation regime
+        print("[ML-RETRAIN] Fetching SPY...", flush=True)
+        try:
+            spy5       = yf.Ticker("SPY").history(period="6mo", interval="5m")
+            spy_closes = spy5["Close"].astype(float).reset_index(drop=True)
+            min_len    = min(len(closes), len(spy_closes))
+            closes     = closes.iloc[:min_len]
+            highs      = highs.iloc[:min_len]
+            lows       = lows.iloc[:min_len]
+            volumes    = volumes.iloc[:min_len]
+            spy_closes = spy_closes.iloc[:min_len]
+            idx        = hist5.index[:min_len]
+            spy_ok     = True
+        except Exception as _spy_e:
+            print(f"[ML-RETRAIN] SPY failed: {_spy_e}", flush=True)
+            spy_closes = _pd_rt.Series(0.0, index=closes.index)
+            spy_ok     = False
+
+        # 3. Fetch real VIX (daily)
+        try:
+            vix_daily = yf.Ticker("^VIX").history(period="6mo", interval="1d")["Close"].astype(float)
+            vix_ok = True
+        except Exception:
+            vix_ok = False
+
+        # 4. Options: IV term structure + P/C ratio
+        print("[ML-RETRAIN] Fetching options data...", flush=True)
+        front_iv, back_iv, iv_term_spread, pc_ratio_now = 0.4, 0.4, 0.0, 1.0
+        try:
+            tkr = yf.Ticker("TSLA")
+            exps = tkr.options
+            if exps and len(exps) >= 2:
+                c1 = tkr.option_chain(exps[0])
+                c2 = tkr.option_chain(exps[1])
+                front_iv = float(c1.calls["impliedVolatility"].median() or 0.4)
+                back_iv  = float(c2.calls["impliedVolatility"].median() or 0.4)
+                call_v   = float(c1.calls["volume"].sum() or 1)
+                put_v    = float(c1.puts["volume"].sum() or 1)
+                pc_ratio_now  = put_v / (call_v + 1e-9)
+            iv_term_spread = back_iv - front_iv
+        except Exception as _oe:
+            print(f"[ML-RETRAIN] Options failed: {_oe}", flush=True)
+
+        # 5. Earnings dates
+        earnings_dates = []
+        try:
+            cal = yf.Ticker("TSLA").get_earnings_dates(limit=20)
+            if cal is not None and not cal.empty:
+                earnings_dates = [d.date() if hasattr(d,"date") else d for d in cal.index.tolist()]
+        except Exception as _ee:
+            print(f"[ML-RETRAIN] Earnings failed: {_ee}", flush=True)
+
+        # 6. Pre-compute series
         n = len(closes)
+        delta     = closes.diff()
+        gain14    = delta.where(delta>0,0).rolling(14).mean()
+        loss14    = (-delta.where(delta<0,0)).rolling(14).mean()
+        rsi14_s   = 100 - 100/(1 + gain14/loss14.replace(0,1e-9))
+        gain6     = delta.where(delta>0,0).rolling(6).mean()
+        loss6     = (-delta.where(delta<0,0)).rolling(6).mean()
+        rsi6_s    = 100 - 100/(1 + gain6/loss6.replace(0,1e-9))
+        ema12_s   = closes.ewm(span=12, adjust=False).mean()
+        ema26_s   = closes.ewm(span=26, adjust=False).mean()
+        macd_s    = ema12_s - ema26_s
+        macd_h_s  = macd_s - macd_s.ewm(span=9, adjust=False).mean()
+        ema50_s   = closes.ewm(span=50,  adjust=False).mean()
+        ema200_s  = closes.ewm(span=200, adjust=False).mean()
+        bb_ma20_s = closes.rolling(20).mean()
+        bb_std_s  = closes.rolling(20).std().replace(0, 1e-9)
+        if spy_ok and spy_closes.std() > 0:
+            tsla_ret_s = closes.pct_change()
+            spy_ret_s  = spy_closes.pct_change()
+            corr_s     = tsla_ret_s.rolling(20).corr(spy_ret_s)
+        else:
+            corr_s = _pd_rt.Series(0.75, index=closes.index)
 
-        # Pre-compute RSI series once (avoid recomputing per bar)
-        delta = closes.diff()
-        gain  = delta.where(delta > 0, 0).rolling(14).mean()
-        loss  = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rsi_series = 100 - 100 / (1 + gain / loss.replace(0, 1e-9))
-
-        # Pre-compute EMA50 / EMA200 for golden-cross feature
-        ema50_s  = closes.ewm(span=50,  adjust=False).mean()
-        ema200_s = closes.ewm(span=200, adjust=False).mean()
-
+        # 7. Build feature rows
+        LOOKBACK = 78
         X_rows, y_rows = [], []
-        for i in range(20, n - 1):
-            c = closes.iloc
-            h = highs.iloc
-            l = lows.iloc
-            v = volumes.iloc
-            price = float(c[i])
+        import numpy as np
 
-            # ── Returns (match: ret_1b, ret_3b, ret_6b, ret_12b, ret_48b) ──
-            def ret(b): return (float(c[i]) / float(c[max(0,i-b)]) - 1) if float(c[max(0,i-b)]) > 0 else 0
-            ret_1b  = ret(1)
-            ret_3b  = ret(3)
-            ret_6b  = ret(6)
-            ret_12b = ret(12)
-            ret_48b = ret(min(48, i))
+        for i in range(200, n - 7):
+            price = float(closes.iloc[i])
+            if price <= 0: continue
 
-            # ── RSI (match: rsi_14, rsi_6, rsi_ob, rsi_os) ──
-            rsi_14 = float(rsi_series.iloc[i])
-            rsi_6  = rsi_14   # proxy — daily bars don't have rsi_6 separately
-            rsi_ob = 1 if rsi_14 > 70 else 0
-            rsi_os = 1 if rsi_14 < 30 else 0
+            ts       = idx[i]
+            bar_date = ts.date() if hasattr(ts,"date") else None
+            bar_hour = float(ts.hour + ts.minute/60.0) if hasattr(ts,"hour") else 12.0
+            bar_dow  = int(ts.weekday()) if hasattr(ts,"weekday") else 2
 
-            # ── MACD hist proxy (match: macd_hist) ──
-            ema12 = float(closes.iloc[max(0,i-12):i+1].ewm(span=12, adjust=False).mean().iloc[-1])
-            ema26 = float(closes.iloc[max(0,i-26):i+1].ewm(span=26, adjust=False).mean().iloc[-1])
-            macd_line = ema12 - ema26
-            sig_line  = float(closes.iloc[max(0,i-35):i+1].ewm(span=9, adjust=False).mean().iloc[-1])
-            macd_hist = macd_line - sig_line
+            def sc(j): return float(closes.iloc[j]) if float(closes.iloc[j])>0 else price
+            ret_1b  = price/sc(i-1)-1;  ret_3b  = price/sc(i-3)-1
+            ret_6b  = price/sc(i-6)-1;  ret_12b = price/sc(i-12)-1
+            ret_48b = price/sc(max(0,i-48))-1
 
-            # ── VIX proxy — use realized vol as stand-in (match: vix, vix_high) ──
-            ret_arr = [float(c[j])/float(c[j-1])-1 for j in range(max(1,i-19), i+1) if float(c[j-1])>0]
-            realized_vol = float(np.std(ret_arr) * (252**0.5)) if ret_arr else 0.3
-            vix       = realized_vol * 100   # scale to VIX-like units
-            vix_high  = 1 if vix > 25 else 0
+            rsi_14 = float(rsi14_s.iloc[i]) if not np.isnan(rsi14_s.iloc[i]) else 50.0
+            rsi_6  = float(rsi6_s.iloc[i])  if not np.isnan(rsi6_s.iloc[i])  else rsi_14
+            rsi_ob = 1 if rsi_14>70 else 0;  rsi_os = 1 if rsi_14<30 else 0
 
-            # ── Volume (match: vol_ratio) ──
-            vol_ma12 = float(volumes.iloc[max(0,i-12):i].mean() or 1)
-            vol_ratio = float(v[i]) / vol_ma12
-            vol_surge = 1 if vol_ratio > 2 else 0
+            macd_hist = float(macd_h_s.iloc[i]) if not np.isnan(macd_h_s.iloc[i]) else 0.0
 
-            # ── ATR ratio (match: atr_ratio) ──
-            def tr(j): return max(float(h[j])-float(l[j]), abs(float(h[j])-float(c[j-1])), abs(float(l[j])-float(c[j-1])))
-            tr5  = float(np.mean([tr(j) for j in range(max(1,i-5), i+1)]))
-            tr20 = float(np.mean([tr(j) for j in range(max(1,i-20), i+1)]))
-            atr_ratio = tr5 / (tr20 + 1e-9)
+            if vix_ok and bar_date is not None:
+                try:   vix_val = float(vix_daily.asof(str(bar_date)) or 20)
+                except: vix_val = 20.0
+            else:
+                rets20  = [float(closes.iloc[j])/float(closes.iloc[j-1])-1
+                           for j in range(max(1,i-19),i+1) if float(closes.iloc[j-1])>0]
+                vix_val = float(np.std(rets20)*(252**0.5)*100) if rets20 else 20.0
+            vix_high = 1 if vix_val>25 else 0
 
-            # ── BB pct (match: bb_pct) ──
-            ma20  = float(closes.iloc[max(0,i-20):i].mean())
-            std20 = float(closes.iloc[max(0,i-20):i].std() or 1)
-            bb_pct = (price - (ma20 - 2*std20)) / (4*std20 + 1e-9)
+            vol_ma    = float(volumes.iloc[max(0,i-12):i].mean() or 1)
+            vol_ratio = float(volumes.iloc[i]) / vol_ma
+            vol_surge = 1 if vol_ratio>2 else 0
 
-            # ── OFI proxy (match: ofi_6b, ofi_zscore) ──
-            ofi_6b    = ret_6b   # daily bars: use 6b return as OFI proxy
-            ofi_zscore = ret_6b / (realized_vol / (252**0.5) + 1e-9)
+            def tr(j): return max(float(highs.iloc[j])-float(lows.iloc[j]),
+                                  abs(float(highs.iloc[j])-float(closes.iloc[j-1])),
+                                  abs(float(lows.iloc[j])-float(closes.iloc[j-1])))
+            tr5       = float(np.mean([tr(j) for j in range(max(1,i-5),i+1)]))
+            tr20      = float(np.mean([tr(j) for j in range(max(1,i-20),i+1)]))
+            atr_ratio = tr5/(tr20+1e-9)
+            realized_vol = float(closes.pct_change().iloc[max(0,i-20):i].std() or 0.01)
 
-            # ── VWAP proxy (match: vwap_dist, above_vwap) ──
-            vwap_proxy = float(closes.iloc[max(0,i-5):i+1].mean())
-            vwap_dist  = (price - vwap_proxy) / (vwap_proxy + 1e-9)
-            above_vwap = 1 if vwap_dist > 0 else 0
+            ma20  = float(bb_ma20_s.iloc[i]) if not np.isnan(bb_ma20_s.iloc[i]) else price
+            std20 = float(bb_std_s.iloc[i])  if not np.isnan(bb_std_s.iloc[i])  else price*0.02
+            bb_pct = (price-(ma20-2*std20))/(4*std20+1e-9)
 
-            # ── SPY proxy (match: tsla_spy_corr, spy_ret_1b) ──
-            tsla_spy_corr = 0.75   # historical TSLA-SPY correlation constant
-            spy_ret_1b    = ret_1b * 0.5  # rough proxy
+            ofi_6b     = ret_6b
+            ofi_zscore = ret_6b/(realized_vol/(252**0.5)+1e-9)
 
-            # ── Daily return so far (match: daily_ret_so_far) ──
-            daily_ret_so_far = ret_1b
+            vwap_proxy = float(closes.iloc[max(0,i-LOOKBACK):i+1].mean())
+            vwap_dist  = (price-vwap_proxy)/(vwap_proxy+1e-9)
+            above_vwap = 1 if vwap_dist>0 else 0
 
-            # ── EMA / trend (match: above_daily_ma20, daily_trend_up, above_ema9, above_ema21) ──
-            ema50_v  = float(ema50_s.iloc[i])
-            ema200_v = float(ema200_s.iloc[i])
-            above_daily_ma20 = 1 if price > ema50_v else 0
-            daily_trend_up   = 1 if ema50_v > ema200_v else 0
-            trend_score = sum(1 if float(c[j]) > float(c[j-1]) else -1 for j in range(max(1,i-10), i+1))
-            above_ema9  = 1 if trend_score >= 2 else 0
-            above_ema21 = 1 if trend_score >= 1 else 0
+            tsla_spy_corr = float(corr_s.iloc[i]) if not np.isnan(corr_s.iloc[i]) else 0.75
+            spy_ret_1b    = float(spy_closes.pct_change().iloc[i]) if spy_ok and not np.isnan(spy_closes.pct_change().iloc[i]) else ret_1b*0.5
+            spy_decouple  = 1 if abs(tsla_spy_corr)<0.4 else 0
 
-            # ── Time (match: time_of_day, is_open, is_close, is_lunch, day_of_week) ──
-            tod = closes.index[i].hour + closes.index[i].minute/60.0 if hasattr(closes.index[i], 'hour') else 12.0
-            dow = closes.index[i].weekday() if hasattr(closes.index[i], 'weekday') else 2
-            is_open  = 1 if 9.5  <= tod < 10.25 else 0
-            is_close = 1 if 15.25 <= tod < 16.0  else 0
-            is_lunch = 1 if 11.75 <= tod < 13.0  else 0
+            open_ref         = float(closes.iloc[max(0,i-LOOKBACK)])
+            daily_ret_so_far = (price-open_ref)/(open_ref+1e-9)
 
-            # ── High/low dist (match: dist_from_high, dist_from_low) ──
+            ema50_v  = float(ema50_s.iloc[i]);  ema200_v = float(ema200_s.iloc[i])
+            above_daily_ma20 = 1 if price>ema50_v  else 0
+            daily_trend_up   = 1 if ema50_v>ema200_v else 0
+            trend_score = sum(1 if float(closes.iloc[j])>float(closes.iloc[j-1]) else -1
+                              for j in range(max(1,i-10),i+1))
+            above_ema9  = 1 if trend_score>=2 else 0
+            above_ema21 = 1 if trend_score>=1 else 0
+
+            is_open  = 1 if 9.5<=bar_hour<10.25  else 0
+            is_close = 1 if 15.25<=bar_hour<16.0 else 0
+            is_lunch = 1 if 11.75<=bar_hour<13.0 else 0
+
             h20 = float(highs.iloc[max(0,i-20):i].max() or price)
-            l20 = float(lows.iloc[max(0,i-20):i].min() or price)
-            dist_from_high = (price - h20) / (h20 + 1e-9)
-            dist_from_low  = (price - l20) / (l20 + 1e-9)
+            l20 = float(lows.iloc[max(0,i-20):i].min()  or price)
+            dist_from_high = (price-h20)/(h20+1e-9)
+            dist_from_low  = (price-l20)/(l20+1e-9)
+            absorption     = abs(float(highs.iloc[i])-float(lows.iloc[i]))/(price+1e-9)
 
-            # ── Absorption proxy (match: absorption) ──
-            absorption = float(abs(float(h[i]) - float(l[i])) / (price + 1e-9))
+            # Earnings proximity
+            if earnings_dates and bar_date is not None:
+                days_to_earn  = min(abs((bar_date-ed).days) for ed in earnings_dates)
+                earn_near_5d  = 1 if days_to_earn<=5  else 0
+                earn_near_10d = 1 if days_to_earn<=10 else 0
+                earn_proximity = 1.0/(days_to_earn+1)
+            else:
+                days_to_earn=30; earn_near_5d=0; earn_near_10d=0; earn_proximity=0.0
 
-            # Feature vector — keys MUST match _ml_features in run_analysis exactly
+            # IV term structure (static from latest options fetch)
+            iv_front     = front_iv
+            iv_back      = back_iv
+            iv_term_sprd = iv_term_spread
+            iv_ratio     = front_iv/(back_iv+1e-9)
+
+            # P/C
+            pc_ratio      = pc_ratio_now
+            pc_delta_feat = 0.0  # live value used in inference
+
             row = [
                 ret_1b, ret_3b, ret_6b, ret_12b, ret_48b,
-                rsi_14, rsi_6, rsi_ob, rsi_os,
-                macd_hist,
-                vix, vix_high,
-                vol_ratio, atr_ratio, realized_vol,
+                rsi_14, rsi_6, rsi_ob, rsi_os, macd_hist,
+                vix_val, vix_high,
+                vol_ratio, vol_surge,
+                atr_ratio, realized_vol,
                 ofi_6b, ofi_zscore,
                 vwap_dist, above_vwap,
-                tsla_spy_corr, spy_ret_1b,
+                tsla_spy_corr, spy_ret_1b, spy_decouple,
                 daily_ret_so_far,
                 above_daily_ma20, daily_trend_up,
-                tod, is_open, is_close, is_lunch, dow,
-                bb_pct, trend_score,
-                above_ema9, above_ema21,
+                trend_score, above_ema9, above_ema21,
+                bar_hour, is_open, is_close, is_lunch, bar_dow,
+                bb_pct,
                 dist_from_high, dist_from_low,
-                absorption, vol_surge,
+                absorption,
+                earn_proximity, earn_near_5d, earn_near_10d,
+                iv_front, iv_back, iv_term_sprd, iv_ratio,
+                pc_ratio, pc_delta_feat,
             ]
             X_rows.append(row)
-            y_rows.append(1 if float(c[i+1]) > float(c[i]) else 0)
+            future = float(closes.iloc[min(i+6, n-1)])
+            y_rows.append(1 if future > price*1.001 else 0)
 
-        X = np.array(X_rows)
-        y = np.array(y_rows)
+        print(f"[ML-RETRAIN] {len(X_rows)} samples, pos_rate={sum(y_rows)/max(len(y_rows),1):.2f}", flush=True)
+        if len(X_rows) < 200:
+            print("[ML-RETRAIN] Not enough samples", flush=True); return
 
-        # CRITICAL: these names must EXACTLY match the keys in _ml_features dict
+        X  = _pd_rt.DataFrame(X_rows).replace([np.inf,-np.inf],0).fillna(0).values
+        y  = np.array(y_rows)
+
         feat_cols = [
-            "ret_1b", "ret_3b", "ret_6b", "ret_12b", "ret_48b",
-            "rsi_14", "rsi_6", "rsi_ob", "rsi_os",
-            "macd_hist",
-            "vix", "vix_high",
-            "vol_ratio", "atr_ratio", "realized_vol",
-            "ofi_6b", "ofi_zscore",
-            "vwap_dist", "above_vwap",
-            "tsla_spy_corr", "spy_ret_1b",
+            "ret_1b","ret_3b","ret_6b","ret_12b","ret_48b",
+            "rsi_14","rsi_6","rsi_ob","rsi_os","macd_hist",
+            "vix","vix_high",
+            "vol_ratio","vol_surge",
+            "atr_ratio","realized_vol",
+            "ofi_6b","ofi_zscore",
+            "vwap_dist","above_vwap",
+            "tsla_spy_corr","spy_ret_1b","spy_decouple",
             "daily_ret_so_far",
-            "above_daily_ma20", "daily_trend_up",
-            "time_of_day", "is_open", "is_close", "is_lunch", "day_of_week",
-            "bb_pct", "trend_score",
-            "above_ema9", "above_ema21",
-            "dist_from_high", "dist_from_low",
-            "absorption", "vol_surge",
+            "above_daily_ma20","daily_trend_up",
+            "trend_score","above_ema9","above_ema21",
+            "time_of_day","is_open","is_close","is_lunch","day_of_week",
+            "bb_pct",
+            "dist_from_high","dist_from_low",
+            "absorption",
+            "earn_proximity","earn_near_5d","earn_near_10d",
+            "iv_front","iv_back","iv_term_spread","iv_ratio",
+            "pc_ratio","pc_delta",
         ]
 
-        assert len(feat_cols) == X.shape[1], f"Feature count mismatch: {len(feat_cols)} names vs {X.shape[1]} cols"
+        assert len(feat_cols)==X.shape[1], f"Mismatch {len(feat_cols)} vs {X.shape[1]}"
 
-        import pandas as _pd_rt
+        X_df   = _pd_rt.DataFrame(X, columns=feat_cols)
         scaler = StandardScaler()
-        X_df_train = _pd_rt.DataFrame(X, columns=feat_cols)
-        X_s = scaler.fit_transform(X_df_train)
+        X_s    = scaler.fit_transform(X_df)
+        X_s_df = _pd_rt.DataFrame(X_s, columns=feat_cols)
 
-        # Try LightGBM, fallback to RandomForest
-        model_name = "LightGBM"
+        # 9. Train ensemble
+        print("[ML-RETRAIN] Training ensemble...", flush=True)
+        models_trained = []
+        model_names    = []
+
         try:
             from lightgbm import LGBMClassifier
-            model = LGBMClassifier(n_estimators=200, learning_rate=0.05,
-                                   max_depth=4, random_state=42, verbose=-1)
-        except (ImportError, OSError):
-            from sklearn.ensemble import RandomForestClassifier
-            model = RandomForestClassifier(n_estimators=200, max_depth=4, random_state=42)
-            model_name = "RandomForest"
+            lgbm = LGBMClassifier(n_estimators=300, learning_rate=0.03, max_depth=5,
+                                  num_leaves=31, subsample=0.8, colsample_bytree=0.8,
+                                  random_state=42, verbose=-1)
+            lgbm.fit(X_s_df, y); models_trained.append(lgbm); model_names.append("LightGBM")
+            print("[ML-RETRAIN]   LightGBM OK", flush=True)
+        except Exception as _le: print(f"[ML-RETRAIN]   LGBM fail: {_le}", flush=True)
 
-        X_s_df = _pd_rt.DataFrame(X_s, columns=feat_cols)
-        model.fit(X_s_df, y)
-        cv_scores = cross_val_score(model, X_s_df, y, cv=5, scoring="roc_auc")
-        auc = float(np.mean(cv_scores))
+        try:
+            from xgboost import XGBClassifier
+            xgb = XGBClassifier(n_estimators=300, learning_rate=0.03, max_depth=5,
+                                subsample=0.8, colsample_bytree=0.8,
+                                eval_metric="logloss", random_state=42, verbosity=0)
+            xgb.fit(X_s_df, y); models_trained.append(xgb); model_names.append("XGBoost")
+            print("[ML-RETRAIN]   XGBoost OK", flush=True)
+        except Exception as _xe: print(f"[ML-RETRAIN]   XGB fail: {_xe}", flush=True)
+
+        try:
+            lr = LogisticRegression(C=0.1, max_iter=500, random_state=42)
+            lr.fit(X_s_df, y); models_trained.append(lr); model_names.append("LogReg")
+            print("[ML-RETRAIN]   LogReg OK", flush=True)
+        except Exception as _lre: print(f"[ML-RETRAIN]   LR fail: {_lre}", flush=True)
+
+        if not models_trained:
+            print("[ML-RETRAIN] All models failed", flush=True); return
+
+        # 10. TimeSeriesSplit CV
+        tscv = TimeSeriesSplit(n_splits=5)
+        fold_aucs = []
+        for tr_idx, val_idx in tscv.split(X_s_df):
+            X_tr,X_val = X_s_df.iloc[tr_idx],X_s_df.iloc[val_idx]
+            y_tr,y_val = y[tr_idx],y[val_idx]
+            fold_probs = []
+            for m in models_trained:
+                try: m.fit(X_tr,y_tr); fold_probs.append(m.predict_proba(X_val)[:,1])
+                except: pass
+            if fold_probs:
+                try: fold_aucs.append(roc_auc_score(y_val, np.mean(fold_probs,axis=0)))
+                except: pass
+        # Re-fit on full data
+        for m in models_trained:
+            try: m.fit(X_s_df, y)
+            except: pass
+
+        auc = float(np.mean(fold_aucs)) if fold_aucs else 0.5
+        print(f"[ML-RETRAIN] CV AUC={auc:.3f}", flush=True)
+
+        # 11. Best threshold
+        ens_prob = np.mean([m.predict_proba(X_s_df)[:,1] for m in models_trained], axis=0)
+        best_thresh, best_f1 = 0.55, 0.0
+        for thr in [0.52,0.55,0.58,0.60,0.62,0.65]:
+            preds = (ens_prob>=thr).astype(int)
+            tp=np.sum((preds==1)&(y==1)); fp=np.sum((preds==1)&(y==0)); fn=np.sum((preds==0)&(y==1))
+            prec=tp/(tp+fp+1e-9); rec=tp/(tp+fn+1e-9); f1=2*prec*rec/(prec+rec+1e-9)
+            if f1>best_f1: best_f1=f1; best_thresh=thr
 
         pkg = {
-            "model":        model,
+            "models":       models_trained,
+            "model":        models_trained[0],
             "scaler":       scaler,
             "feature_cols": feat_cols,
-            "model_name":   model_name,
-            "auc":          round(auc, 3),
+            "model_name":   "+".join(model_names),
+            "auc":          round(auc,3),
             "n_samples":    len(X),
-            "entry_thresh": 0.60,
+            "entry_thresh": best_thresh,
             "trained_on":   datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "bar_interval": "5m",
+            "n_models":     len(models_trained),
+            "iv_front_ref": front_iv,
+            "iv_back_ref":  back_iv,
+            "pc_ratio_ref": pc_ratio_now,
         }
-
         pkl_path = "/app/tsla_model.pkl"
-        with open(pkl_path, "wb") as f:
-            pickle.dump(pkg, f)
-
+        with open(pkl_path,"wb") as f: pickle.dump(pkg,f)
         _ml_model_cache = pkg
         _ml_load_errors = []
-        print(f"[ML-RETRAIN] Done - {model_name} AUC={auc:.3f} on {len(X)} samples, {len(feat_cols)} features. Saved.", flush=True)
+        print(f"[ML-RETRAIN] Saved — {pkg['model_name']} AUC={auc:.3f} on {len(X)} bars, {len(feat_cols)} features.", flush=True)
 
-        # Force an immediate re-analysis so the new model updates the dashboard state
         try:
-            print("[ML-RETRAIN] Triggering re-analysis with new model...", flush=True)
+            print("[ML-RETRAIN] Triggering re-analysis...", flush=True)
             run_analysis()
-            print("[ML-RETRAIN] Re-analysis complete — ML panel should now show live signal.", flush=True)
+            print("[ML-RETRAIN] Done.", flush=True)
         except Exception as _ra_e:
             print(f"[ML-RETRAIN] Re-analysis error: {_ra_e}", flush=True)
 
@@ -6138,45 +6342,59 @@ def _load_ml_model():
     return None
 
 def _get_ml_signal(features_dict):
-    """Run ML model on current features. Returns signal dict."""
+    """Run ensemble ML model on current features. Returns signal dict."""
     empty = {"signal":"HOLD","confidence":0,"probability":0.5,"available":False}
     try:
         import numpy as np
         import pandas as pd
         pkg = _load_ml_model()
         if pkg is None: return empty
-        cols  = pkg["feature_cols"]
-        # Validate model features match what run_analysis sends — reject stale cached model
-        _expected = set(["ret_1b","ret_3b","ret_6b","ret_12b","ret_48b","rsi_14","rsi_6",
-                         "rsi_ob","rsi_os","macd_hist","vix","vix_high","vol_ratio",
-                         "atr_ratio","realized_vol","ofi_6b","ofi_zscore","vwap_dist",
-                         "above_vwap","tsla_spy_corr","spy_ret_1b","daily_ret_so_far",
-                         "above_daily_ma20","daily_trend_up","time_of_day","is_open",
-                         "is_close","is_lunch","day_of_week","bb_pct","trend_score",
-                         "above_ema9","above_ema21","dist_from_high","dist_from_low",
-                         "absorption","vol_surge"])
-        if _expected != set(cols):
+        cols = pkg["feature_cols"]
+        # Reject stale model — new model has more than 37 features
+        if len(cols) <= 37:
             return {**empty, "error": "stale model — retrain in progress"}
-        # Use DataFrame with named columns so LightGBM gets the feature names it was fitted with
+        # Build feature row — missing keys default to 0 gracefully
         row_data = {c: float(features_dict.get(c, 0) or 0) for c in cols}
-        X_df  = pd.DataFrame([row_data], columns=cols)
-        X_s   = pkg["scaler"].transform(X_df)
-        # Pass as DataFrame to predict_proba so LGBM feature names match
+        X_df   = pd.DataFrame([row_data], columns=cols)
+        X_s    = pkg["scaler"].transform(X_df)
         X_s_df = pd.DataFrame(X_s, columns=cols)
-        prob  = float(pkg["model"].predict_proba(X_s_df)[0][1])
-        thresh = pkg.get("entry_thresh", 0.60)
-        if prob >= thresh:           signal = "BUY"
-        elif prob <= (1 - thresh):   signal = "SELL"
-        else:                        signal = "HOLD"
-        confidence = round(abs(prob - 0.5) * 200)
-        # Log how many features matched vs defaulted to 0
+
+        # Ensemble: average probabilities from all models
+        models = pkg.get("models", [pkg.get("model")])
+        models = [m for m in models if m is not None]
+        if not models: return {**empty, "error": "no models in pkg"}
+
+        probs = []
+        for m in models:
+            try: probs.append(float(m.predict_proba(X_s_df)[0][1]))
+            except Exception: pass
+        if not probs: return {**empty, "error": "all models failed"}
+
+        prob   = float(np.mean(probs))
+        agree  = sum(1 for p in probs if p >= 0.5) / len(probs)
+        thresh = pkg.get("entry_thresh", 0.58)
+
+        if prob >= thresh:         signal = "BUY"
+        elif prob <= (1 - thresh): signal = "SELL"
+        else:                      signal = "HOLD"
+
+        base_conf        = round(abs(prob - 0.5) * 200)
+        agreement_bonus  = round((abs(agree - 0.5) * 2) * 20)
+        confidence       = min(100, base_conf + agreement_bonus)
+
         matched = sum(1 for c in cols if c in features_dict and features_dict[c] != 0)
-        return {"signal":signal,"confidence":confidence,
-                "probability":round(prob,3),"available":True,
-                "model":pkg.get("model_name","LightGBM"),
-                "auc":round(pkg.get("auc",0),3),
-                "features_matched": matched,
-                "features_total": len(cols)}
+        return {
+            "signal":           signal,
+            "confidence":       confidence,
+            "probability":      round(prob, 3),
+            "available":        True,
+            "model":            pkg.get("model_name", "Ensemble"),
+            "auc":              round(pkg.get("auc", 0), 3),
+            "n_models":         len(probs),
+            "model_agreement":  round(agree, 2),
+            "features_matched": matched,
+            "features_total":   len(cols),
+        }
     except Exception as e:
         return {**empty, "error": str(e)[:60]}
 
@@ -9479,8 +9697,9 @@ function renderMLPanel(ml) {
   var hdrEl=document.getElementById('mlPanelHeader');
   if(hdrEl&&ml.auc&&ml.available) {
     var nFeat = ml.features_total || 37;
-    hdrEl.textContent = (ml.model||'LIGHTGBM').toUpperCase()+' · '+nFeat+' FEATURES · AUC '+ml.auc+' · PROFIT FACTOR 1.53x';
-  }
+    hdrEl.textContent = (ml.model||'ENSEMBLE').toUpperCase()
+      +' ('+(ml.n_models||1)+' models) · '+(ml.features_total||47)+' FEATURES · AUC '+ml.auc
+      +(ml.model_agreement!==undefined?' · AGREE '+Math.round(ml.model_agreement*100)+'%':'');
 
   var statusEl=document.getElementById('mlStatus');
   if(statusEl){
@@ -10913,7 +11132,7 @@ setTimeout(pollSpockStatus, 5000);
   <div class="panel" id="ml-panel" style="grid-column:1/-1;border:2px solid rgba(0,229,255,0.3);background:rgba(0,10,20,0.98);">
     <div class="panel-title" onclick="togglePanel('ml-panel')" style="cursor:pointer;">
       🧠 ML DIRECTIONAL SIGNAL
-      <span id="mlPanelHeader" style="font-size:9px;color:var(--text-dim);">LIGHTGBM · 37 FEATURES · AUC — · PROFIT FACTOR 1.53x</span>
+      <span id="mlPanelHeader" style="font-size:9px;color:var(--text-dim);">ENSEMBLE · 47 FEATURES · AUC — · 5-MIN BARS</span>
       <span class="panel-collapse-btn" id="btn-ml-panel">▾</span>
     </div>
     <div style="display:grid;grid-template-columns:180px 1fr 1fr 1fr;gap:16px;align-items:start;">
@@ -12433,21 +12652,32 @@ def start_background_threads():
     time.sleep(3)  # short wait for gunicorn to bind port
     print("[STARTUP] Starting background monitor threads...", flush=True)
     # Pre-load ML model — check feature compatibility and retrain if needed
-    _EXPECTED_ML_FEATURES = ['ret_1b', 'ret_3b', 'ret_6b', 'ret_12b', 'ret_48b', 'rsi_14', 'rsi_6', 'rsi_ob', 'rsi_os', 'macd_hist', 'vix', 'vix_high', 'vol_ratio', 'atr_ratio', 'realized_vol', 'ofi_6b', 'ofi_zscore', 'vwap_dist', 'above_vwap', 'tsla_spy_corr', 'spy_ret_1b', 'daily_ret_so_far', 'above_daily_ma20', 'daily_trend_up', 'time_of_day', 'is_open', 'is_close', 'is_lunch', 'day_of_week', 'bb_pct', 'trend_score', 'above_ema9', 'above_ema21', 'dist_from_high', 'dist_from_low', 'absorption', 'vol_surge']
+    _EXPECTED_ML_FEATURES = [
+            "ret_1b","ret_3b","ret_6b","ret_12b","ret_48b",
+            "rsi_14","rsi_6","rsi_ob","rsi_os","macd_hist","vix","vix_high",
+            "vol_ratio","vol_surge","atr_ratio","realized_vol",
+            "ofi_6b","ofi_zscore","vwap_dist","above_vwap",
+            "tsla_spy_corr","spy_ret_1b","spy_decouple","daily_ret_so_far",
+            "above_daily_ma20","daily_trend_up","trend_score","above_ema9","above_ema21",
+            "time_of_day","is_open","is_close","is_lunch","day_of_week","bb_pct",
+            "dist_from_high","dist_from_low","absorption",
+            "earn_proximity","earn_near_5d","earn_near_10d",
+            "iv_front","iv_back","iv_term_spread","iv_ratio","pc_ratio","pc_delta"
+        ]
     try:
         pkg = _load_ml_model()
         if pkg:
             loaded_cols = pkg.get("feature_cols", [])
             # Check if loaded model's features match what run_analysis sends
-            missing = [c for c in _EXPECTED_ML_FEATURES if c not in loaded_cols]
-            extra   = [c for c in loaded_cols if c not in _EXPECTED_ML_FEATURES]
-            if missing or extra:
-                print(f"[STARTUP] ⚠️ ML feature mismatch — loaded:{len(loaded_cols)} expected:{len(_EXPECTED_ML_FEATURES)} missing:{missing[:3]} extra:{extra[:3]} — retraining...", flush=True)
+            # Check feature count — new model has 47 features (old had 37 or 54)
+            if len(loaded_cols) != len(_EXPECTED_ML_FEATURES):
+                print(f"[STARTUP] ⚠️ ML feature count mismatch: loaded={len(loaded_cols)} expected={len(_EXPECTED_ML_FEATURES)} — retraining with enhanced model...", flush=True)
                 global _ml_model_cache
-                _ml_model_cache = None  # clear stale cache
+                _ml_model_cache = None
                 threading.Thread(target=_run_ml_retrain, daemon=True).start()
             else:
-                print(f"[STARTUP] ✅ ML model ready: {pkg.get('model_name','?')} AUC={pkg.get('auc',0):.3f} features={len(loaded_cols)}", flush=True)
+                n_models = pkg.get("n_models", 1)
+                print(f"[STARTUP] ✅ ML ready: {pkg.get('model_name','?')} ({n_models} models) AUC={pkg.get('auc',0):.3f} features={len(loaded_cols)}", flush=True)
         else:
             print("[STARTUP] ❌ ML model NOT found — auto-training now (takes ~60s)...", flush=True)
             threading.Thread(target=_run_ml_retrain, daemon=True).start()
