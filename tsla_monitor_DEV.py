@@ -5492,12 +5492,35 @@ def _run_ml_retrain():
         from sklearn.metrics import roc_auc_score
 
         # 1. Fetch 6 months of 5-minute TSLA bars
-        print("[ML-RETRAIN] Fetching 6mo 5-min TSLA bars...", flush=True)
-        hist5 = yf.Ticker("TSLA").history(period="6mo", interval="5m")
-        if hist5.empty or len(hist5) < 500:
-            print("[ML-RETRAIN] Not enough 5-min data, falling back to daily", flush=True)
-            hist5 = yf.Ticker("TSLA").history(period="6mo", interval="1d")
-        print(f"[ML-RETRAIN] Got {len(hist5)} bars", flush=True)
+        # Yahoo Finance limits 5-min bars to last 60 days max
+        print("[ML-RETRAIN] Fetching 60d 5-min TSLA bars...", flush=True)
+        try:
+            hist5 = yf.download("TSLA", period="60d", interval="5m",
+                                progress=False, auto_adjust=True)
+            if hasattr(hist5.columns, "levels"):
+                hist5.columns = hist5.columns.get_level_values(0)
+        except Exception:
+            hist5 = yf.Ticker("TSLA").history(period="60d", interval="5m")
+        use_intraday = not hist5.empty and len(hist5) >= 500
+        if not use_intraday:
+            print("[ML-RETRAIN] Trying 1h bars (730 day limit)...", flush=True)
+            try:
+                hist5 = yf.download("TSLA", period="730d", interval="1h",
+                                    progress=False, auto_adjust=True)
+                if hist5.empty or len(hist5) < 200:
+                    raise ValueError(f"only {len(hist5)} 1h bars")
+                # yf.download returns MultiIndex columns sometimes - flatten
+                if hasattr(hist5.columns, "levels"):
+                    hist5.columns = hist5.columns.get_level_values(0)
+                print(f"[ML-RETRAIN] Got {len(hist5)} 1h bars", flush=True)
+            except Exception as _1he:
+                print(f"[ML-RETRAIN] 1h failed ({_1he}), using 2y daily...", flush=True)
+                hist5 = yf.download("TSLA", period="2y", interval="1d",
+                                    progress=False, auto_adjust=True)
+                if hasattr(hist5.columns, "levels"):
+                    hist5.columns = hist5.columns.get_level_values(0)
+                use_intraday = False
+        print(f"[ML-RETRAIN] Got {len(hist5)} bars (interval={'5m' if use_intraday else 'fallback'})", flush=True)
 
         closes  = hist5["Close"].astype(float).reset_index(drop=True)
         highs   = hist5["High"].astype(float).reset_index(drop=True)
@@ -5508,7 +5531,17 @@ def _run_ml_retrain():
         # 2. Fetch SPY for correlation regime
         print("[ML-RETRAIN] Fetching SPY...", flush=True)
         try:
-            spy5       = yf.Ticker("SPY").history(period="6mo", interval="5m")
+            try:
+                spy5 = yf.download("SPY", period="60d", interval="5m",
+                                   progress=False, auto_adjust=True)
+                if hasattr(spy5.columns, "levels"): spy5.columns = spy5.columns.get_level_values(0)
+            except Exception: spy5 = yf.Ticker("SPY").history(period="60d", interval="5m")
+            if spy5.empty or len(spy5) < 500:
+                try:
+                    spy5 = yf.download("SPY", period="730d", interval="1h",
+                                       progress=False, auto_adjust=True)
+                    if hasattr(spy5.columns, "levels"): spy5.columns = spy5.columns.get_level_values(0)
+                except Exception: spy5 = yf.Ticker("SPY").history(period="2y", interval="1h")
             spy_closes = spy5["Close"].astype(float).reset_index(drop=True)
             min_len    = min(len(closes), len(spy_closes))
             closes     = closes.iloc[:min_len]
@@ -5551,14 +5584,20 @@ def _run_ml_retrain():
         # 5. Earnings dates
         earnings_dates = []
         try:
+            import subprocess as _subp, sys as _sys
+            # Install lxml if missing (needed for earnings calendar)
+            try:
+                import lxml
+            except ImportError:
+                _subp.check_call([_sys.executable, "-m", "pip", "install", "lxml", "--quiet"])
             cal = yf.Ticker("TSLA").get_earnings_dates(limit=20)
             if cal is not None and not cal.empty:
                 earnings_dates = [d.date() if hasattr(d,"date") else d for d in cal.index.tolist()]
+            print(f"[ML-RETRAIN] Earnings: {len(earnings_dates)} dates loaded", flush=True)
         except Exception as _ee:
-            print(f"[ML-RETRAIN] Earnings failed: {_ee}", flush=True)
+            print(f"[ML-RETRAIN] Earnings skipped: {str(_ee)[:60]}", flush=True)
 
         # 6. Pre-compute series
-        n = len(closes)
         delta     = closes.diff()
         gain14    = delta.where(delta>0,0).rolling(14).mean()
         loss14    = (-delta.where(delta<0,0)).rolling(14).mean()
@@ -5581,12 +5620,25 @@ def _run_ml_retrain():
         else:
             corr_s = _pd_rt.Series(0.75, index=closes.index)
 
-        # 7. Build feature rows
-        LOOKBACK = 78
+        # 7. Build feature rows — LOOKBACK scales with bar interval
+        n = len(closes)
+        if n >= 5000:
+            LOOKBACK = 78   # 5-min: 78 bars ~ 1 trading day
+            MIN_START = 200
+            FORWARD   = 6   # predict 30min ahead (6x5min)
+        elif n >= 1000:
+            LOOKBACK = 7    # 1h: 7 bars ~ 1 trading day
+            MIN_START = 50
+            FORWARD   = 2   # predict 2h ahead
+        else:
+            LOOKBACK = 5    # daily: 5 bars ~ 1 week
+            MIN_START = 30
+            FORWARD   = 1   # predict next day
+        print(f"[ML-RETRAIN] Using LOOKBACK={LOOKBACK} FORWARD={FORWARD}", flush=True)
         X_rows, y_rows = [], []
         import numpy as np
 
-        for i in range(200, n - 7):
+        for i in range(MIN_START, n - FORWARD - 1):
             price = float(closes.iloc[i])
             if price <= 0: continue
 
@@ -5703,12 +5755,14 @@ def _run_ml_retrain():
                 pc_ratio, pc_delta_feat,
             ]
             X_rows.append(row)
-            future = float(closes.iloc[min(i+6, n-1)])
-            y_rows.append(1 if future > price*1.001 else 0)
+            future = float(closes.iloc[min(i+FORWARD, n-1)])
+            threshold = 1.0005 if FORWARD <= 2 else 1.001
+            y_rows.append(1 if future > price*threshold else 0)
 
         print(f"[ML-RETRAIN] {len(X_rows)} samples, pos_rate={sum(y_rows)/max(len(y_rows),1):.2f}", flush=True)
-        if len(X_rows) < 200:
-            print("[ML-RETRAIN] Not enough samples", flush=True); return
+        min_samples = 50 if FORWARD == 1 else 200   # daily bars need fewer samples
+        if len(X_rows) < min_samples:
+            print(f"[ML-RETRAIN] Not enough samples ({len(X_rows)} < {min_samples})", flush=True); return
 
         X  = _pd_rt.DataFrame(X_rows).replace([np.inf,-np.inf],0).fillna(0).values
         y  = np.array(y_rows)
@@ -6350,9 +6404,9 @@ def _get_ml_signal(features_dict):
         pkg = _load_ml_model()
         if pkg is None: return empty
         cols = pkg["feature_cols"]
-        # Reject stale model — new model has more than 37 features
-        if len(cols) <= 37:
-            return {**empty, "error": "stale model — retrain in progress"}
+        # Reject stale model — new model has exactly 47 features
+        if len(cols) != 47:
+            return {**empty, "error": f"stale model ({len(cols)} feats) — retrain in progress"}
         # Build feature row — missing keys default to 0 gracefully
         row_data = {c: float(features_dict.get(c, 0) or 0) for c in cols}
         X_df   = pd.DataFrame([row_data], columns=cols)
@@ -9696,10 +9750,10 @@ function renderMLPanel(ml) {
   if(aucEl&&ml.auc) aucEl.textContent=ml.auc;
   var hdrEl=document.getElementById('mlPanelHeader');
   if(hdrEl&&ml.auc&&ml.available) {
-    var nFeat = ml.features_total || 37;
     hdrEl.textContent = (ml.model||'ENSEMBLE').toUpperCase()
-      +' ('+(ml.n_models||1)+' models) · '+(ml.features_total||47)+' FEATURES · AUC '+ml.auc
-      +(ml.model_agreement!==undefined?' · AGREE '+Math.round(ml.model_agreement*100)+'%':'');
+      +' ('+(ml.n_models||1)+' models) - '+(ml.features_total||47)+' FEATURES - AUC '+ml.auc
+      +(ml.model_agreement!==undefined?' - AGREE '+Math.round(ml.model_agreement*100)+'%':'');
+  }
 
   var statusEl=document.getElementById('mlStatus');
   if(statusEl){
