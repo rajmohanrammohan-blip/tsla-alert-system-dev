@@ -4768,6 +4768,7 @@ def run_analysis():
             state["capitulation"] = {}
 
         # ── DarthVader 1.0 — Institutional Intelligence ──────────
+        dv_result = {}  # default if calculate_darthvader throws
         try:
             dv_result = calculate_darthvader(
                 closes, highs, lows, volumes, opens_s,
@@ -4894,7 +4895,7 @@ def run_analysis():
 
         # ── ML Directional Signal ─────────────────────────────
         try:
-            _dv_ft = dv_result.get("features", {})
+            _dv_ft = (dv_result if isinstance(dv_result, dict) else {}).get("features", {})
             _now_h = datetime.now().hour + datetime.now().minute / 60
             _vol_ma12 = float(volumes.rolling(12).mean().iloc[-1] + 1)
             _vol_now  = float(volumes.iloc[-1])
@@ -5638,103 +5639,105 @@ def _run_ml_retrain():
         X_rows, y_rows = [], []
         import numpy as np
 
+        skipped_errors = 0
         for i in range(MIN_START, n - FORWARD - 1):
-            price = float(closes.iloc[i])
-            if price <= 0: continue
+            try:
+                price = float(closes.iloc[i])
+                if price <= 0: continue
 
-            ts       = idx[i]
-            bar_date = ts.date() if hasattr(ts,"date") else None
-            bar_hour = float(ts.hour + ts.minute/60.0) if hasattr(ts,"hour") else 12.0
-            bar_dow  = int(ts.weekday()) if hasattr(ts,"weekday") else 2
+                ts       = idx[i]
+                bar_date = ts.date() if hasattr(ts,"date") else None
+                bar_hour = float(ts.hour + ts.minute/60.0) if hasattr(ts,"hour") else 12.0
+                bar_dow  = int(ts.weekday()) if hasattr(ts,"weekday") else 2
 
-            def sc(j): return float(closes.iloc[j]) if float(closes.iloc[j])>0 else price
-            ret_1b  = price/sc(i-1)-1;  ret_3b  = price/sc(i-3)-1
-            ret_6b  = price/sc(i-6)-1;  ret_12b = price/sc(i-12)-1
-            ret_48b = price/sc(max(0,i-48))-1
+                def sc(j): return float(closes.iloc[j]) if float(closes.iloc[j])>0 else price
+                ret_1b  = price/sc(i-1)-1;  ret_3b  = price/sc(i-3)-1
+                ret_6b  = price/sc(i-6)-1;  ret_12b = price/sc(i-12)-1
+                ret_48b = price/sc(max(0,i-48))-1
 
-            rsi_14 = float(rsi14_s.iloc[i]) if not np.isnan(rsi14_s.iloc[i]) else 50.0
-            rsi_6  = float(rsi6_s.iloc[i])  if not np.isnan(rsi6_s.iloc[i])  else rsi_14
-            rsi_ob = 1 if rsi_14>70 else 0;  rsi_os = 1 if rsi_14<30 else 0
+                rsi_14 = float(rsi14_s.iloc[i]) if not np.isnan(rsi14_s.iloc[i]) else 50.0
+                rsi_6  = float(rsi6_s.iloc[i])  if not np.isnan(rsi6_s.iloc[i])  else rsi_14
+                rsi_ob = 1 if rsi_14>70 else 0;  rsi_os = 1 if rsi_14<30 else 0
 
-            macd_hist = float(macd_h_s.iloc[i]) if not np.isnan(macd_h_s.iloc[i]) else 0.0
+                macd_hist = float(macd_h_s.iloc[i]) if not np.isnan(macd_h_s.iloc[i]) else 0.0
 
-            if vix_ok and bar_date is not None:
-                try:   vix_val = float(vix_daily.asof(str(bar_date)) or 20)
-                except: vix_val = 20.0
-            else:
-                rets20  = [float(closes.iloc[j])/float(closes.iloc[j-1])-1
-                           for j in range(max(1,i-19),i+1) if float(closes.iloc[j-1])>0]
-                vix_val = float(np.std(rets20)*(252**0.5)*100) if rets20 else 20.0
-            vix_high = 1 if vix_val>25 else 0
+                if vix_ok and bar_date is not None:
+                    try:   vix_val = float(vix_daily.asof(str(bar_date)) or 20)
+                    except: vix_val = 20.0
+                else:
+                    rets20  = [float(closes.iloc[j])/float(closes.iloc[j-1])-1
+                               for j in range(max(1,i-19),i+1) if float(closes.iloc[j-1])>0]
+                    vix_val = float(np.std(rets20)*(252**0.5)*100) if rets20 else 20.0
+                vix_high = 1 if vix_val>25 else 0
 
-            vol_ma    = float(volumes.iloc[max(0,i-12):i].mean() or 1)
-            vol_ratio = float(volumes.iloc[i]) / vol_ma
-            vol_surge = 1 if vol_ratio>2 else 0
+                vol_ma    = float(volumes.iloc[max(0,i-12):i].mean() or 1)
+                vol_ratio = float(volumes.iloc[i]) / vol_ma
+                vol_surge = 1 if vol_ratio>2 else 0
 
-            def tr(j): return max(float(highs.iloc[j])-float(lows.iloc[j]),
-                                  abs(float(highs.iloc[j])-float(closes.iloc[j-1])),
-                                  abs(float(lows.iloc[j])-float(closes.iloc[j-1])))
-            tr5       = float(np.mean([tr(j) for j in range(max(1,i-5),i+1)]))
-            tr20      = float(np.mean([tr(j) for j in range(max(1,i-20),i+1)]))
-            atr_ratio = tr5/(tr20+1e-9)
-            realized_vol = float(closes.pct_change().iloc[max(0,i-20):i].std() or 0.01)
+                def tr(j): return max(float(highs.iloc[j])-float(lows.iloc[j]),
+                abs(float(highs.iloc[j])-float(closes.iloc[j-1])),
+                abs(float(lows.iloc[j])-float(closes.iloc[j-1])))
+                tr5       = float(np.mean([tr(j) for j in range(max(1,i-5),i+1)]))
+                tr20      = float(np.mean([tr(j) for j in range(max(1,i-20),i+1)]))
+                atr_ratio = tr5/(tr20+1e-9)
+                realized_vol = float(closes.pct_change().iloc[max(0,i-20):i].std() or 0.01)
 
-            ma20  = float(bb_ma20_s.iloc[i]) if not np.isnan(bb_ma20_s.iloc[i]) else price
-            std20 = float(bb_std_s.iloc[i])  if not np.isnan(bb_std_s.iloc[i])  else price*0.02
-            bb_pct = (price-(ma20-2*std20))/(4*std20+1e-9)
+                ma20  = float(bb_ma20_s.iloc[i]) if not np.isnan(bb_ma20_s.iloc[i]) else price
+                std20 = float(bb_std_s.iloc[i])  if not np.isnan(bb_std_s.iloc[i])  else price*0.02
+                bb_pct = (price-(ma20-2*std20))/(4*std20+1e-9)
 
-            ofi_6b     = ret_6b
-            ofi_zscore = ret_6b/(realized_vol/(252**0.5)+1e-9)
+                ofi_6b     = ret_6b
+                ofi_zscore = ret_6b/(realized_vol/(252**0.5)+1e-9)
 
-            vwap_proxy = float(closes.iloc[max(0,i-LOOKBACK):i+1].mean())
-            vwap_dist  = (price-vwap_proxy)/(vwap_proxy+1e-9)
-            above_vwap = 1 if vwap_dist>0 else 0
+                vwap_proxy = float(closes.iloc[max(0,i-LOOKBACK):i+1].mean())
+                vwap_dist  = (price-vwap_proxy)/(vwap_proxy+1e-9)
+                above_vwap = 1 if vwap_dist>0 else 0
 
-            tsla_spy_corr = float(corr_s.iloc[i]) if not np.isnan(corr_s.iloc[i]) else 0.75
-            spy_ret_1b    = float(spy_closes.pct_change().iloc[i]) if spy_ok and not np.isnan(spy_closes.pct_change().iloc[i]) else ret_1b*0.5
-            spy_decouple  = 1 if abs(tsla_spy_corr)<0.4 else 0
+                tsla_spy_corr = float(corr_s.iloc[i]) if not np.isnan(corr_s.iloc[i]) else 0.75
+                spy_ret_1b    = float(spy_closes.pct_change().iloc[i]) if spy_ok and not np.isnan(spy_closes.pct_change().iloc[i]) else ret_1b*0.5
+                spy_decouple  = 1 if abs(tsla_spy_corr)<0.4 else 0
 
-            open_ref         = float(closes.iloc[max(0,i-LOOKBACK)])
-            daily_ret_so_far = (price-open_ref)/(open_ref+1e-9)
+                open_ref         = float(closes.iloc[max(0,i-LOOKBACK)])
+                daily_ret_so_far = (price-open_ref)/(open_ref+1e-9)
 
-            ema50_v  = float(ema50_s.iloc[i]);  ema200_v = float(ema200_s.iloc[i])
-            above_daily_ma20 = 1 if price>ema50_v  else 0
-            daily_trend_up   = 1 if ema50_v>ema200_v else 0
-            trend_score = sum(1 if float(closes.iloc[j])>float(closes.iloc[j-1]) else -1
-                              for j in range(max(1,i-10),i+1))
-            above_ema9  = 1 if trend_score>=2 else 0
-            above_ema21 = 1 if trend_score>=1 else 0
+                ema50_v  = float(ema50_s.iloc[i]);  ema200_v = float(ema200_s.iloc[i])
+                above_daily_ma20 = 1 if price>ema50_v  else 0
+                daily_trend_up   = 1 if ema50_v>ema200_v else 0
+                trend_score = sum(1 if float(closes.iloc[j])>float(closes.iloc[j-1]) else -1
+                for j in range(max(1,i-10),i+1))
+                above_ema9  = 1 if trend_score>=2 else 0
+                above_ema21 = 1 if trend_score>=1 else 0
 
-            is_open  = 1 if 9.5<=bar_hour<10.25  else 0
-            is_close = 1 if 15.25<=bar_hour<16.0 else 0
-            is_lunch = 1 if 11.75<=bar_hour<13.0 else 0
+                is_open  = 1 if 9.5<=bar_hour<10.25  else 0
+                is_close = 1 if 15.25<=bar_hour<16.0 else 0
+                is_lunch = 1 if 11.75<=bar_hour<13.0 else 0
 
-            h20 = float(highs.iloc[max(0,i-20):i].max() or price)
-            l20 = float(lows.iloc[max(0,i-20):i].min()  or price)
-            dist_from_high = (price-h20)/(h20+1e-9)
-            dist_from_low  = (price-l20)/(l20+1e-9)
-            absorption     = abs(float(highs.iloc[i])-float(lows.iloc[i]))/(price+1e-9)
+                h20 = float(highs.iloc[max(0,i-20):i].max() or price)
+                l20 = float(lows.iloc[max(0,i-20):i].min()  or price)
+                dist_from_high = (price-h20)/(h20+1e-9)
+                dist_from_low  = (price-l20)/(l20+1e-9)
+                absorption     = abs(float(highs.iloc[i])-float(lows.iloc[i]))/(price+1e-9)
 
-            # Earnings proximity
-            if earnings_dates and bar_date is not None:
-                days_to_earn  = min(abs((bar_date-ed).days) for ed in earnings_dates)
-                earn_near_5d  = 1 if days_to_earn<=5  else 0
-                earn_near_10d = 1 if days_to_earn<=10 else 0
-                earn_proximity = 1.0/(days_to_earn+1)
-            else:
-                days_to_earn=30; earn_near_5d=0; earn_near_10d=0; earn_proximity=0.0
+                # Earnings proximity
+                if earnings_dates and bar_date is not None:
+                    days_to_earn  = min(abs((bar_date-ed).days) for ed in earnings_dates)
+                    earn_near_5d  = 1 if days_to_earn<=5  else 0
+                    earn_near_10d = 1 if days_to_earn<=10 else 0
+                    earn_proximity = 1.0/(days_to_earn+1)
+                else:
+                    days_to_earn=30; earn_near_5d=0; earn_near_10d=0; earn_proximity=0.0
 
-            # IV term structure (static from latest options fetch)
-            iv_front     = front_iv
-            iv_back      = back_iv
-            iv_term_sprd = iv_term_spread
-            iv_ratio     = front_iv/(back_iv+1e-9)
+                # IV term structure (static from latest options fetch)
+                iv_front     = front_iv
+                iv_back      = back_iv
+                iv_term_sprd = iv_term_spread
+                iv_ratio     = front_iv/(back_iv+1e-9)
 
-            # P/C
-            pc_ratio      = pc_ratio_now
-            pc_delta_feat = 0.0  # live value used in inference
+                # P/C
+                pc_ratio      = pc_ratio_now
+                pc_delta_feat = 0.0  # live value used in inference
 
-            row = [
+                row = [
                 ret_1b, ret_3b, ret_6b, ret_12b, ret_48b,
                 rsi_14, rsi_6, rsi_ob, rsi_os, macd_hist,
                 vix_val, vix_high,
@@ -5753,13 +5756,15 @@ def _run_ml_retrain():
                 earn_proximity, earn_near_5d, earn_near_10d,
                 iv_front, iv_back, iv_term_sprd, iv_ratio,
                 pc_ratio, pc_delta_feat,
-            ]
-            X_rows.append(row)
-            future = float(closes.iloc[min(i+FORWARD, n-1)])
-            threshold = 1.0005 if FORWARD <= 2 else 1.001
-            y_rows.append(1 if future > price*threshold else 0)
-
-        print(f"[ML-RETRAIN] {len(X_rows)} samples, pos_rate={sum(y_rows)/max(len(y_rows),1):.2f}", flush=True)
+                ]
+                X_rows.append(row)
+                future = float(closes.iloc[min(i+FORWARD, n-1)])
+                threshold = 1.0005 if FORWARD <= 2 else 1.001
+                y_rows.append(1 if future > price*threshold else 0)
+            except Exception as _le:
+                skipped_errors += 1
+                if skipped_errors <= 3: print(f"[ML-RETRAIN] bar {i} err: {_le}", flush=True)
+        print(f"[ML-RETRAIN] {len(X_rows)} samples ({skipped_errors} errors), pos_rate={sum(y_rows)/max(len(y_rows),1):.2f}", flush=True)
         min_samples = 50 if FORWARD == 1 else 200   # daily bars need fewer samples
         if len(X_rows) < min_samples:
             print(f"[ML-RETRAIN] Not enough samples ({len(X_rows)} < {min_samples})", flush=True); return
@@ -6404,11 +6409,11 @@ def _get_ml_signal(features_dict):
         pkg = _load_ml_model()
         if pkg is None: return empty
         cols = pkg["feature_cols"]
-        # Reject stale model — new model has exactly 47 features
-        if len(cols) != 47:
-            return {**empty, "error": f"stale model ({len(cols)} feats) — retrain in progress"}
-        # Build feature row — missing keys default to 0 gracefully
+        # Accept any model — fill missing features with 0, ignore extras
+        # This lets the old pkl work while retrain is in progress
         row_data = {c: float(features_dict.get(c, 0) or 0) for c in cols}
+        # Flag if this is a stale model (old feature set)
+        _is_stale = len(cols) != 47
         X_df   = pd.DataFrame([row_data], columns=cols)
         X_s    = pkg["scaler"].transform(X_df)
         X_s_df = pd.DataFrame(X_s, columns=cols)
@@ -6448,6 +6453,7 @@ def _get_ml_signal(features_dict):
             "model_agreement":  round(agree, 2),
             "features_matched": matched,
             "features_total":   len(cols),
+            "stale":            _is_stale,
         }
     except Exception as e:
         return {**empty, "error": str(e)[:60]}
