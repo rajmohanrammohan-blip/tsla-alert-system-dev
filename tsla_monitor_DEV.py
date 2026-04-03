@@ -6239,6 +6239,106 @@ def api_schwab_test():
         results["account"] = {"error": str(e)}
     return jsonify(results)
 
+
+@app.route("/schwab-setup")
+def schwab_setup_page():
+    """Simple HTML page for Schwab OAuth setup — no URL encoding headaches."""
+    import schwab_client as sc
+    auth_url, err = sc.get_auth_url()
+    status = "connected" if (sc.is_configured() and sc.get_client()) else ("configured" if sc.is_configured() else "not configured")
+    html = """<!DOCTYPE html>
+<html>
+<head>
+<title>Schwab Setup</title>
+<style>
+body{font-family:monospace;background:#0a0e1a;color:#00e5ff;padding:40px;max-width:800px;margin:0 auto;}
+h1{color:#00ff88;}
+h2{color:#ffb300;margin-top:30px;}
+input{width:100%;padding:10px;background:#1a2030;border:1px solid #00e5ff;color:#fff;font-family:monospace;font-size:13px;border-radius:4px;box-sizing:border-box;}
+button{background:#00ff88;color:#000;border:none;padding:12px 24px;font-family:monospace;font-size:14px;font-weight:700;cursor:pointer;border-radius:4px;margin-top:10px;}
+button:hover{background:#00cc66;}
+.status{padding:10px;border-radius:4px;margin:10px 0;}
+.ok{background:rgba(0,255,136,0.1);border:1px solid #00ff88;color:#00ff88;}
+.warn{background:rgba(255,179,0,0.1);border:1px solid #ffb300;color:#ffb300;}
+.err{background:rgba(255,51,85,0.1);border:1px solid #ff3355;color:#ff3355;}
+pre{background:#1a2030;padding:15px;border-radius:4px;overflow-x:auto;font-size:12px;color:#69f0ae;white-space:pre-wrap;word-break:break-all;}
+a{color:#00e5ff;}
+</style>
+</head>
+<body>
+<h1>🔐 Schwab API Setup</h1>
+<div class="status STATUSCLASS">Status: STATUS</div>
+
+<h2>Step 1 — Open Schwab Login</h2>
+<p>Click the button below to open the Schwab login page in a new tab:</p>
+AUTH_BUTTON
+
+<h2>Step 2 — Paste Redirect URL</h2>
+<p>After logging in, your browser will redirect to <code>https://127.0.0.1/?code=...</code> and show an error. 
+Copy the <b>full URL</b> from your address bar and paste it below:</p>
+<input type="text" id="redirectUrl" placeholder="https://127.0.0.1/?code=C0.xxx&session=xxx&state=xxx" />
+<br>
+<button onclick="completeAuth()">Complete Auth</button>
+<div id="result"></div>
+
+<h2>Step 3 — Save Token</h2>
+<p>After completing auth above, copy the <code>token_json</code> value and add it as <code>SCHWAB_TOKEN_JSON</code> in Railway Variables.</p>
+
+<script>
+async function completeAuth() {
+    var url = document.getElementById('redirectUrl').value.trim();
+    if (!url) { alert('Paste the redirect URL first'); return; }
+    document.getElementById('result').innerHTML = '<p style="color:#ffb300">Completing auth...</p>';
+    try {
+        var resp = await fetch('/api/schwab/complete_auth_post', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({url: url})
+        });
+        var data = await resp.json();
+        if (data.success) {
+            document.getElementById('result').innerHTML = 
+                '<div class="status ok">✅ Auth complete!</div>' +
+                '<p>Copy this entire value and set it as <b>SCHWAB_TOKEN_JSON</b> in Railway:</p>' +
+                '<pre>' + JSON.stringify(JSON.parse(data.token_json), null, 2) + '</pre>';
+        } else {
+            document.getElementById('result').innerHTML = 
+                '<div class="status err">❌ Error: ' + (data.error || 'Unknown error') + '</div>';
+        }
+    } catch(e) {
+        document.getElementById('result').innerHTML = '<div class="status err">❌ ' + e.message + '</div>';
+    }
+}
+</script>
+</body>
+</html>""".replace("STATUS", status).replace("STATUSCLASS", "ok" if status=="connected" else "warn" if status=="configured" else "err")
+    
+    if auth_url:
+        btn = f'<a href="{auth_url}" target="_blank"><button>🔑 Open Schwab Login (new tab)</button></a>'
+    else:
+        btn = f'<div class="status err">Error: {err}</div>'
+    html = html.replace("AUTH_BUTTON", btn)
+    return html
+
+
+@app.route("/api/schwab/complete_auth_post", methods=["POST"])
+def api_schwab_complete_auth_post():
+    """POST version of complete_auth — accepts JSON body so URL encoding is not an issue."""
+    import schwab_client as sc
+    data = request.get_json() or {}
+    redirect_url = data.get("url", "").strip()
+    if not redirect_url:
+        return jsonify({"error": "Missing url in request body"}), 400
+    success, msg, token_json = sc.complete_auth_from_url(redirect_url)
+    if not success:
+        return jsonify({"error": msg}), 400
+    return jsonify({
+        "success":   True,
+        "message":   msg,
+        "next_step": "Copy token_json and set as SCHWAB_TOKEN_JSON in Railway Variables",
+        "token_json": token_json,
+    })
+
 @app.route("/health")
 def health(): return jsonify({"status": "ok"}), 200
 
