@@ -163,13 +163,14 @@ def get_price_history(symbol, period_years=2, freq_minutes=5):
         freq_type, freq = freq_map.get(freq_minutes, freq_map[5])
 
         # Schwab supports up to 10 years of 5-min data with YEAR period type
-        # Use start/end datetime for precise control — avoids Period enum confusion
+        # Schwab rule: MINUTE frequency MUST use periodType=DAY
+        # For longer history with start/end datetime, omit period_type entirely
         end_dt   = datetime.now()
         start_dt = end_dt - timedelta(days=int(365 * period_years))
 
         resp = client.get_price_history(
             symbol,
-            period_type              = C.PriceHistory.PeriodType.YEAR,
+            period_type              = C.PriceHistory.PeriodType.DAY if freq_minutes >= 1440 else None,
             frequency_type           = freq_type,
             frequency                = freq,
             start_datetime           = start_dt,
