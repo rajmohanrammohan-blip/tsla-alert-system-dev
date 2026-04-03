@@ -597,20 +597,37 @@ def complete_auth_from_url(redirected_url):
         return False, "Credentials not set", ""
     try:
         import schwab
-        ctx = schwab.auth.get_auth_context(SCHWAB_APP_KEY, SCHWAB_CALLBACK_URL)
+        from urllib.parse import urlparse, parse_qs
+
+        # Extract state from the redirected URL to reconstruct matching auth_context
+        parsed = urlparse(redirected_url)
+        params = parse_qs(parsed.query)
+        state  = params.get("state", [""])[0]
+
+        if not state:
+            return False, "No state parameter in redirect URL — make sure you copied the full URL", ""
+
+        # Reconstruct auth_context with the ORIGINAL state from the redirect
+        ctx = schwab.auth.AuthContext(
+            callback_url      = SCHWAB_CALLBACK_URL,
+            authorization_url = f"https://api.schwabapi.com/v1/oauth/authorize",
+            state             = state,
+        )
+
         client = schwab.auth.client_from_received_url(
-            api_key         = SCHWAB_APP_KEY,
-            app_secret      = SCHWAB_APP_SECRET,
-            authorization_response_url = redirected_url,
-            auth_context    = ctx,
+            api_key          = SCHWAB_APP_KEY,
+            app_secret       = SCHWAB_APP_SECRET,
+            received_url     = redirected_url,
+            auth_context     = ctx,
             token_write_func = _token_write,
         )
         global _client, _client_ts
         _client    = client
         _client_ts = time.time()
         token_str  = json.dumps(_token_cache)
-        return True, "Auth complete! Copy SCHWAB_TOKEN_JSON value from Railway logs.", token_str
+        return True, "Auth complete! Add token_json as SCHWAB_TOKEN_JSON in Railway Variables.", token_str
     except Exception as e:
+        import traceback
         return False, f"Auth failed: {e}", ""
 
 
