@@ -5598,6 +5598,11 @@ def _run_ml_retrain():
         from sklearn.model_selection import TimeSeriesSplit
         from sklearn.linear_model import LogisticRegression
         from sklearn.metrics import roc_auc_score
+        # Import schwab_client locally so sc is always defined in this scope
+        try:
+            import schwab_client as sc
+        except ImportError:
+            sc = None
 
         # 1. Fetch 6 months of 5-minute TSLA bars
         # Fetch price history — Schwab first (2yr 5-min), yfinance fallback
@@ -5606,7 +5611,7 @@ def _run_ml_retrain():
         use_intraday = False
 
         # Try Schwab (2 years of 5-min = ~58,000 bars)
-        if sc.is_configured() and sc.get_client():
+        if sc and sc.is_configured() and sc.get_client():
             try:
                 hist5 = sc.get_price_history("TSLA", period_years=2, freq_minutes=5)
                 if hist5 is not None and not hist5.empty and len(hist5) >= 500:
@@ -5661,7 +5666,7 @@ def _run_ml_retrain():
         try:
             spy5 = _pd_rt.DataFrame()
             # Try Schwab SPY (matches TSLA bar count)
-            if sc.is_configured() and sc.get_client() and use_intraday:
+            if sc and sc.is_configured() and sc.get_client() and use_intraday:
                 try:
                     spy5 = sc.get_price_history("SPY", period_years=2, freq_minutes=5)
                     if spy5 is None or spy5.empty: spy5 = _pd_rt.DataFrame()
