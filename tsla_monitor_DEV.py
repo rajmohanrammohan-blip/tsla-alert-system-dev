@@ -48,6 +48,38 @@ except ImportError:
 
 load_dotenv()
 
+# ── Schwab API client (optional — falls back to yfinance if not configured) ──
+try:
+    import schwab_client as sc
+    _SCHWAB_OK = sc.is_configured()
+    if _SCHWAB_OK:
+        print(f"[SCHWAB] Credentials found — Schwab API enabled", flush=True)
+    else:
+        print("[SCHWAB] No credentials — using yfinance (set SCHWAB_APP_KEY + SCHWAB_APP_SECRET)", flush=True)
+except ImportError:
+    print("[SCHWAB] schwab_client.py not found — using yfinance", flush=True)
+    class sc:
+        @staticmethod
+        def is_configured(): return False
+        @staticmethod
+        def get_client(): return None
+        @staticmethod
+        def get_quote(s): return {}
+        @staticmethod
+        def get_price_history(s, **kw):
+            import pandas as pd; return pd.DataFrame()
+        @staticmethod
+        def get_option_chain(s, **kw): return {}
+        @staticmethod
+        def get_positions(): return []
+        @staticmethod
+        def get_account_summary(): return {}
+        @staticmethod
+        def get_auth_url(): return None, "schwab_client.py not installed"
+        @staticmethod
+        def complete_auth_from_url(u): return False, "not installed", ""
+    _SCHWAB_OK = False
+
 # ─────────────────────────────────────────────
 #  CONFIG
 # ─────────────────────────────────────────────
@@ -4398,25 +4430,49 @@ def run_analysis():
     global last_signal
     print(f"\n[ANALYSIS] {TICKER} @ {datetime.now().strftime('%H:%M:%S')}...", flush=True)
     try:
-        # ── Fetch price history with retry ──
+        # ── Fetch price history — Schwab first, yfinance fallback ──
         hist = None
-        for _attempt in range(3):
+        if sc.is_configured() and sc.get_client():
             try:
-                hist = yf.Ticker(TICKER).history(period="6mo", interval="1d")
-                if not hist.empty:
-                    break
-                print(f"  ⚠️ yfinance returned empty data (attempt {_attempt+1}/3)")
-                time.sleep(2)
-            except Exception as _ye:
-                print(f"  ⚠️ yfinance fetch error (attempt {_attempt+1}/3): {_ye}")
-                time.sleep(2)
+                print(f"  📡 Fetching {TICKER} via Schwab API (5-min bars, 2yr)...", flush=True)
+                hist = sc.get_price_history(TICKER, period_years=2, freq_minutes=5)
+                if hist is not None and not hist.empty:
+                    print(f"  📡 Schwab: {len(hist)} bars loaded", flush=True)
+                else:
+                    hist = None
+            except Exception as _se:
+                print(f"  ⚠️ Schwab history failed: {_se} — falling back to yfinance", flush=True)
+                hist = None
+
+        if hist is None or (hasattr(hist, 'empty') and hist.empty):
+            for _attempt in range(3):
+                try:
+                    hist = yf.Ticker(TICKER).history(period="6mo", interval="1d")
+                    if not hist.empty:
+                        break
+                    print(f"  ⚠️ yfinance returned empty data (attempt {_attempt+1}/3)")
+                    time.sleep(2)
+                except Exception as _ye:
+                    print(f"  ⚠️ yfinance fetch error (attempt {_attempt+1}/3): {_ye}")
+                    time.sleep(2)
+
         if hist is None or hist.empty:
             print(f"[FATAL] Could not fetch {TICKER} data — retrying next cycle",flush=True)
             state.update({"signal":"WAIT","price":state.get("price",0),"market_state":"DATA UNAVAILABLE","last_updated":datetime.now().strftime("%H:%M:%S"),"signal_strength":0})
             return
         closes  = hist["Close"]
         volumes = hist["Volume"]
-        price   = round(closes.iloc[-1], 2)
+        price   = round(float(closes.iloc[-1]), 2)
+
+        # ── Real-time quote from Schwab (no 15-min delay) ──
+        if sc.is_configured() and sc.get_client():
+            try:
+                _rt = sc.get_quote(TICKER)
+                if _rt.get("price", 0) > 0:
+                    price = round(float(_rt["price"]), 2)
+                    print(f"  📡 Schwab real-time: ${price} ({_rt.get('change_pct',0):+.2f}%)", flush=True)
+            except Exception as _qe:
+                pass  # silently fall back to hist price
 
         rsi                    = calculate_rsi(closes)
         macd_val, macd_sig, macd_hist = calculate_macd(closes)
@@ -4481,9 +4537,36 @@ def run_analysis():
 
         # ══ MARKET MAKER ENGINE ══
         print("  🎰 Running Market Maker analysis...")
+        _schwab_opts = {}  # Schwab options data shared with UOA + ML
         try:
+            # Fetch Schwab options chain if available (gets real Greeks)
+            if sc.is_configured() and sc.get_client():
+                try:
+                    _schwab_opts = sc.get_option_chain(TICKER, current_price=price)
+                    if _schwab_opts.get("calls"):
+                        print(f"  📡 Schwab options: {len(_schwab_opts['calls'])} calls, "
+                              f"{len(_schwab_opts['puts'])} puts, "
+                              f"GEX={_schwab_opts.get('gex_total',0):.0f}M "
+                              f"PC={_schwab_opts.get('pc_ratio',0):.2f}", flush=True)
+                except Exception as _soe:
+                    print(f"  ⚠️ Schwab options failed: {_soe}", flush=True)
+                    _schwab_opts = {}
+
             mm_data   = calculate_market_maker_data(TICKER, price)
             dark_pool = calculate_dark_pool_levels(closes, volumes, highs, lows)
+
+            # Enhance mm_data with Schwab values where better
+            if _schwab_opts.get("gex_total") is not None:
+                mm_data["gex_total"]    = _schwab_opts["gex_total"]
+            if _schwab_opts.get("max_pain"):
+                mm_data["max_pain"]     = _schwab_opts["max_pain"]
+            if _schwab_opts.get("pc_ratio"):
+                mm_data["pc_ratio"]     = _schwab_opts["pc_ratio"]
+            if _schwab_opts.get("front_iv"):
+                mm_data["iv_front"]     = _schwab_opts["front_iv"]
+                mm_data["iv_back"]      = _schwab_opts.get("back_iv", _schwab_opts["front_iv"])
+                mm_data["iv_term_spread"] = _schwab_opts.get("iv_term_spread", 0)
+
         except Exception as _e:
             print(f"  ⚠️ Market maker error: {_e}")
             mm_data   = {"gex_total":0,"gex_signal":"ERROR","max_pain":None,"pc_ratio":None,"iv_rank":50,"iv_signal":"ERROR","hedging_pressure":"NEUTRAL","call_walls":[],"put_walls":[],"pin_risk":False,"zero_dte_risk":False}
@@ -4948,6 +5031,24 @@ def run_analysis():
                         _earn_near_10d   = 1 if _dte <= 10 else 0
             except Exception: pass
 
+            # NEW: Greeks from Schwab options chain
+            _delta_atm = 0.5; _gamma_exp = 0.0; _theta_atm = 0.0; _vega_atm = 0.0; _iv_skew = 0.0
+            try:
+                if _schwab_opts.get('calls'):
+                    _calls = _schwab_opts['calls']
+                    _puts  = _schwab_opts['puts']
+                    _atm_calls = sorted(_calls, key=lambda x: abs(x['strike']-price))[:5]
+                    _atm_puts  = sorted(_puts,  key=lambda x: abs(x['strike']-price))[:5]
+                    if _atm_calls:
+                        _delta_atm = float(sum(c['delta'] for c in _atm_calls) / len(_atm_calls))
+                        _theta_atm = float(sum(c['theta'] for c in _atm_calls) / len(_atm_calls))
+                        _vega_atm  = float(sum(c['vega']  for c in _atm_calls) / len(_atm_calls))
+                    _gamma_exp = float(_schwab_opts.get('gex_total', 0)) / (price + 1e-9)
+                    _call_iv = float(sum(c['iv'] for c in _atm_calls) / max(len(_atm_calls),1)) if _atm_calls else 0.3
+                    _put_iv  = float(sum(p['iv'] for p in _atm_puts)  / max(len(_atm_puts), 1)) if _atm_puts  else 0.3
+                    _iv_skew = _put_iv - _call_iv
+            except Exception: pass
+
             # NEW: IV term structure + P/C ratio (from mm_data / uoa_data)
             _iv_front    = float(mm_data.get("iv_front",    0.4) or 0.4)
             _iv_back     = float(mm_data.get("iv_back",     0.4) or 0.4)
@@ -5024,6 +5125,12 @@ def run_analysis():
                 # NEW: P/C ratio + delta
                 "pc_ratio":        _pc_ratio,
                 "pc_delta":        _pc_delta,
+                # NEW: Real Greeks from Schwab (0 if not available)
+                "delta_atm":       _delta_atm,
+                "gamma_exposure":  _gamma_exp,
+                "theta_decay":     _theta_atm,
+                "vega_exposure":   _vega_atm,
+                "iv_skew":         _iv_skew,
             }
             ml_signal = _get_ml_signal(_ml_features)
             state["ml_signal"] = ml_signal
@@ -5493,16 +5600,36 @@ def _run_ml_retrain():
         from sklearn.metrics import roc_auc_score
 
         # 1. Fetch 6 months of 5-minute TSLA bars
-        # Yahoo Finance limits 5-min bars to last 60 days max
-        print("[ML-RETRAIN] Fetching 60d 5-min TSLA bars...", flush=True)
-        try:
-            hist5 = yf.download("TSLA", period="60d", interval="5m",
-                                progress=False, auto_adjust=True)
-            if hasattr(hist5.columns, "levels"):
-                hist5.columns = hist5.columns.get_level_values(0)
-        except Exception:
-            hist5 = yf.Ticker("TSLA").history(period="60d", interval="5m")
-        use_intraday = not hist5.empty and len(hist5) >= 500
+        # Fetch price history — Schwab first (2yr 5-min), yfinance fallback
+        print("[ML-RETRAIN] Fetching price history...", flush=True)
+        hist5 = _pd_rt.DataFrame()
+        use_intraday = False
+
+        # Try Schwab (2 years of 5-min = ~58,000 bars)
+        if sc.is_configured() and sc.get_client():
+            try:
+                hist5 = sc.get_price_history("TSLA", period_years=2, freq_minutes=5)
+                if hist5 is not None and not hist5.empty and len(hist5) >= 500:
+                    use_intraday = True
+                    print(f"[ML-RETRAIN] Schwab: {len(hist5)} 5-min bars (2yr)", flush=True)
+                else:
+                    hist5 = _pd_rt.DataFrame()
+            except Exception as _sch_e:
+                print(f"[ML-RETRAIN] Schwab failed: {_sch_e}", flush=True)
+                hist5 = _pd_rt.DataFrame()
+
+        # Fallback: Yahoo 60d 5-min
+        if hist5.empty:
+            print("[ML-RETRAIN] Trying Yahoo 60d 5-min...", flush=True)
+            try:
+                hist5 = yf.download("TSLA", period="60d", interval="5m",
+                                    progress=False, auto_adjust=True)
+                if hasattr(hist5.columns, "levels"):
+                    hist5.columns = hist5.columns.get_level_values(0)
+                use_intraday = not hist5.empty and len(hist5) >= 500
+            except Exception:
+                hist5 = yf.Ticker("TSLA").history(period="60d", interval="5m")
+                use_intraday = not hist5.empty and len(hist5) >= 500
         if not use_intraday:
             print("[ML-RETRAIN] Trying 1h bars (730 day limit)...", flush=True)
             try:
@@ -5532,11 +5659,21 @@ def _run_ml_retrain():
         # 2. Fetch SPY for correlation regime
         print("[ML-RETRAIN] Fetching SPY...", flush=True)
         try:
-            try:
-                spy5 = yf.download("SPY", period="60d", interval="5m",
-                                   progress=False, auto_adjust=True)
-                if hasattr(spy5.columns, "levels"): spy5.columns = spy5.columns.get_level_values(0)
-            except Exception: spy5 = yf.Ticker("SPY").history(period="60d", interval="5m")
+            spy5 = _pd_rt.DataFrame()
+            # Try Schwab SPY (matches TSLA bar count)
+            if sc.is_configured() and sc.get_client() and use_intraday:
+                try:
+                    spy5 = sc.get_price_history("SPY", period_years=2, freq_minutes=5)
+                    if spy5 is None or spy5.empty: spy5 = _pd_rt.DataFrame()
+                    else: print(f"[ML-RETRAIN] Schwab SPY: {len(spy5)} bars", flush=True)
+                except Exception: spy5 = _pd_rt.DataFrame()
+            # Yahoo fallback
+            if spy5.empty:
+                try:
+                    spy5 = yf.download("SPY", period="60d", interval="5m",
+                                       progress=False, auto_adjust=True)
+                    if hasattr(spy5.columns, "levels"): spy5.columns = spy5.columns.get_level_values(0)
+                except Exception: spy5 = yf.Ticker("SPY").history(period="60d", interval="5m")
             if spy5.empty or len(spy5) < 500:
                 try:
                     spy5 = yf.download("SPY", period="730d", interval="1h",
@@ -5756,6 +5893,8 @@ def _run_ml_retrain():
                 earn_proximity, earn_near_5d, earn_near_10d,
                 iv_front, iv_back, iv_term_sprd, iv_ratio,
                 pc_ratio, pc_delta_feat,
+                # Greeks placeholders (live values used in inference)
+                0.5, 0.0, 0.0, 0.0, 0.0,
                 ]
                 X_rows.append(row)
                 future = float(closes.iloc[min(i+FORWARD, n-1)])
@@ -5791,6 +5930,8 @@ def _run_ml_retrain():
             "earn_proximity","earn_near_5d","earn_near_10d",
             "iv_front","iv_back","iv_term_spread","iv_ratio",
             "pc_ratio","pc_delta",
+            # Schwab Greeks (0 if not available)
+            "delta_atm","gamma_exposure","theta_decay","vega_exposure","iv_skew",
         ]
 
         assert len(feat_cols)==X.shape[1], f"Mismatch {len(feat_cols)} vs {X.shape[1]}"
@@ -5996,6 +6137,107 @@ def api_darthvader():
         })
     return jsonify(_sanitize(dv))
 
+
+
+
+# ── Schwab API Routes ─────────────────────────────────────────────────────────
+
+@app.route("/api/schwab/status")
+def api_schwab_status():
+    """Check Schwab connection status."""
+    configured = sc.is_configured()
+    client     = sc.get_client() if configured else None
+    connected  = client is not None
+    result = {
+        "configured": configured,
+        "connected":  connected,
+        "app_key_set":  bool(sc.SCHWAB_APP_KEY),
+        "secret_set":   bool(sc.SCHWAB_APP_SECRET),
+        "token_set":    bool(sc.SCHWAB_TOKEN_JSON and sc.SCHWAB_TOKEN_JSON != "PENDING"),
+        "source":       "schwab" if connected else "yfinance",
+    }
+    if connected:
+        try:
+            q = sc.get_quote(TICKER)
+            result["live_price"]   = q.get("price")
+            result["change_pct"]   = q.get("change_pct")
+            result["quote_source"] = q.get("source")
+        except Exception as e:
+            result["test_error"] = str(e)
+    return jsonify(result)
+
+
+@app.route("/api/schwab/auth_url")
+def api_schwab_auth_url():
+    """Step 1 of OAuth: get the Schwab login URL."""
+    url, err = sc.get_auth_url()
+    if err:
+        return jsonify({"error": err}), 400
+    return jsonify({
+        "auth_url": url,
+        "instructions": [
+            "1. Open auth_url in your browser",
+            "2. Log in with your Schwab credentials",
+            "3. You will be redirected to https://127.0.0.1?code=... (browser shows error — this is normal)",
+            "4. Copy the FULL URL from your browser address bar",
+            "5. Call /api/schwab/complete_auth?url=PASTE_URL_HERE",
+        ]
+    })
+
+
+@app.route("/api/schwab/complete_auth")
+def api_schwab_complete_auth():
+    """Step 2 of OAuth: complete with the redirect URL from browser."""
+    redirect_url = request.args.get("url", "")
+    if not redirect_url:
+        return jsonify({"error": "Missing ?url= parameter — paste the full redirect URL"}), 400
+    success, msg, token_json = sc.complete_auth_from_url(redirect_url)
+    if not success:
+        return jsonify({"error": msg}), 400
+    return jsonify({
+        "success":   True,
+        "message":   msg,
+        "next_step": "Add this as SCHWAB_TOKEN_JSON in Railway Variables, then redeploy",
+        "token_json": token_json,
+    })
+
+
+@app.route("/api/schwab/test")
+def api_schwab_test():
+    """Test all Schwab data endpoints."""
+    results = {"configured": sc.is_configured(), "connected": sc.get_client() is not None}
+    try:
+        q = sc.get_quote(TICKER)
+        results["quote"] = {"price": q.get("price"), "change_pct": q.get("change_pct"), "source": q.get("source")}
+    except Exception as e:
+        results["quote"] = {"error": str(e)}
+    try:
+        df = sc.get_price_history(TICKER, period_years=0.1, freq_minutes=5)
+        results["price_history"] = {"bars": len(df), "ok": len(df) > 0}
+    except Exception as e:
+        results["price_history"] = {"error": str(e)}
+    try:
+        opts = sc.get_option_chain(TICKER)
+        results["options"] = {
+            "calls": len(opts.get("calls", [])), "puts": len(opts.get("puts", [])),
+            "front_iv": opts.get("front_iv"), "pc_ratio": opts.get("pc_ratio"),
+            "gex": opts.get("gex_total"), "max_pain": opts.get("max_pain"),
+            "source": opts.get("source"),
+        }
+    except Exception as e:
+        results["options"] = {"error": str(e)}
+    try:
+        pos = sc.get_positions()
+        tsla = [p for p in pos if p.get("symbol") == TICKER]
+        results["positions"] = {"total": len(pos), "tsla": tsla[0] if tsla else None}
+    except Exception as e:
+        results["positions"] = {"error": str(e)}
+    try:
+        acct = sc.get_account_summary()
+        results["account"] = acct
+    except Exception as e:
+        results["account"] = {"error": str(e)}
+    return jsonify(results)
 
 @app.route("/health")
 def health(): return jsonify({"status": "ok"}), 200
@@ -6360,7 +6602,17 @@ def _load_ml_model():
         except Exception as _ae:
             print("  [ML] apt install libgomp1 failed: " + str(_ae), flush=True)
 
-    # Auto-install lightgbm if not present (Railway doesn't have it by default)
+    # Auto-install schwab-py and lightgbm if not present
+    for _pkg in ['schwab-py', 'lightgbm']:
+        try:
+            __import__(_pkg.replace('-','_'))
+        except ImportError:
+            try:
+                import subprocess as _sp, sys as _sys
+                _sp.check_call([_sys.executable, '-m', 'pip', 'install', _pkg, '--quiet'])
+                print(f'  [ML] {_pkg} installed', flush=True)
+            except Exception as _ie:
+                print(f'  [ML] Could not install {_pkg}: {_ie}', flush=True)
     try:
         import lightgbm as _lgbm_test  # noqa
     except (ImportError, OSError):
@@ -6413,7 +6665,7 @@ def _get_ml_signal(features_dict):
         # This lets the old pkl work while retrain is in progress
         row_data = {c: float(features_dict.get(c, 0) or 0) for c in cols}
         # Flag if this is a stale model (old feature set)
-        _is_stale = len(cols) != 47
+        _is_stale = len(cols) != 52
         X_df   = pd.DataFrame([row_data], columns=cols)
         X_s    = pkg["scaler"].transform(X_df)
         X_s_df = pd.DataFrame(X_s, columns=cols)
@@ -11192,7 +11444,7 @@ setTimeout(pollSpockStatus, 5000);
   <div class="panel" id="ml-panel" style="grid-column:1/-1;border:2px solid rgba(0,229,255,0.3);background:rgba(0,10,20,0.98);">
     <div class="panel-title" onclick="togglePanel('ml-panel')" style="cursor:pointer;">
       🧠 ML DIRECTIONAL SIGNAL
-      <span id="mlPanelHeader" style="font-size:9px;color:var(--text-dim);">ENSEMBLE · 47 FEATURES · AUC — · 5-MIN BARS</span>
+      <span id="mlPanelHeader" style="font-size:9px;color:var(--text-dim);">ENSEMBLE · 52 FEATURES · AUC — · SCHWAB + 5-MIN BARS</span>
       <span class="panel-collapse-btn" id="btn-ml-panel">▾</span>
     </div>
     <div style="display:grid;grid-template-columns:180px 1fr 1fr 1fr;gap:16px;align-items:start;">
@@ -12722,7 +12974,8 @@ def start_background_threads():
             "time_of_day","is_open","is_close","is_lunch","day_of_week","bb_pct",
             "dist_from_high","dist_from_low","absorption",
             "earn_proximity","earn_near_5d","earn_near_10d",
-            "iv_front","iv_back","iv_term_spread","iv_ratio","pc_ratio","pc_delta"
+            "iv_front","iv_back","iv_term_spread","iv_ratio","pc_ratio","pc_delta",
+            "delta_atm","gamma_exposure","theta_decay","vega_exposure","iv_skew"
         ]
     try:
         pkg = _load_ml_model()
