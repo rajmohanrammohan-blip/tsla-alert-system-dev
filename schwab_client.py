@@ -87,17 +87,17 @@ def _token_read():
     log.info(f"[SCHWAB] Token loaded OK (created: {parsed.get('creation_timestamp')})")
     return _token_cache
 
-def _token_write(token):
-    """Store updated token in memory (and log for Railway env var update)."""
+def _token_write(token, *args, **kwargs):
+    """Store updated token in memory. Accepts *args/**kwargs from schwab-py internals."""
     global _token_cache
     _token_cache = token
-    token_str = json.dumps(token)
-    # Log so Railway logs show the new token — operator can update env var
-    log.info(f"[SCHWAB] Token refreshed — update SCHWAB_TOKEN_JSON env var with: {token_str[:80]}...")
-    # Also try to write to /tmp for persistence within the session
+    token_str = json.dumps(token, separators=(',', ':'))
+    log.info(f"[SCHWAB] Token refreshed — SCHWAB_TOKEN_JSON updated in memory")
+    log.info(f"[SCHWAB] NEW TOKEN (update Railway env var): {token_str}")
+    # Persist to /tmp for within-session reuse
     try:
         with open("/tmp/schwab_token.json", "w") as f:
-            json.dump(token, f)
+            f.write(token_str)
     except Exception:
         pass
 
@@ -163,36 +163,22 @@ def get_price_history(symbol, period_years=2, freq_minutes=5):
         freq_type, freq = freq_map.get(freq_minutes, freq_map[5])
 
         # Schwab supports up to 10 years of 5-min data with YEAR period type
-        period_type = C.PriceHistory.PeriodType.YEAR
-        period_val  = min(period_years, 10)
-        if period_val == 1:
-            period = C.PriceHistory.Period.SIX_MONTHS
-        else:
-            # Use year count (1,2,3,5,10,15,20 are valid)
-            valid = [1, 2, 3, 5, 10, 15, 20]
-            period_val = min(valid, key=lambda x: abs(x - period_years))
-            period_enum_map = {
-                1: None,  # handled above
-                2: C.PriceHistory.Period.TWO_DAYS,   # not right but we override
-            }
-            # Actually use needByEndDate for precise control
-            period = C.PriceHistory.Period.FIFTEEN_YEARS  # max, we'll trim
-
+        # Use start/end datetime for precise control — avoids Period enum confusion
         end_dt   = datetime.now()
-        start_dt = end_dt - timedelta(days=365 * period_years)
+        start_dt = end_dt - timedelta(days=int(365 * period_years))
 
         resp = client.get_price_history(
             symbol,
-            period_type          = period_type,
-            frequency_type       = freq_type,
-            frequency            = freq,
-            start_datetime       = start_dt,
-            end_datetime         = end_dt,
+            period_type              = C.PriceHistory.PeriodType.YEAR,
+            frequency_type           = freq_type,
+            frequency                = freq,
+            start_datetime           = start_dt,
+            end_datetime             = end_dt,
             need_extended_hours_data = False,
         )
 
         if resp.status_code != 200:
-            log.warning(f"[SCHWAB] price_history HTTP {resp.status_code} — falling back to yfinance")
+            log.warning(f"[SCHWAB] price_history HTTP {resp.status_code} body={resp.text[:200]} — falling back to yfinance")
             return _yf_fallback_history(symbol, period_years, freq_minutes)
 
         data = resp.json()
