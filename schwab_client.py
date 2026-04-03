@@ -31,20 +31,61 @@ def is_configured():
     return bool(SCHWAB_APP_KEY and SCHWAB_APP_SECRET)
 
 def _token_read():
-    """Read token from env var or in-memory cache."""
+    """Read token from env var or in-memory cache. Handles multiple formats robustly."""
     global _token_cache
     if _token_cache:
         return _token_cache
-    if SCHWAB_TOKEN_JSON and SCHWAB_TOKEN_JSON.strip() not in ("PENDING", "", "null", "{}"):
-        try:
-            _token_cache = json.loads(SCHWAB_TOKEN_JSON)
-            return _token_cache
-        except Exception as e:
-            log.error(f"[SCHWAB] Token parse error: {e} — set SCHWAB_TOKEN_JSON via /schwab-setup")
-    else:
-        if SCHWAB_TOKEN_JSON == "PENDING":
+
+    raw = (SCHWAB_TOKEN_JSON or "").strip()
+    if not raw or raw in ("PENDING", "null", "{}", ""):
+        if raw == "PENDING":
             log.info("[SCHWAB] Token is PENDING — complete auth at /schwab-setup")
-    return None
+        return None
+
+    # Also check /tmp for token saved by _token_write during this session
+    if not raw or raw == "PENDING":
+        try:
+            with open("/tmp/schwab_token.json") as f:
+                raw = f.read().strip()
+        except Exception:
+            pass
+
+    try:
+        parsed = json.loads(raw)
+    except Exception as e:
+        log.error(f"[SCHWAB] Token JSON parse error: {e}")
+        log.error(f"[SCHWAB] First 100 chars of token: {repr(raw[:100])}")
+        log.error("[SCHWAB] Go to /schwab-setup to re-authenticate")
+        return None
+
+    # Handle case where user pasted the full /api/schwab/complete_auth response
+    # instead of just the token_json value inside it
+    if isinstance(parsed, dict) and "token_json" in parsed:
+        log.info("[SCHWAB] Detected full response format — extracting token_json")
+        inner = parsed["token_json"]
+        try:
+            parsed = json.loads(inner) if isinstance(inner, str) else inner
+        except Exception as e:
+            log.error(f"[SCHWAB] Could not parse inner token_json: {e}")
+            return None
+
+    # Handle double-encoded string (token_json was a string, not parsed)
+    if isinstance(parsed, str):
+        try:
+            parsed = json.loads(parsed)
+        except Exception as e:
+            log.error(f"[SCHWAB] Double-encoded token parse failed: {e}")
+            return None
+
+    # Validate it has the required schwab-py structure
+    if not isinstance(parsed, dict) or "creation_timestamp" not in parsed:
+        log.error(f"[SCHWAB] Token missing creation_timestamp — keys: {list(parsed.keys()) if isinstance(parsed, dict) else type(parsed)}")
+        log.error("[SCHWAB] Re-authenticate at /schwab-setup")
+        return None
+
+    _token_cache = parsed
+    log.info(f"[SCHWAB] Token loaded OK (created: {parsed.get('creation_timestamp')})")
+    return _token_cache
 
 def _token_write(token):
     """Store updated token in memory (and log for Railway env var update)."""
