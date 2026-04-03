@@ -35,12 +35,15 @@ def _token_read():
     global _token_cache
     if _token_cache:
         return _token_cache
-    if SCHWAB_TOKEN_JSON:
+    if SCHWAB_TOKEN_JSON and SCHWAB_TOKEN_JSON.strip() not in ("PENDING", "", "null", "{}"):
         try:
             _token_cache = json.loads(SCHWAB_TOKEN_JSON)
             return _token_cache
         except Exception as e:
-            log.error(f"[SCHWAB] Token parse error: {e}")
+            log.error(f"[SCHWAB] Token parse error: {e} — set SCHWAB_TOKEN_JSON via /schwab-setup")
+    else:
+        if SCHWAB_TOKEN_JSON == "PENDING":
+            log.info("[SCHWAB] Token is PENDING — complete auth at /schwab-setup")
     return None
 
 def _token_write(token):
