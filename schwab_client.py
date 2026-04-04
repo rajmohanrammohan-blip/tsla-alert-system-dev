@@ -111,40 +111,44 @@ def _token_write(token, *args, **kwargs):
 
 def _update_railway_token(token_str):
     """
-    Update SCHWAB_TOKEN_JSON in Railway via the Railway API.
-    Requires RAILWAY_API_TOKEN and RAILWAY_SERVICE_ID env vars.
-    These are set automatically by Railway — no manual setup needed.
+    Update SCHWAB_TOKEN_JSON in Railway via Railway's GraphQL API.
+    Requires RAILWAY_API_TOKEN env var (create at railway.app/account/tokens).
     """
     import threading
     def _do_update():
         try:
-            railway_token   = os.environ.get("RAILWAY_API_TOKEN", "")
-            service_id      = os.environ.get("RAILWAY_SERVICE_ID", "")
-            environment_id  = os.environ.get("RAILWAY_ENVIRONMENT_ID", "")
+            railway_token  = os.environ.get("RAILWAY_API_TOKEN", "")
+            project_id     = os.environ.get("RAILWAY_PROJECT_ID", "")
+            environment_id = os.environ.get("RAILWAY_ENVIRONMENT_ID", "")
+            service_id     = os.environ.get("RAILWAY_SERVICE_ID", "")
 
-            if not railway_token or not service_id:
-                # No Railway API access — just log the token for manual update
-                log.warning("[SCHWAB] No RAILWAY_API_TOKEN found — manual update needed")
-                log.warning(f"[SCHWAB] Copy this to SCHWAB_TOKEN_JSON in Railway: {token_str[:80]}...")
+            if not railway_token:
+                log.warning("[SCHWAB] RAILWAY_API_TOKEN not set — token won't persist across restarts")
+                log.warning(f"[SCHWAB] Current token: {token_str[:120]}...")
                 return
 
-            # Railway GraphQL API
+            if not service_id or not environment_id:
+                log.warning(f"[SCHWAB] Missing RAILWAY_SERVICE_ID={service_id} or RAILWAY_ENVIRONMENT_ID={environment_id}")
+                return
+
             import urllib.request
-            query = """
-            mutation UpsertVariables($input: ServiceVariablesUpsertInput!) {
-              serviceVariablesUpsert(input: $input)
-            }
-            """
-            variables = {
+
+            # Railway GraphQL v2 API
+            mutation = """
+mutation variableUpsert($input: VariableUpsertInput!) {
+  variableUpsert(input: $input)
+}
+"""
+            gql_vars = {
                 "input": {
-                    "serviceId":     service_id,
+                    "projectId":     project_id,
                     "environmentId": environment_id,
-                    "variables": {
-                        "SCHWAB_TOKEN_JSON": token_str
-                    }
+                    "serviceId":     service_id,
+                    "name":          "SCHWAB_TOKEN_JSON",
+                    "value":         token_str,
                 }
             }
-            payload = json.dumps({"query": query, "variables": variables}).encode()
+            payload = json.dumps({"query": mutation, "variables": gql_vars}).encode()
             req = urllib.request.Request(
                 "https://backboard.railway.app/graphql/v2",
                 data    = payload,
@@ -154,17 +158,19 @@ def _update_railway_token(token_str):
                 },
                 method = "POST"
             )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                result = json.loads(resp.read())
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                body   = resp.read()
+                result = json.loads(body)
                 if result.get("errors"):
-                    log.warning(f"[SCHWAB] Railway API error: {result['errors']}")
-                else:
+                    log.warning(f"[SCHWAB] Railway API errors: {result['errors']}")
+                elif result.get("data", {}).get("variableUpsert"):
                     log.info("[SCHWAB] ✅ SCHWAB_TOKEN_JSON auto-updated in Railway")
+                else:
+                    log.warning(f"[SCHWAB] Railway API unexpected response: {body[:200]}")
         except Exception as e:
             log.warning(f"[SCHWAB] Railway auto-update failed: {e}")
-            log.warning(f"[SCHWAB] Manually update SCHWAB_TOKEN_JSON with: {token_str[:80]}...")
+            log.warning(f"[SCHWAB] Add RAILWAY_API_TOKEN env var to enable auto-update")
 
-    # Run in background so it doesn't block the main thread
     threading.Thread(target=_do_update, daemon=True).start()
 
 def get_client():
