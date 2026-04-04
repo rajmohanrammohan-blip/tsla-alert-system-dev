@@ -106,7 +106,7 @@ WA_ENABLED     = bool(GREEN_INSTANCE and GREEN_TOKEN and GREEN_PHONE)
 ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY", "")   # Claude API key for Spock
 
 # Minimum minutes between the same type of alert (prevents spam)
-WA_THROTTLE_MIN = 15
+WA_THROTTLE_MIN = 60  # Increased to reduce spam
 
 SEC_HEADERS = {"User-Agent": "tsla-alert-system rajmohan.rammohan@gmail.com"}
 
@@ -964,7 +964,21 @@ def generate_signal(indicators, price):
         score -= 15; reasons.append("⚠ TSLA underperforming SPY — stock-specific selling pressure ▼")
 
     strength = min(abs(score), 100)
-    signal   = "BUY" if score >= 30 else "SELL" if score <= -30 else "HOLD"
+    # VIX-aware thresholds: in high-fear markets need more conviction to BUY
+    vix_now = indicators.get("vix", 20) or 20
+    if vix_now >= 30:
+        # Very high fear — require strong conviction
+        buy_thresh  = 45
+        sell_thresh = -20
+    elif vix_now >= 25:
+        # Elevated fear — moderate caution
+        buy_thresh  = 40
+        sell_thresh = -22
+    else:
+        # Normal — standard thresholds
+        buy_thresh  = 35
+        sell_thresh = -25
+    signal = "BUY" if score >= buy_thresh else "SELL" if score <= sell_thresh else "HOLD"
     return signal, strength, reasons
 
 
@@ -4060,11 +4074,11 @@ def calculate_entry_signals(closes, highs, lows, volumes, opens,
         entry_score = min(entry_score, 100)
         result["entry_score"] = entry_score
 
-        if   entry_score >= 65:
+        if   entry_score >= 70:
             result.update({"entry_urgency": "🟢 BUY NOW",    "entry_color": "#00ff88"})
-        elif entry_score >= 45:
+        elif entry_score >= 50:
             result.update({"entry_urgency": "📈 ACCUMULATE", "entry_color": "#69f0ae"})
-        elif entry_score >= 25:
+        elif entry_score >= 30:
             result.update({"entry_urgency": "👁 WATCH",      "entry_color": "var(--gold)"})
         else:
             result.update({"entry_urgency": "⏳ WAIT",       "entry_color": "var(--text-dim)"})
@@ -4085,9 +4099,9 @@ def calculate_entry_signals(closes, highs, lows, volumes, opens,
 
             # Scale deploy % by entry score — don't go all-in on weak signals
             score_factor = entry_score / 100.0
-            if   entry_score >= 65: max_deploy_pct = min(base_ratio * 100 * 0.9, 80)   # Up to 80%
-            elif entry_score >= 45: max_deploy_pct = min(base_ratio * 100 * 0.65, 55)  # Up to 55%
-            elif entry_score >= 25: max_deploy_pct = min(base_ratio * 100 * 0.35, 30)  # Up to 30%
+            if   entry_score >= 70: max_deploy_pct = min(base_ratio * 100 * 0.9, 80)   # Up to 80%
+            elif entry_score >= 50: max_deploy_pct = min(base_ratio * 100 * 0.65, 55)  # Up to 55%
+            elif entry_score >= 30: max_deploy_pct = min(base_ratio * 100 * 0.35, 30)  # Up to 30%
             else:                   max_deploy_pct = 0
 
             # Support levels for tranche prices
@@ -4312,9 +4326,9 @@ def calculate_peak_signals(closes, highs, lows, volumes, opens,
         # URGENCY
         peak_score = min(peak_score, 100)
         result["peak_score"] = peak_score
-        if   peak_score >= 65: result.update({"peak_urgency":"🚨 SELL NOW",   "peak_color":"#ff1744", "countdown_bars":1, "optimal_exit_window":"Exit immediately — reversal imminent"})
-        elif peak_score >= 45: result.update({"peak_urgency":"⚠️ NEAR TOP",   "peak_color":"#ff6d00", "countdown_bars":3, "optimal_exit_window":"Sell into next 1–3 day bounce — do not wait"})
-        elif peak_score >= 25: result.update({"peak_urgency":"👁 WATCH",      "peak_color":"#ffd600", "countdown_bars":7, "optimal_exit_window":"Reduce 25–50% at next resistance, trail stop"})
+        if   peak_score >= 70: result.update({"peak_urgency":"🚨 SELL NOW",   "peak_color":"#ff1744", "countdown_bars":1, "optimal_exit_window":"Exit immediately — reversal imminent"})
+        elif peak_score >= 50: result.update({"peak_urgency":"⚠️ NEAR TOP",   "peak_color":"#ff6d00", "countdown_bars":3, "optimal_exit_window":"Sell into next 1–3 day bounce — do not wait"})
+        elif peak_score >= 30: result.update({"peak_urgency":"👁 WATCH",      "peak_color":"#ffd600", "countdown_bars":7, "optimal_exit_window":"Reduce 25–50% at next resistance, trail stop"})
         else:                  result.update({"peak_urgency":"✅ CLEAR",      "peak_color":"#00ff88", "countdown_bars":None, "optimal_exit_window":"No topping signals — hold with stop below SAR"})
 
         try:
@@ -4599,6 +4613,7 @@ def run_analysis():
         indicators = {
             "rsi": rsi, "macd": macd_val, "macd_signal": macd_sig, "macd_hist": macd_hist,
             "prev_macd_hist": prev_macd_hist,
+            "vix": float(spy_data.get("vix", 20) or 20),  # for VIX-aware thresholds
             "bb_upper": bb_upper, "bb_mid": bb_mid, "bb_lower": bb_lower,
             "ema50": ema50, "ema200": ema200,
             "volume_ratio": vol_ratio,
@@ -4925,7 +4940,7 @@ def run_analysis():
         # ── Whale / UOA WhatsApp alert ──
         prev_uoa_whales = state.get("_prev_uoa_whales", 0)
         curr_uoa_whales = len(uoa_data.get("whale_alerts", []))
-        if curr_uoa_whales >= 2 and prev_uoa_whales < 2:
+        if curr_uoa_whales >= 5 and prev_uoa_whales < 5:  # Raised from 2→5 to reduce spam
             top_whale  = uoa_data.get("whale_alerts", [{}])[0]
             net_flow   = uoa_data.get("net_flow", "NEUTRAL")
             call_prem  = uoa_data.get("total_call_premium", 0)
@@ -5050,14 +5065,25 @@ def run_analysis():
             except Exception: pass
 
             # NEW: IV term structure + P/C ratio (from mm_data / uoa_data)
-            _iv_front    = float(mm_data.get("iv_front",    0.4) or 0.4)
-            _iv_back     = float(mm_data.get("iv_back",     0.4) or 0.4)
+            # IV term structure — try Schwab opts first, then mm_data fallback
+            _iv_front = 0.4; _iv_back = 0.4
+            if _schwab_opts.get("front_iv"):
+                _iv_front = float(_schwab_opts["front_iv"] or 0.4)
+                _iv_back  = float(_schwab_opts.get("back_iv", _iv_front) or _iv_front)
+            else:
+                _iv_front = float(mm_data.get("iv_front", 0.4) or 0.4)
+                _iv_back  = float(mm_data.get("iv_back",  _iv_front) or _iv_front)
             _iv_term_spd = _iv_back - _iv_front
             _iv_ratio    = _iv_front / (_iv_back + 1e-9)
-            _pc_ratio    = float(mm_data.get("pc_ratio",    1.0) or 1.0)
-            # P/C delta: change vs previous cycle
-            _pc_prev     = float(state.get("_ml_pc_prev",   _pc_ratio))
-            _pc_delta    = _pc_ratio - _pc_prev
+
+            # P/C ratio — Schwab opts first (more accurate), then mm_data
+            if _schwab_opts.get("pc_ratio"):
+                _pc_ratio = float(_schwab_opts["pc_ratio"] or 1.0)
+            else:
+                _pc_ratio = float(mm_data.get("pc_ratio", 1.0) or 1.0)
+            # P/C delta: change vs previous cycle (momentum of sentiment)
+            _pc_prev  = float(state.get("_ml_pc_prev", _pc_ratio))
+            _pc_delta = _pc_ratio - _pc_prev
             state["_ml_pc_prev"] = _pc_ratio
 
             _ml_features = {
@@ -5142,7 +5168,7 @@ def run_analysis():
         # ── Entry signal WhatsApp alert ──
         prev_entry = state.get("_prev_entry_score", 0)
         curr_entry = entry_data.get("entry_score", 0)
-        if curr_entry >= 45 and prev_entry < 45:
+        if curr_entry >= 50 and prev_entry < 50:  # Raised 45→50 to match ACCUMULATE tier
             tp = entry_data.get("tranche_plan", [])
             t1 = tp[0] if tp else {}
             t2 = tp[1] if len(tp) > 1 else {}
@@ -5167,7 +5193,7 @@ def run_analysis():
         # ── Peak signal WhatsApp alert ──
         prev_peak = state.get("_prev_peak_score", 0)
         curr_peak = peak_data.get("peak_score", 0)
-        if curr_peak >= 65 and prev_peak < 65:
+        if curr_peak >= 70 and prev_peak < 70:  # Raised 65→70
             top_tgt = peak_data.get("top_price_target", "?")
             hard_stop = peak_data.get("hard_stop", "?")
             top3_sigs = " | ".join(s["name"] for s in peak_data.get("signals", [])[:3])
@@ -5195,7 +5221,7 @@ def run_analysis():
 
         # ── Dashboard alert: exit urgency escalation ──
         prev_exit_score = state.get("_prev_exit_score", 0)
-        if exit_score >= 45 and prev_exit_score < 45:
+        if exit_score >= 55 and prev_exit_score < 55:  # Raised from 45→55 to reduce noise
             sell_low  = exit_analysis.get("optimal_sell_low", price)
             sell_high = exit_analysis.get("optimal_sell_high", price * 1.02)
             stop      = exit_analysis.get("stop_loss", price * 0.97)
@@ -6788,7 +6814,7 @@ def _get_ml_signal(features_dict):
 
         prob   = float(np.mean(probs))
         agree  = sum(1 for p in probs if p >= 0.5) / len(probs)
-        thresh = pkg.get("entry_thresh", 0.58)
+        thresh = pkg.get("entry_thresh", 0.60)  # Tightened default 0.58→0.60
 
         if prob >= thresh:         signal = "BUY"
         elif prob <= (1 - thresh): signal = "SELL"
@@ -6798,7 +6824,7 @@ def _get_ml_signal(features_dict):
         agreement_bonus  = round((abs(agree - 0.5) * 2) * 20)
         confidence       = min(100, base_conf + agreement_bonus)
 
-        matched = sum(1 for c in cols if c in features_dict and features_dict[c] != 0)
+        matched = sum(1 for c in cols if c in features_dict)  # count all present features
         return {
             "signal":           signal,
             "confidence":       confidence,
