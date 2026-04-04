@@ -253,7 +253,10 @@ def get_option_chain(symbol, current_price=None):
             strategy          = C.Options.Strategy.SINGLE,
         )
 
-        if resp.status_code != 200:
+        if resp.status_code == 503:
+            log.warning(f"[SCHWAB] option_chain HTTP 503 — market may be closed, using yfinance")
+            return _yf_fallback_options(symbol)
+        elif resp.status_code != 200:
             log.warning(f"[SCHWAB] option_chain HTTP {resp.status_code}")
             return _yf_fallback_options(symbol)
 
@@ -426,8 +429,8 @@ def _yf_fallback_options(symbol):
             chain = tkr.option_chain(exp)
             for _, row in chain.calls.iterrows():
                 iv   = float(row.get("impliedVolatility", 0.3) or 0.3)
-                vol  = int(row.get("volume", 0) or 0)
-                oi   = int(row.get("openInterest", 0) or 0)
+                _rv  = row.get("volume", 0); vol = int(_rv) if _rv == _rv else 0
+                _ro  = row.get("openInterest", 0); oi = int(_ro) if _ro == _ro else 0
                 mid  = float(row.get("lastPrice", 0) or 0)
                 prem = vol * mid * 100
                 total_call_prem += prem
@@ -436,8 +439,8 @@ def _yf_fallback_options(symbol):
                                     "delta":0,"gamma":0,"theta":0,"vega":0})
             for _, row in chain.puts.iterrows():
                 iv   = float(row.get("impliedVolatility", 0.3) or 0.3)
-                vol  = int(row.get("volume", 0) or 0)
-                oi   = int(row.get("openInterest", 0) or 0)
+                _rv  = row.get("volume", 0); vol = int(_rv) if _rv == _rv else 0
+                _ro  = row.get("openInterest", 0); oi = int(_ro) if _ro == _ro else 0
                 mid  = float(row.get("lastPrice", 0) or 0)
                 prem = vol * mid * 100
                 total_put_prem += prem
