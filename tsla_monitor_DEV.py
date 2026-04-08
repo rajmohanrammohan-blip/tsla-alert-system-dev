@@ -4570,12 +4570,17 @@ def run_analysis():
             dark_pool = calculate_dark_pool_levels(closes, volumes, highs, lows)
 
             # Enhance mm_data with Schwab values where better
+            # Always override GEX with Schwab value (more accurate than approximation)
             if _schwab_opts.get("gex_total") is not None:
-                mm_data["gex_total"]    = _schwab_opts["gex_total"]
+                mm_data["gex_total"]    = float(_schwab_opts["gex_total"])
+                # Also recompute gex_signal based on Schwab GEX
+                gex_v = float(_schwab_opts["gex_total"])
+                mm_data["gex_signal"] = "POSITIVE" if gex_v > 50 else "NEGATIVE" if gex_v < -50 else "NEUTRAL"
             if _schwab_opts.get("max_pain"):
                 mm_data["max_pain"]     = _schwab_opts["max_pain"]
-            if _schwab_opts.get("pc_ratio"):
+            if _schwab_opts.get("pc_ratio") and float(_schwab_opts["pc_ratio"]) > 0.01:
                 mm_data["pc_ratio"]     = _schwab_opts["pc_ratio"]
+            # else keep yfinance OI-based PC ratio from calculate_market_maker_data
             if _schwab_opts.get("front_iv"):
                 mm_data["iv_front"]     = _schwab_opts["front_iv"]
                 mm_data["iv_back"]      = _schwab_opts.get("back_iv", _schwab_opts["front_iv"])
