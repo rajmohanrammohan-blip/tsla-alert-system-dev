@@ -436,7 +436,15 @@ def get_option_chain(symbol, current_price=None):
             back_iv  = float(sum(c["iv"] for c in back_calls) / max(len(back_calls), 1))
 
         # PC ratio
-        pc_ratio = total_put_vol / max(total_call_vol, 1)
+        # Use volume-based PC if available, fall back to OI-based for pre-market
+        if total_call_vol > 10:
+            pc_ratio = total_put_vol / max(total_call_vol, 1)
+        else:
+            # Pre-market: no volume yet — compute from open interest instead
+            total_call_oi_s = sum(c.get("oi", 0) for c in calls_list)
+            total_put_oi_s  = sum(p.get("oi", 0) for p in puts_list)
+            pc_ratio = total_put_oi_s / max(total_call_oi_s, 1) if total_call_oi_s > 0 else 1.0
+            log.info(f"[SCHWAB] Pre-market: using OI-based PC ratio = {pc_ratio:.2f}")
 
         # Max pain: strike where option sellers (MMs) lose least
         max_pain = _calc_max_pain(calls_list, puts_list, price)
@@ -467,16 +475,26 @@ def get_option_chain(symbol, current_price=None):
 
 
 def _calc_max_pain(calls, puts, current_price):
-    """Calculate max pain strike (where total option value is minimized for buyers)."""
+    """Calculate max pain strike — filter to relevant strikes within 20% of price."""
     try:
-        strikes = sorted(set(c["strike"] for c in calls) | set(p["strike"] for p in puts))
+        lo = current_price * 0.80
+        hi = current_price * 1.20
+        # Filter to relevant strikes only (deep OTM distorts calculation)
+        rel_calls = [c for c in calls if lo <= c["strike"] <= hi]
+        rel_puts  = [p for p in puts  if lo <= p["strike"] <= hi]
+        if not rel_calls and not rel_puts:
+            rel_calls, rel_puts = calls, puts  # fallback to all if filtered too aggressively
+
+        strikes = sorted(set(c["strike"] for c in rel_calls) | set(p["strike"] for p in rel_puts))
         if not strikes:
             return round(current_price / 5) * 5
 
         min_pain, max_pain_strike = float("inf"), strikes[0]
         for test_strike in strikes:
-            call_pain = sum(max(0, test_strike - c["strike"]) * c["oi"] for c in calls)
-            put_pain  = sum(max(0, p["strike"] - test_strike) * p["oi"] for p in puts)
+            call_pain = sum(max(0, test_strike - c["strike"]) * (c.get("oi", 0) or 0)
+                           for c in rel_calls)
+            put_pain  = sum(max(0, p["strike"] - test_strike) * (p.get("oi", 0) or 0)
+                           for p in rel_puts)
             total = call_pain + put_pain
             if total < min_pain:
                 min_pain = total
