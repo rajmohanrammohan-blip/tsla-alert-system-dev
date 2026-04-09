@@ -115,6 +115,9 @@ app = Flask(__name__)
 # ─────────────────────────────────────────────
 #  GLOBAL STATE
 # ─────────────────────────────────────────────
+# Alert quality tracking — stores outcomes of past alerts
+_alert_outcomes = []   # [{alert_key, signal, price_at_alert, price_after_1h, price_after_1d, profitable}]
+
 state = {
     "price": None,
     "signal": "HOLD",
@@ -2826,14 +2829,17 @@ def fetch_news():
     except Exception as e:
         print(f"  ⚠️ Yahoo Finance news error: {e}")
 
-    # ── Source 2: RSS feeds — Reuters, MarketWatch, Benzinga ──
+    # ── Source 2: RSS feeds — using reliable sources that work on Railway ──
     rss_feeds = [
-        ("Reuters",     "https://feeds.reuters.com/reuters/businessNews"),
-        ("MarketWatch", "https://feeds.content.dowjones.io/public/rss/mw_topstories"),
-        ("Benzinga",    "https://www.benzinga.com/feed"),
-        ("Seeking Alpha","https://seekingalpha.com/feed/tesla-tsla"),
-        ("Electrek",    "https://electrek.co/feed/"),
-        ("CNBC",        "https://www.cnbc.com/id/100003114/device/rss/rss.html"),
+        # Ticker-specific feeds (most reliable)
+        ("Benzinga",       f"https://www.benzinga.com/stock/{TICKER.lower()}/feed"),
+        ("Yahoo Finance",  f"https://finance.yahoo.com/rss/headline?s={TICKER}"),
+        ("Finviz",         f"https://finviz.com/rss.ashx?t={TICKER}"),
+        # Market-wide feeds
+        ("MarketWatch",    "https://feeds.content.dowjones.io/public/rss/mw_topstories"),
+        ("Investopedia",   "https://www.investopedia.com/feedbuilder/feed/getfeed?feedName=rss_headline"),
+        ("Electrek",       "https://electrek.co/feed/"),
+        ("Seeking Alpha",  f"https://seekingalpha.com/feed/symbol/{TICKER}"),
     ]
 
     rss_headers = {
@@ -4397,6 +4403,23 @@ def send_whatsapp(message, alert_key="default"):
         print(f"🔔 ALERT (WhatsApp off): {message[:80]}...")
         return False
     # Throttle: don't resend same alert type within WA_THROTTLE_MIN minutes
+    # Track alert for quality scoring
+    _cur_price = state.get("price", 0) or 0
+    _cur_signal = state.get("signal", "HOLD")
+    _alert_outcomes.append({
+        "alert_key":  alert_key,
+        "signal":     _cur_signal,
+        "price":      _cur_price,
+        "timestamp":  time.time(),
+        "ticker":     TICKER,
+    })
+    # Keep last 500 alerts
+    if len(_alert_outcomes) > 500:
+        _alert_outcomes.pop(0)
+    # Check outcomes of past alerts
+    for _past in _alert_outcomes[-50:]:
+        _check_alert_outcome(_past, _cur_price)
+
     last = _last_wa_send.get(alert_key)
     if last and (datetime.now() - last).total_seconds() < WA_THROTTLE_MIN * 60:
         print(f"⏳ WhatsApp throttled ({alert_key}) — {WA_THROTTLE_MIN}min cooldown")
@@ -4426,6 +4449,72 @@ def send_whatsapp(message, alert_key="default"):
     except Exception as e:
         print(f"❌ WhatsApp error: {e}")
         return False
+
+
+def _check_alert_outcome(alert_entry, current_price):
+    """Check if a past alert was profitable. Called on each analysis cycle."""
+    try:
+        import time as _t
+        alert_time  = alert_entry.get("timestamp", 0)
+        alert_price = float(alert_entry.get("price", current_price) or current_price)
+        signal      = alert_entry.get("signal", "HOLD")
+        elapsed_h   = (time.time() - alert_time) / 3600
+
+        if signal == "HOLD" or alert_price <= 0:
+            return
+
+        price_chg = (current_price - alert_price) / alert_price * 100
+
+        # 1-hour outcome
+        if elapsed_h >= 1.0 and not alert_entry.get("outcome_1h"):
+            profitable = (signal == "BUY" and price_chg > 0) or (signal == "SELL" and price_chg < 0)
+            alert_entry["outcome_1h"]   = round(price_chg, 2)
+            alert_entry["profit_1h"]    = profitable
+            alert_entry["price_1h"]     = round(current_price, 2)
+
+        # 1-day outcome
+        if elapsed_h >= 24.0 and not alert_entry.get("outcome_1d"):
+            profitable = (signal == "BUY" and price_chg > 0) or (signal == "SELL" and price_chg < 0)
+            alert_entry["outcome_1d"]   = round(price_chg, 2)
+            alert_entry["profit_1d"]    = profitable
+            alert_entry["price_1d"]     = round(current_price, 2)
+    except Exception:
+        pass
+
+
+def _get_alert_scorecard():
+    """Compute win rates for each alert type."""
+    scorecard = {}
+    for entry in _alert_outcomes[-200:]:   # last 200 alerts
+        key    = entry.get("alert_key", "unknown")
+        signal = entry.get("signal", "?")
+        label  = f"{key}_{signal}" if signal not in key else key
+
+        if label not in scorecard:
+            scorecard[label] = {"total": 0, "win_1h": 0, "win_1d": 0, "avg_chg_1h": [], "avg_chg_1d": []}
+
+        scorecard[label]["total"] += 1
+        if entry.get("outcome_1h") is not None:
+            if entry.get("profit_1h"):
+                scorecard[label]["win_1h"] += 1
+            scorecard[label]["avg_chg_1h"].append(entry["outcome_1h"])
+        if entry.get("outcome_1d") is not None:
+            if entry.get("profit_1d"):
+                scorecard[label]["win_1d"] += 1
+            scorecard[label]["avg_chg_1d"].append(entry["outcome_1d"])
+
+    # Compute averages
+    result = {}
+    for label, s in scorecard.items():
+        n1h = len(s["avg_chg_1h"]); n1d = len(s["avg_chg_1d"])
+        result[label] = {
+            "total":       s["total"],
+            "win_rate_1h": round(s["win_1h"] / max(n1h, 1) * 100, 1) if n1h > 0 else None,
+            "win_rate_1d": round(s["win_1d"] / max(n1d, 1) * 100, 1) if n1d > 0 else None,
+            "avg_chg_1h":  round(sum(s["avg_chg_1h"]) / max(n1h, 1), 2) if n1h > 0 else None,
+            "avg_chg_1d":  round(sum(s["avg_chg_1d"]) / max(n1d, 1), 2) if n1d > 0 else None,
+        }
+    return result
 
 
 def log_alert(message, alert_key="default"):
@@ -4927,8 +5016,14 @@ def run_analysis():
                     tranches_txt = f"\n💰 *Entry Plan ({entry_data.get('total_deploy_pct',0)}% of capital):*\n" + tranches_txt
                     tranches_txt += f"  🛑 Invalidation: ${entry_data.get("invalidation","?")}"
 
+            # Earnings mode warning
+            _earn_ctx = state.get("earnings_context", {})
+            _earn_warn = ""
+            if _earn_ctx.get("earnings_mode"):
+                _earn_warn = f"\n⚠️ *EARNINGS IN {_earn_ctx.get('days_away','?')} DAYS* — use tighter stops, expect IV crush after\n"
+
             wa_msg = (
-                f"{emoji} TSLA *{signal} SIGNAL*\n"
+                f"{emoji} {TICKER} *{signal} SIGNAL*\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"💰 Price: *${price}* | Strength: *{strength}/100*\n"
                 f"\n"
@@ -4942,6 +5037,7 @@ def run_analysis():
                 f"\n"
                 f"⏰ Pre-Mkt: {pm_pct:+.1f}% | 📰 News: {news_s}\n"
                 f"🧠 HMM: {regime_str} | ☁ Cloud: {cloud_str}\n"
+                f"{_earn_warn}"
                 f"{tranches_txt}\n"
                 f"📌 *Why:*\n  {top3}"
             )
@@ -5039,29 +5135,48 @@ def run_analysis():
             _tsla_spy_corr = float(spy_data.get("correlation_60d", 0) or 0)
             _spy_decouple  = 1 if abs(_tsla_spy_corr) < 0.4 else 0
 
-            # NEW: Earnings proximity — use cached pkg values if available
+            # NEW: Earnings proximity — cached, with earnings mode detection
             _earn_proximity = 0.0; _earn_near_5d = 0; _earn_near_10d = 0
+            _earn_days_away = 99; _earnings_mode = False
             try:
-                _pkg_ref = _ml_model_cache  # may be None before first retrain
-                if _pkg_ref:
-                    # Fetch earnings dates (cached via state to avoid repeat calls)
-                    _earn_dates = state.get("_ml_earn_dates", [])
-                    if not _earn_dates:
-                        try:
-                            _ec = yf.Ticker(TICKER).get_earnings_dates(limit=8)
-                            if _ec is not None and not _ec.empty:
-                                _earn_dates = [d.date() if hasattr(d,"date") else d
-                                               for d in _ec.index.tolist()]
-                                state["_ml_earn_dates"] = _earn_dates
-                        except Exception:
-                            pass
-                    if _earn_dates:
-                        import datetime as _dt2
-                        _today = _dt2.date.today()
-                        _dte   = min(abs((_today - ed).days) for ed in _earn_dates)
-                        _earn_proximity  = 1.0 / (_dte + 1)
-                        _earn_near_5d    = 1 if _dte <= 5  else 0
-                        _earn_near_10d   = 1 if _dte <= 10 else 0
+                _earn_dates = state.get("_ml_earn_dates", [])
+                _earn_ticker = state.get("_ml_earn_ticker", "")
+                # Refresh earnings if ticker changed or cache empty
+                if not _earn_dates or _earn_ticker != TICKER:
+                    try:
+                        _ec = yf.Ticker(TICKER).get_earnings_dates(limit=10)
+                        if _ec is not None and not _ec.empty:
+                            _earn_dates = [d.date() if hasattr(d,"date") else d
+                                           for d in _ec.index.tolist()]
+                            state["_ml_earn_dates"] = _earn_dates
+                            state["_ml_earn_ticker"] = TICKER
+                    except Exception:
+                        pass
+                if _earn_dates:
+                    import datetime as _dt2
+                    _today = _dt2.date.today()
+                    _future = [ed for ed in _earn_dates if ed >= _today]
+                    if _future:
+                        _dte = min(abs((_today - ed).days) for ed in _future)
+                    else:
+                        _dte = 99
+                    _earn_days_away  = _dte
+                    _earn_proximity  = 1.0 / (_dte + 1)
+                    _earn_near_5d    = 1 if _dte <= 5  else 0
+                    _earn_near_10d   = 1 if _dte <= 10 else 0
+                    _earnings_mode   = _dte <= 7  # within 1 week of earnings
+
+                    if _earnings_mode:
+                        print(f"  ⚠️ EARNINGS MODE: {TICKER} earnings in {_dte} days!", flush=True)
+
+                # Store earnings context in state for dashboard
+                state["earnings_context"] = {
+                    "days_away":      _earn_days_away,
+                    "earnings_mode":  _earnings_mode,
+                    "near_5d":        bool(_earn_near_5d),
+                    "near_10d":       bool(_earn_near_10d),
+                    "next_date":      str(_future[0]) if _earn_dates and _future else "Unknown",
+                }
             except Exception: pass
 
             # NEW: Greeks from Schwab options chain
@@ -5178,7 +5293,10 @@ def run_analysis():
             }
             ml_signal = _get_ml_signal(_ml_features)
             state["ml_signal"] = ml_signal
-            print(f"  [ML] signal={ml_signal.get('signal')} confidence={ml_signal.get('confidence')} available={ml_signal.get('available')} matched={ml_signal.get('features_matched','?')}/{ml_signal.get('features_total','?')} err={ml_signal.get('error','')}", flush=True)
+            _regime_str = ml_signal.get('regime', '')
+            print(f"  [ML] signal={ml_signal.get('signal')} conf={ml_signal.get('confidence')} "
+                  f"regime={_regime_str} matched={ml_signal.get('features_matched','?')}/{ml_signal.get('features_total','?')} "
+                  f"avail={ml_signal.get('available')} err={ml_signal.get('error','')}", flush=True)
         except Exception as _ml_e:
             state["ml_signal"] = {"signal":"HOLD","confidence":0,"probability":0.5,"available":False,"error":str(_ml_e)[:60]}
             print(f"  [ML] EXCEPTION: {_ml_e}", flush=True)
@@ -5425,7 +5543,14 @@ def api_switch_ticker():
         # Reset state
         state.clear()
         state.update({"ticker": TICKER, "darthvader": {}, "last_updated": None})
-        print(f"  🔄 Ticker switched to {TICKER}")
+        print(f"  🔄 Ticker switched to {TICKER}", flush=True)
+        # Clear ML cache so new ticker gets its own model
+        global _ml_model_cache, _ml_load_errors
+        _ml_model_cache = None
+        _ml_load_errors = []
+        # Trigger retrain for new ticker in background
+        threading.Thread(target=_run_ml_retrain, daemon=True).start()
+        print(f"  🤖 ML retrain queued for {TICKER}", flush=True)
         # Trigger async analysis
         import threading
         threading.Thread(target=run_analysis, daemon=True).start()
@@ -5625,6 +5750,49 @@ def api_refresh():
 
 
 
+def _save_regime_models(X_df, y, feat_cols, scaler, models_trained, base_pkg):
+    """Save regime-specific models trained on regime-filtered data."""
+    import pickle, numpy as np
+
+    # Regime columns in feature set
+    vix_col    = "vix"       if "vix"          in feat_cols else None
+    earn_col   = "earn_near_5d" if "earn_near_5d" in feat_cols else None
+    trend_col  = "trend_score"  if "trend_score"  in feat_cols else None
+
+    regimes = {}
+    if vix_col:
+        regimes["high_vix"] = X_df[vix_col] >= 30
+        regimes["low_vix"]  = X_df[vix_col] <= 15
+    if earn_col:
+        regimes["earnings"] = X_df[earn_col] == 1
+    if trend_col:
+        regimes["trending"] = X_df[trend_col].abs() >= 7
+
+    for regime_name, mask in regimes.items():
+        try:
+            n = mask.sum()
+            if n < 100:
+                print(f"[REGIME] {regime_name}: only {n} samples, skipping", flush=True)
+                continue
+            Xr = X_df[mask]; yr = y[mask]
+            regime_models = []
+            for m in models_trained:
+                try:
+                    import copy
+                    rm = copy.deepcopy(m)
+                    rm.fit(Xr, yr)
+                    regime_models.append(rm)
+                except Exception: pass
+            if not regime_models: continue
+            pkg = {**base_pkg, "models": regime_models, "model": regime_models[0],
+                   "n_samples": int(n), "regime": regime_name}
+            path = f"/app/{TICKER.lower()}_model_{regime_name}.pkl"
+            with open(path, "wb") as f: pickle.dump(pkg, f)
+            print(f"[REGIME] Saved {regime_name} model ({n} samples)", flush=True)
+        except Exception as e:
+            print(f"[REGIME] {regime_name} failed: {e}", flush=True)
+
+
 def _run_ml_retrain():
     """
     Enhanced ML retrain:
@@ -5657,7 +5825,7 @@ def _run_ml_retrain():
         # Try Schwab (2 years of 5-min = ~58,000 bars)
         if sc and sc.is_configured() and sc.get_client():
             try:
-                hist5 = sc.get_price_history("TSLA", period_years=2, freq_minutes=5)
+                hist5 = sc.get_price_history(TICKER, period_years=2, freq_minutes=5)
                 if hist5 is not None and not hist5.empty and len(hist5) >= 500:
                     use_intraday = True
                     print(f"[ML-RETRAIN] Schwab: {len(hist5)} 5-min bars (2yr)", flush=True)
@@ -5671,7 +5839,7 @@ def _run_ml_retrain():
         if hist5.empty:
             print("[ML-RETRAIN] Trying Yahoo 60d 5-min...", flush=True)
             try:
-                hist5 = yf.download("TSLA", period="60d", interval="5m",
+                hist5 = yf.download(TICKER, period="60d", interval="5m",
                                     progress=False, auto_adjust=True)
                 if hasattr(hist5.columns, "levels"):
                     hist5.columns = hist5.columns.get_level_values(0)
@@ -5777,7 +5945,7 @@ def _run_ml_retrain():
                 import lxml
             except ImportError:
                 _subp.check_call([_sys.executable, "-m", "pip", "install", "lxml", "--quiet"])
-            cal = yf.Ticker("TSLA").get_earnings_dates(limit=20)
+            cal = yf.Ticker(TICKER).get_earnings_dates(limit=20)
             if cal is not None and not cal.empty:
                 earnings_dates = [d.date() if hasattr(d,"date") else d for d in cal.index.tolist()]
             print(f"[ML-RETRAIN] Earnings: {len(earnings_dates)} dates loaded", flush=True)
@@ -6068,8 +6236,13 @@ def _run_ml_retrain():
             "iv_back_ref":  back_iv,
             "pc_ratio_ref": pc_ratio_now,
         }
-        pkl_path = "/app/tsla_model.pkl"
+        pkl_path = f"/app/{TICKER.lower()}_model.pkl"
         with open(pkl_path,"wb") as f: pickle.dump(pkg,f)
+
+        # Also save regime-specific models by splitting training data
+        try:
+            _save_regime_models(X_df, y, feat_cols, scaler, models_trained, pkg)
+        except Exception as _re: print(f"[ML-RETRAIN] Regime models: {_re}", flush=True)
         _ml_model_cache = pkg
         _ml_load_errors = []
         print(f"[ML-RETRAIN] Saved — {pkg['model_name']} AUC={auc:.3f} on {len(X)} bars, {len(feat_cols)} features.", flush=True)
@@ -6102,9 +6275,12 @@ def api_debug_ml():
     # 1. Check all candidate paths
     _script_dir = os.path.dirname(os.path.abspath(__file__))
     _paths = [
+        f"{TICKER.lower()}_model.pkl", f"./{TICKER.lower()}_model.pkl",
+        f"/app/{TICKER.lower()}_model.pkl",
+        os.path.join(_script_dir, f"{TICKER.lower()}_model.pkl"),
+        os.path.join(os.getcwd(), f"{TICKER.lower()}_model.pkl"),
+        # fallback to tsla model for backward compat
         "tsla_model.pkl", "./tsla_model.pkl", "/app/tsla_model.pkl",
-        os.path.join(_script_dir, "tsla_model.pkl"),
-        os.path.join(os.getcwd(), "tsla_model.pkl"),
     ]
     result["cwd"]         = os.getcwd()
     result["script_dir"]  = _script_dir
@@ -6125,6 +6301,8 @@ def api_debug_ml():
         result["auc"]          = _ml_model_cache.get("auc", 0)
     # 4. Show last ML signal from state
     result["ml_signal"] = state.get("ml_signal", {})
+    result["earnings_context"] = state.get("earnings_context", {})
+    result["alert_scorecard"]  = _get_alert_scorecard()
     return jsonify(result)
 
 @app.route("/api/debug/options")
@@ -6387,6 +6565,17 @@ def api_schwab_complete_auth_post():
         "next_step": "Copy token_json and set as SCHWAB_TOKEN_JSON in Railway Variables",
         "token_json": token_json,
     })
+
+@app.route("/api/alert_scorecard")
+def api_alert_scorecard():
+    """Alert quality scorecard — win rates for each alert type."""
+    scorecard = _get_alert_scorecard()
+    return jsonify({
+        "scorecard": scorecard,
+        "total_tracked": len(_alert_outcomes),
+        "recent": _alert_outcomes[-10:][::-1],
+    })
+
 
 @app.route("/health")
 def health(): return jsonify({"status": "ok"}), 200
@@ -6775,11 +6964,12 @@ def _load_ml_model():
     # Railway deploys to /app by default; also check cwd and script dir
     _script_dir = os.path.dirname(os.path.abspath(__file__))
     _paths = [
-        "tsla_model.pkl",
-        "./tsla_model.pkl",
-        "/app/tsla_model.pkl",
-        os.path.join(_script_dir, "tsla_model.pkl"),
-        os.path.join(os.getcwd(), "tsla_model.pkl"),
+        f"{TICKER.lower()}_model.pkl",
+        f"./{TICKER.lower()}_model.pkl",
+        f"/app/{TICKER.lower()}_model.pkl",
+        os.path.join(_script_dir, f"{TICKER.lower()}_model.pkl"),
+        os.path.join(os.getcwd(), f"{TICKER.lower()}_model.pkl"),
+        "tsla_model.pkl", "./tsla_model.pkl", "/app/tsla_model.pkl",
     ]
     _load_errors = []
     for path in _paths:
@@ -6798,22 +6988,56 @@ def _load_ml_model():
     # Store errors for debug endpoint
     global _ml_load_errors
     _ml_load_errors = _load_errors
-    print(f"  ❌ tsla_model.pkl failed to load. Errors: {_load_errors}", flush=True)
+    print(f"  ❌ {TICKER.lower()}_model.pkl failed to load. Errors: {_load_errors}", flush=True)
     return None
 
+def _detect_regime(features_dict):
+    """Detect current market regime for regime-aware model selection."""
+    vix     = float(features_dict.get("vix", 20) or 20)
+    earn_5d = int(features_dict.get("earn_near_5d", 0) or 0)
+    ts      = float(features_dict.get("trend_score", 0) or 0)
+
+    if earn_5d:
+        return "earnings"
+    elif vix >= 30:
+        return "high_vix"
+    elif vix <= 15:
+        return "low_vix"
+    elif abs(ts) >= 7:
+        return "trending"
+    else:
+        return "normal"
+
+
+def _load_regime_model(regime):
+    """Load regime-specific model if available, fall back to base model."""
+    import os, pickle
+    ticker_lower = TICKER.lower()
+    regime_path  = f"/app/{ticker_lower}_model_{regime}.pkl"
+    if os.path.exists(regime_path):
+        try:
+            with open(regime_path, "rb") as f:
+                pkg = pickle.load(f)
+            return pkg, regime
+        except Exception:
+            pass
+    return _load_ml_model(), "base"
+
+
 def _get_ml_signal(features_dict):
-    """Run ensemble ML model on current features. Returns signal dict."""
+    """Run regime-aware ensemble ML model on current features."""
     empty = {"signal":"HOLD","confidence":0,"probability":0.5,"available":False}
     try:
         import numpy as np
         import pandas as pd
-        pkg = _load_ml_model()
+
+        # Detect regime and load appropriate model
+        regime = _detect_regime(features_dict)
+        pkg, used_regime = _load_regime_model(regime)
+
         if pkg is None: return empty
         cols = pkg["feature_cols"]
-        # Accept any model — fill missing features with 0, ignore extras
-        # This lets the old pkl work while retrain is in progress
         row_data = {c: float(features_dict.get(c, 0) or 0) for c in cols}
-        # Flag if this is a stale model (old feature set)
         _is_stale = len(cols) != 52
         X_df   = pd.DataFrame([row_data], columns=cols)
         X_s    = pkg["scaler"].transform(X_df)
@@ -6855,6 +7079,7 @@ def _get_ml_signal(features_dict):
             "features_matched": matched,
             "features_total":   len(cols),
             "stale":            _is_stale,
+            "regime":           used_regime,
         }
     except Exception as e:
         return {**empty, "error": str(e)[:60]}
@@ -13108,6 +13333,29 @@ setTimeout(pollSpockStatus, 5000);
 # ═══════════════════════════════════════════════════════════════
 #  ENTRY POINT
 
+# ── Weekly ML retrain scheduler ────────────────────────────────────────────────
+def _weekly_retrain_scheduler():
+    """Runs forever — triggers ML retrain every Sunday at midnight."""
+    import time as _t2
+    print("[SCHEDULER] Weekly retrain scheduler active", flush=True)
+    while True:
+        try:
+            now = datetime.now()
+            days_until_sun = (6 - now.weekday()) % 7 or 7
+            next_sun = (now + timedelta(days=days_until_sun)).replace(
+                hour=0, minute=5, second=0, microsecond=0)
+            wait = (next_sun - now).total_seconds()
+            print(f"[SCHEDULER] Next retrain: {next_sun.strftime('%a %Y-%m-%d %H:%M')} "
+                  f"({wait/3600:.1f}h)", flush=True)
+            _t2.sleep(max(wait, 300))
+            if datetime.now().weekday() == 6:  # Sunday
+                print("[SCHEDULER] 🔄 Sunday retrain firing...", flush=True)
+                _run_ml_retrain()
+        except Exception as _se:
+            print(f"[SCHEDULER] Error: {_se}", flush=True)
+            import time as _t3; _t3.sleep(3600)
+
+
 # ── Start background threads with delay so gunicorn can bind port first ──
 def start_background_threads():
     time.sleep(3)  # short wait for gunicorn to bind port
@@ -13152,7 +13400,7 @@ def start_background_threads():
     except Exception as e:
         print(f"  ⚠️ First analysis error: {e}")
     # Start continuous loops (monitor_loop already calls run_analysis every 5min)
-    for target in [fetch_institutional_periodically, monitor_loop]:
+    for target in [fetch_institutional_periodically, monitor_loop, _weekly_retrain_scheduler]:
         try:
             threading.Thread(target=target, daemon=True).start()
         except Exception as e:
