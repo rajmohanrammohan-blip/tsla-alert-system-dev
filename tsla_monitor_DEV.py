@@ -2634,7 +2634,7 @@ def calculate_market_maker_data(ticker_symbol, current_price):
             f"Hedging: {result.get("hedging_pressure","")}"
         )
 
-        print(("  🎰 MM: " + str(result.get("summary",""))[:80]))
+        # MM summary printed again after Schwab override in run_analysis (more accurate)
 
     except Exception as e:
         print(f"  ❌ Market Maker data error: {e}")
