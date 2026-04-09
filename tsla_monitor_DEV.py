@@ -970,17 +970,25 @@ def generate_signal(indicators, price):
     # VIX-aware thresholds: in high-fear markets need more conviction to BUY
     vix_now = indicators.get("vix", 20) or 20
     if vix_now >= 30:
-        # Very high fear — require strong conviction
         buy_thresh  = 45
         sell_thresh = -20
     elif vix_now >= 25:
-        # Elevated fear — moderate caution
         buy_thresh  = 40
         sell_thresh = -22
     else:
-        # Normal — standard thresholds
         buy_thresh  = 35
         sell_thresh = -25
+
+    # Momentum guard: require stronger signal when price is in downtrend
+    _ret1 = float(indicators.get("ret_1b", 0) or 0)
+    _ret3 = float(indicators.get("ret_3b", 0) or 0)
+    _falling = _ret1 < -0.002 and _ret3 < -0.003  # price falling last 3 bars
+    _rising  = _ret1 >  0.002 and _ret3 >  0.003  # price rising last 3 bars
+    if _falling:
+        buy_thresh  += 8   # need more evidence to BUY into falling price
+    if _rising:
+        sell_thresh -= 8   # need more evidence to SELL into rising price
+
     signal = "BUY" if score >= buy_thresh else "SELL" if score <= sell_thresh else "HOLD"
     return signal, strength, reasons
 
@@ -4720,7 +4728,9 @@ def run_analysis():
         indicators = {
             "rsi": rsi, "macd": macd_val, "macd_signal": macd_sig, "macd_hist": macd_hist,
             "prev_macd_hist": prev_macd_hist,
-            "vix": float(spy_data.get("vix", 20) or 20),  # for VIX-aware thresholds
+            "vix":   float(spy_data.get("vix", 20) or 20),
+            "ret_1b": float(closes.pct_change(1).iloc[-1] or 0),
+            "ret_3b": float(closes.pct_change(3).iloc[-1] or 0),
             "bb_upper": bb_upper, "bb_mid": bb_mid, "bb_lower": bb_lower,
             "ema50": ema50, "ema200": ema200,
             "volume_ratio": vol_ratio,
@@ -4999,6 +5009,21 @@ def run_analysis():
         print(f"  💰 ${price} | {signal}({strength}) | EXIT:{exit_urgency}(score:{exit_score}) | {mm_gex_str} {mm_mp_str} {mm_pc_str} | HMM:{regime_str}")
 
         # ── Dashboard alert: BUY/SELL signal change ──
+        # Momentum confirmation: don't alert BUY if price trend is down
+        _recent_momentum = float(closes.pct_change(3).iloc[-1] or 0)
+        _above_vwap_now  = price >= float(indicators.get("vwap", price) or price)
+        _momentum_ok_buy  = _recent_momentum >= -0.003  # not falling more than 0.3%
+        _momentum_ok_sell = _recent_momentum <= 0.003   # not rising more than 0.3%
+
+        if signal != "HOLD" and signal != last_signal:
+            # Require momentum confirmation for alerts
+            if signal == "BUY"  and not _momentum_ok_buy:
+                print(f"  ⚠️ BUY suppressed — momentum down ({_recent_momentum:.3%})", flush=True)
+                signal = "HOLD"
+            if signal == "SELL" and not _momentum_ok_sell:
+                print(f"  ⚠️ SELL suppressed — momentum up ({_recent_momentum:.3%})", flush=True)
+                signal = "HOLD"
+
         if signal != "HOLD" and signal != last_signal:
             emoji  = "🟢" if signal == "BUY" else "🔴"
             top3   = " | ".join(reasons[:3])
@@ -5078,6 +5103,21 @@ def run_analysis():
             )
             log_alert(wa_msg, alert_key="uoa_whale")
         state["_prev_uoa_whales"] = curr_uoa_whales
+        # Track UOA flow delta (change since last cycle)
+        _prev_call_prem = state.get("_prev_call_prem", 0)
+        _prev_put_prem  = state.get("_prev_put_prem",  0)
+        _curr_call_prem = uoa_data.get("total_call_premium", 0) or 0
+        _curr_put_prem  = uoa_data.get("total_put_premium",  0) or 0
+        _call_delta = _curr_call_prem - _prev_call_prem
+        _put_delta  = _curr_put_prem  - _prev_put_prem
+        state["uoa_flow_delta"] = {
+            "call_delta": round(_call_delta),
+            "put_delta":  round(_put_delta),
+            "net_delta":  round(_call_delta - _put_delta),
+            "direction":  "BULLISH" if _call_delta > _put_delta else "BEARISH" if _put_delta > _call_delta else "NEUTRAL",
+        }
+        state["_prev_call_prem"] = _curr_call_prem
+        state["_prev_put_prem"]  = _curr_put_prem
 
         # ── CAPITULATION BOUNCE WhatsApp + SPOCK auto-trigger ────
         prev_cap = state.get("_prev_cap_detected", False)
@@ -7057,10 +7097,14 @@ def _get_ml_signal(features_dict):
         prob   = float(np.mean(probs))
         agree  = sum(1 for p in probs if p >= 0.5) / len(probs)
         thresh = pkg.get("entry_thresh", 0.60)  # Tightened default 0.58→0.60
+        min_confidence = 30  # Ignore ML signals below this — too noisy
 
         if prob >= thresh:         signal = "BUY"
         elif prob <= (1 - thresh): signal = "SELL"
         else:                      signal = "HOLD"
+        # Force HOLD if confidence too low — below 30% is noise
+        if confidence < min_confidence:
+            signal = "HOLD"
 
         base_conf        = round(abs(prob - 0.5) * 200)
         agreement_bonus  = round((abs(agree - 0.5) * 2) * 20)
