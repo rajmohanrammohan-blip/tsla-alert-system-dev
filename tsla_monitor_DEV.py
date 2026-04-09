@@ -4573,18 +4573,31 @@ def run_analysis():
             # Always override GEX with Schwab value (more accurate than approximation)
             if _schwab_opts.get("gex_total") is not None:
                 mm_data["gex_total"]    = float(_schwab_opts["gex_total"])
-                # Also recompute gex_signal based on Schwab GEX
                 gex_v = float(_schwab_opts["gex_total"])
                 mm_data["gex_signal"] = "POSITIVE" if gex_v > 50 else "NEGATIVE" if gex_v < -50 else "NEUTRAL"
             if _schwab_opts.get("max_pain"):
                 mm_data["max_pain"]     = _schwab_opts["max_pain"]
             if _schwab_opts.get("pc_ratio") and float(_schwab_opts["pc_ratio"]) > 0.01:
                 mm_data["pc_ratio"]     = _schwab_opts["pc_ratio"]
-            # else keep yfinance OI-based PC ratio from calculate_market_maker_data
             if _schwab_opts.get("front_iv"):
                 mm_data["iv_front"]     = _schwab_opts["front_iv"]
                 mm_data["iv_back"]      = _schwab_opts.get("back_iv", _schwab_opts["front_iv"])
                 mm_data["iv_term_spread"] = _schwab_opts.get("iv_term_spread", 0)
+
+            # Rebuild summary string with Schwab-corrected values
+            _gex_s  = mm_data.get("gex_total", 0)
+            _pc_s   = mm_data.get("pc_ratio", "?")
+            _mp_s   = mm_data.get("max_pain", "?")
+            _ivr_s  = mm_data.get("iv_rank", "?")
+            _hed_s  = mm_data.get("hedging_pressure", "")
+            mm_data["summary"] = (
+                f"GEX: {_gex_s:+.0f}M ({mm_data.get('gex_signal','')}) | "
+                f"Max Pain: ${_mp_s} | "
+                f"P/C: {_pc_s} | "
+                f"IV Rank: {_ivr_s}% | "
+                f"Hedging: {_hed_s}"
+            )
+            print(f"  🎰 MM: {mm_data['summary'][:90]}", flush=True)
 
         except Exception as _e:
             print(f"  ⚠️ Market maker error: {_e}")
