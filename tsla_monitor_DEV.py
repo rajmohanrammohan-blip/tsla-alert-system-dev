@@ -1043,9 +1043,38 @@ def calculate_spy_analysis(tsla_closes, tsla_price):
         spy_chg = round((float(spy_closes.iloc[-1]) / float(spy_closes.iloc[-2]) - 1) * 100, 2) if len(spy_closes) > 1 else 0
         result["spy_change_pct"] = spy_chg
 
-        if qqq_closes is not None and len(qqq_closes) > 1:
-            result["qqq_price"]      = round(float(qqq_closes.iloc[-1]), 2)
-            result["qqq_change_pct"] = round((float(qqq_closes.iloc[-1]) / float(qqq_closes.iloc[-2]) - 1) * 100, 2)
+        if qqq_closes is not None and len(qqq_closes) > 14:
+            qqq_price = float(qqq_closes.iloc[-1])
+            result["qqq_price"]      = round(qqq_price, 2)
+            result["qqq_change_pct"] = round((qqq_price / float(qqq_closes.iloc[-2]) - 1) * 100, 2)
+            # QQQ RSI
+            _qd = qqq_closes.diff()
+            _qg = _qd.where(_qd > 0, 0).rolling(14).mean()
+            _ql = -_qd.where(_qd < 0, 0).rolling(14).mean()
+            qqq_rsi = round(float((100 - 100/(1 + _qg/(_ql + 1e-9))).iloc[-1]), 1)
+            result["qqq_rsi"]    = qqq_rsi
+            result["qqq_ob"]     = qqq_rsi > 70   # overbought
+            result["qqq_os"]     = qqq_rsi < 30   # oversold
+            # QQQ MACD
+            _qema12 = qqq_closes.ewm(span=12, adjust=False).mean()
+            _qema26 = qqq_closes.ewm(span=26, adjust=False).mean()
+            _qmacd  = _qema12 - _qema26
+            _qsig   = _qmacd.ewm(span=9, adjust=False).mean()
+            result["qqq_macd_hist"] = round(float((_qmacd - _qsig).iloc[-1]), 4)
+            result["qqq_macd_bull"] = result["qqq_macd_hist"] > 0
+            # QQQ trend
+            _qema20  = float(qqq_closes.ewm(span=20, adjust=False).mean().iloc[-1])
+            _qema50  = float(qqq_closes.ewm(span=50, adjust=False).mean().iloc[-1])
+            _qema200 = float(qqq_closes.ewm(span=200, adjust=False).mean().iloc[-1])
+            result["qqq_above_20ema"]  = qqq_price > _qema20
+            result["qqq_above_50ema"]  = qqq_price > _qema50
+            result["qqq_above_200ema"] = qqq_price > _qema200
+            result["qqq_trend"] = (
+                "BULL"  if qqq_price > _qema20 and qqq_price > _qema50 else
+                "BEAR"  if qqq_price < _qema20 and qqq_price < _qema50 else "MIXED"
+            )
+            # QQQ 5-day momentum
+            result["qqq_mom_5d"] = round((qqq_price / float(qqq_closes.iloc[-6]) - 1)*100, 2) if len(qqq_closes) > 5 else 0
 
         # VIX
         if vix_closes is not None and len(vix_closes):
@@ -1123,6 +1152,25 @@ def calculate_spy_analysis(tsla_closes, tsla_price):
         result["spy_ema20"]  = round(spy_ema20, 2)
         result["spy_ema50"]  = round(spy_ema50, 2)
         result["spy_ema200"] = round(spy_ema200, 2)
+        result["spy_ob"]     = spy_rsi > 70
+        result["spy_os"]     = spy_rsi < 30
+        # SPY MACD
+        _sema12 = spy_closes.ewm(span=12, adjust=False).mean()
+        _sema26 = spy_closes.ewm(span=26, adjust=False).mean()
+        _smacd  = _sema12 - _sema26
+        _ssig   = _smacd.ewm(span=9, adjust=False).mean()
+        spy_macd_hist = float((_smacd - _ssig).iloc[-1])
+        result["spy_macd_hist"] = round(spy_macd_hist, 4)
+        result["spy_macd_bull"] = spy_macd_hist > 0
+        # SPY Bollinger %B
+        _sma20 = float(spy_closes.rolling(20).mean().iloc[-1])
+        _sstd  = float(spy_closes.rolling(20).std().iloc[-1] or 1)
+        spy_bb_pct = (spy_price - (_sma20 - 2*_sstd)) / (4*_sstd + 1e-9)
+        result["spy_bb_pct"] = round(spy_bb_pct, 3)
+        result["spy_bb_ob"]  = spy_bb_pct > 0.9   # near upper band
+        result["spy_bb_os"]  = spy_bb_pct < 0.1   # near lower band
+        # SPY 5-day momentum
+        result["spy_mom_5d"] = round((spy_price / float(spy_closes.iloc[-6]) - 1)*100, 2) if len(spy_closes) > 5 else 0
 
         above_200 = spy_price > spy_ema200
         above_50  = spy_price > spy_ema50
@@ -5291,6 +5339,24 @@ def run_analysis():
                 "tsla_spy_corr":   _tsla_spy_corr,
                 "spy_ret_1b":      float((spy_data.get("spy_change_pct", 0) or 0) / 100),
                 "spy_decouple":    _spy_decouple,
+                # SPY technical state — critical for market-aware signals
+                "spy_rsi":         float(spy_data.get("spy_rsi", 50) or 50),
+                "spy_ob":          1 if spy_data.get("spy_ob", False) else 0,
+                "spy_os":          1 if spy_data.get("spy_os", False) else 0,
+                "spy_macd_bull":   1 if spy_data.get("spy_macd_bull", True) else 0,
+                "spy_bb_pct":      float(spy_data.get("spy_bb_pct", 0.5) or 0.5),
+                "spy_mom_5d":      float(spy_data.get("spy_mom_5d", 0) or 0) / 100,
+                "spy_above_200":   1 if spy_data.get("spy_trend", "") in ("BULL MARKET", "UPTREND") else 0,
+                # QQQ technical state — tech sector leading indicator
+                "qqq_rsi":         float(spy_data.get("qqq_rsi", 50) or 50),
+                "qqq_ob":          1 if spy_data.get("qqq_ob", False) else 0,
+                "qqq_os":          1 if spy_data.get("qqq_os", False) else 0,
+                "qqq_macd_bull":   1 if spy_data.get("qqq_macd_bull", True) else 0,
+                "qqq_mom_5d":      float(spy_data.get("qqq_mom_5d", 0) or 0) / 100,
+                "qqq_bull":        1 if spy_data.get("qqq_trend", "") == "BULL" else 0,
+                # Market breadth composite
+                "market_ob":       1 if (spy_data.get("spy_ob") and spy_data.get("qqq_ob")) else 0,
+                "market_os":       1 if (spy_data.get("spy_os") and spy_data.get("qqq_os")) else 0,
                 # Daily context
                 "daily_ret_so_far": _daily_ret,
                 # EMA / trend
@@ -5913,8 +5979,51 @@ def _run_ml_retrain():
         volumes = hist5["Volume"].astype(float).reset_index(drop=True)
         idx     = hist5.index
 
+        # 2. Fetch SPY + QQQ daily data for market context features
+        print("[ML-RETRAIN] Fetching SPY + QQQ daily for market features...", flush=True)
+        # Fetch SPY daily for RSI/MACD/BB features aligned to bar dates
+        try:
+            spy_daily = yf.download("SPY", period="2y", interval="1d",
+                                    progress=False, auto_adjust=True)
+            if hasattr(spy_daily.columns, "levels"):
+                spy_daily.columns = spy_daily.columns.get_level_values(0)
+            spy_daily_closes = spy_daily["Close"].astype(float) if not spy_daily.empty else _pd_rt.Series()
+        except Exception: spy_daily_closes = _pd_rt.Series()
+
+        try:
+            qqq_daily = yf.download("QQQ", period="2y", interval="1d",
+                                    progress=False, auto_adjust=True)
+            if hasattr(qqq_daily.columns, "levels"):
+                qqq_daily.columns = qqq_daily.columns.get_level_values(0)
+            qqq_daily_closes = qqq_daily["Close"].astype(float) if not qqq_daily.empty else _pd_rt.Series()
+        except Exception: qqq_daily_closes = _pd_rt.Series()
+
+        # Pre-compute daily SPY/QQQ indicators
+        def _rsi14(s):
+            d = s.diff(); g = d.where(d>0,0).rolling(14).mean()
+            l = -d.where(d<0,0).rolling(14).mean()
+            return 100 - 100/(1 + g/(l+1e-9))
+        def _macd_hist(s):
+            m = s.ewm(span=12,adjust=False).mean() - s.ewm(span=26,adjust=False).mean()
+            return m - m.ewm(span=9,adjust=False).mean()
+        def _bb_pct(s):
+            ma = s.rolling(20).mean(); sd = s.rolling(20).std().replace(0,1)
+            return (s - (ma - 2*sd)) / (4*sd + 1e-9)
+
+        spy_rsi_s  = _rsi14(spy_daily_closes)   if len(spy_daily_closes) > 14 else _pd_rt.Series()
+        spy_macd_s = _macd_hist(spy_daily_closes) if len(spy_daily_closes) > 26 else _pd_rt.Series()
+        spy_bb_s   = _bb_pct(spy_daily_closes)   if len(spy_daily_closes) > 20 else _pd_rt.Series()
+        spy_ema200 = spy_daily_closes.ewm(span=200,adjust=False).mean() if len(spy_daily_closes) > 50 else _pd_rt.Series()
+
+        qqq_rsi_s  = _rsi14(qqq_daily_closes)    if len(qqq_daily_closes) > 14 else _pd_rt.Series()
+        qqq_macd_s = _macd_hist(qqq_daily_closes) if len(qqq_daily_closes) > 26 else _pd_rt.Series()
+        qqq_ema50  = qqq_daily_closes.ewm(span=50,adjust=False).mean()  if len(qqq_daily_closes) > 50 else _pd_rt.Series()
+        qqq_ema200 = qqq_daily_closes.ewm(span=200,adjust=False).mean() if len(qqq_daily_closes) > 50 else _pd_rt.Series()
+
+        print(f"[ML-RETRAIN] SPY daily: {len(spy_daily_closes)} bars, QQQ: {len(qqq_daily_closes)} bars", flush=True)
+
         # 2. Fetch SPY for correlation regime
-        print("[ML-RETRAIN] Fetching SPY...", flush=True)
+        print("[ML-RETRAIN] Fetching SPY intraday...", flush=True)
         try:
             spy5 = _pd_rt.DataFrame()
             # Try Schwab SPY (matches TSLA bar count)
@@ -6112,6 +6221,31 @@ def _run_ml_retrain():
                 dist_from_low  = (price-l20)/(l20+1e-9)
                 absorption     = abs(float(highs.iloc[i])-float(lows.iloc[i]))/(price+1e-9)
 
+                # SPY/QQQ market context for this bar date
+                _spy_rsi_r=50.0;_spy_ob_r=0;_spy_os_r=0;_spy_mbull_r=1;_spy_bb_r=0.5;_spy_mom_r=0.0;_spy_a200_r=1
+                _qqq_rsi_r=50.0;_qqq_ob_r=0;_qqq_os_r=0;_qqq_mbull_r=1;_qqq_mom_r=0.0;_qqq_bull_r=1;_mkt_ob_r=0;_mkt_os_r=0
+                if bar_date is not None:
+                  try:
+                    _bd = str(bar_date)
+                    if len(spy_rsi_s)>0: _sr=float(spy_rsi_s.asof(_bd) or 50); _spy_rsi_r=_sr; _spy_ob_r=1 if _sr>70 else 0; _spy_os_r=1 if _sr<30 else 0
+                    if len(spy_macd_s)>0: _spy_mbull_r=1 if float(spy_macd_s.asof(_bd) or 0)>0 else 0
+                    if len(spy_bb_s)>0: _spy_bb_r=float(spy_bb_s.asof(_bd) or 0.5)
+                    if len(spy_ema200)>0 and len(spy_daily_closes)>0:
+                      _sp=float(spy_daily_closes.asof(_bd) or 0); _s2=float(spy_ema200.asof(_bd) or _sp); _spy_a200_r=1 if _sp>_s2 else 0
+                    if len(spy_daily_closes)>5:
+                      _spn=float(spy_daily_closes.asof(_bd) or 0); _sp5=float(spy_daily_closes.shift(5).asof(_bd) or _spn)
+                      _spy_mom_r=(_spn/_sp5-1) if _sp5>0 else 0
+                    if len(qqq_rsi_s)>0: _qr=float(qqq_rsi_s.asof(_bd) or 50); _qqq_rsi_r=_qr; _qqq_ob_r=1 if _qr>70 else 0; _qqq_os_r=1 if _qr<30 else 0
+                    if len(qqq_macd_s)>0: _qqq_mbull_r=1 if float(qqq_macd_s.asof(_bd) or 0)>0 else 0
+                    if len(qqq_ema50)>0 and len(qqq_daily_closes)>0:
+                      _qp=float(qqq_daily_closes.asof(_bd) or 0); _q50=float(qqq_ema50.asof(_bd) or _qp); _q200=float(qqq_ema200.asof(_bd) or _qp) if len(qqq_ema200)>0 else _qp
+                      _qqq_bull_r=1 if _qp>_q50 and _qp>_q200 else 0
+                    if len(qqq_daily_closes)>5:
+                      _qpn=float(qqq_daily_closes.asof(_bd) or 0); _qp5=float(qqq_daily_closes.shift(5).asof(_bd) or _qpn)
+                      _qqq_mom_r=(_qpn/_qp5-1) if _qp5>0 else 0
+                    _mkt_ob_r=1 if _spy_ob_r and _qqq_ob_r else 0; _mkt_os_r=1 if _spy_os_r and _qqq_os_r else 0
+                  except Exception: pass
+
                 # Earnings proximity
                 if earnings_dates and bar_date is not None:
                     days_to_earn  = min(abs((bar_date-ed).days) for ed in earnings_dates)
@@ -6150,8 +6284,13 @@ def _run_ml_retrain():
                 earn_proximity, earn_near_5d, earn_near_10d,
                 iv_front, iv_back, iv_term_sprd, iv_ratio,
                 pc_ratio, pc_delta_feat,
-                # Greeks placeholders (live values used in inference)
+                # Greeks placeholders
                 0.5, 0.0, 0.0, 0.0, 0.0,
+                # SPY/QQQ market features
+                _spy_rsi_r, _spy_ob_r, _spy_os_r, _spy_mbull_r, _spy_bb_r,
+                _spy_mom_r, _spy_a200_r,
+                _qqq_rsi_r, _qqq_ob_r, _qqq_os_r, _qqq_mbull_r, _qqq_mom_r, _qqq_bull_r,
+                _mkt_ob_r, _mkt_os_r,
                 ]
                 X_rows.append(row)
                 future = float(closes.iloc[min(i+FORWARD, n-1)])
@@ -6187,8 +6326,13 @@ def _run_ml_retrain():
             "earn_proximity","earn_near_5d","earn_near_10d",
             "iv_front","iv_back","iv_term_spread","iv_ratio",
             "pc_ratio","pc_delta",
-            # Schwab Greeks (0 if not available)
+            # Schwab Greeks
             "delta_atm","gamma_exposure","theta_decay","vega_exposure","iv_skew",
+            # SPY/QQQ market context (NEW)
+            "spy_rsi","spy_ob","spy_os","spy_macd_bull","spy_bb_pct",
+            "spy_mom_5d","spy_above_200",
+            "qqq_rsi","qqq_ob","qqq_os","qqq_macd_bull","qqq_mom_5d","qqq_bull",
+            "market_ob","market_os",
         ]
 
         assert len(feat_cols)==X.shape[1], f"Mismatch {len(feat_cols)} vs {X.shape[1]}"
@@ -7078,7 +7222,7 @@ def _get_ml_signal(features_dict):
         if pkg is None: return empty
         cols = pkg["feature_cols"]
         row_data = {c: float(features_dict.get(c, 0) or 0) for c in cols}
-        _is_stale = len(cols) != 52
+        _is_stale = len(cols) != 67
         X_df   = pd.DataFrame([row_data], columns=cols)
         X_s    = pkg["scaler"].transform(X_df)
         X_s_df = pd.DataFrame(X_s, columns=cols)
@@ -11862,7 +12006,7 @@ setTimeout(pollSpockStatus, 5000);
   <div class="panel" id="ml-panel" style="grid-column:1/-1;border:2px solid rgba(0,229,255,0.3);background:rgba(0,10,20,0.98);">
     <div class="panel-title" onclick="togglePanel('ml-panel')" style="cursor:pointer;">
       🧠 ML DIRECTIONAL SIGNAL
-      <span id="mlPanelHeader" style="font-size:9px;color:var(--text-dim);">ENSEMBLE · 52 FEATURES · AUC — · SCHWAB + 5-MIN BARS</span>
+      <span id="mlPanelHeader" style="font-size:9px;color:var(--text-dim);">ENSEMBLE · 67 FEATURES · AUC — · SCHWAB + SPY/QQQ + 5-MIN BARS</span>
       <span class="panel-collapse-btn" id="btn-ml-panel">▾</span>
     </div>
     <div style="display:grid;grid-template-columns:180px 1fr 1fr 1fr;gap:16px;align-items:start;">
@@ -13416,7 +13560,12 @@ def start_background_threads():
             "dist_from_high","dist_from_low","absorption",
             "earn_proximity","earn_near_5d","earn_near_10d",
             "iv_front","iv_back","iv_term_spread","iv_ratio","pc_ratio","pc_delta",
-            "delta_atm","gamma_exposure","theta_decay","vega_exposure","iv_skew"
+            "delta_atm","gamma_exposure","theta_decay","vega_exposure","iv_skew",
+            # SPY/QQQ market context (NEW — 15 features)
+            "spy_rsi","spy_ob","spy_os","spy_macd_bull","spy_bb_pct",
+            "spy_mom_5d","spy_above_200",
+            "qqq_rsi","qqq_ob","qqq_os","qqq_macd_bull","qqq_mom_5d","qqq_bull",
+            "market_ob","market_os"
         ]
     try:
         pkg = _load_ml_model()
