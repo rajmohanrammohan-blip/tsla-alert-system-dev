@@ -7246,13 +7246,15 @@ def _get_ml_signal(features_dict):
         if prob >= thresh:         signal = "BUY"
         elif prob <= (1 - thresh): signal = "SELL"
         else:                      signal = "HOLD"
-        # Force HOLD if confidence too low — below 30% is noise
-        if confidence < min_confidence:
-            signal = "HOLD"
 
+        # Compute confidence FIRST then apply noise filter
         base_conf        = round(abs(prob - 0.5) * 200)
         agreement_bonus  = round((abs(agree - 0.5) * 2) * 20)
         confidence       = min(100, base_conf + agreement_bonus)
+
+        # Force HOLD if confidence too low — below 30% is noise
+        if confidence < min_confidence:
+            signal = "HOLD"
 
         matched = sum(1 for c in cols if c in features_dict)  # count all present features
         return {
