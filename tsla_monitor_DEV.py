@@ -129,6 +129,8 @@ state = {
     "mm_data":   {},   # Market maker: GEX, Max Pain, options flow
     "uoa_data":  {},   # Unusual options activity — sweeps, whales, flow
     "ml_signal": {"signal":"HOLD","confidence":0,"probability":0.5,"available":False},
+    "master_signal": {"action":"HOLD","score":0,"conviction":0,"risk":"MEDIUM",
+                      "color":"#00e5ff","reasons":[],"bull_votes":0,"bear_votes":0},
     "dark_pool": {},   # Dark pool levels
     "poc_data":  {},   # Volume Profile: POC, VAH, VAL
     "spy_data":  {},   # SPY/macro market context
@@ -4585,6 +4587,240 @@ def log_alert(message, alert_key="default"):
 
 last_signal = None
 
+
+def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
+                             dv_result, entry_data, peak_data, exit_score,
+                             spy_data, cap_result, ichi, hmm_result,
+                             news_data, indicators, price):
+    """
+    Master Signal — synthesizes ALL models into one clear decision.
+    
+    Returns dict:
+        action:      STRONG BUY / BUY / HOLD / SELL / STRONG SELL
+        score:       -100 to +100
+        conviction:  0-100% (% of models agreeing)
+        reasons:     top 3 drivers
+        risk:        LOW / MEDIUM / HIGH / EXTREME
+        color:       hex color for UI
+    """
+    score   = 0
+    reasons = []
+    votes   = {"bull": 0, "bear": 0, "neutral": 0}
+
+    # ── TIER 1: HIGH CONVICTION (±30 pts each) ──────────────────────────────
+
+    # 1. UOA Net Flow — smart money options activity
+    uoa_flow   = uoa_data.get("net_flow", "NEUTRAL")
+    uoa_prem   = uoa_data.get("total_call_premium", 0) - uoa_data.get("total_put_premium", 0)
+    uoa_whales = len(uoa_data.get("whale_alerts", []))
+    if "STRONGLY BULLISH" in uoa_flow:
+        score += 30; reasons.append(f"Smart money STRONGLY BULLISH (${abs(uoa_prem/1e6):.0f}M calls)")
+        votes["bull"] += 1
+    elif "BULLISH" in uoa_flow:
+        score += 18; reasons.append(f"Smart money BULLISH (${abs(uoa_prem/1e6):.0f}M call heavy)")
+        votes["bull"] += 1
+    elif "STRONGLY BEARISH" in uoa_flow:
+        score -= 30; reasons.append(f"Smart money STRONGLY BEARISH (${abs(uoa_prem/1e6):.0f}M puts)")
+        votes["bear"] += 1
+    elif "BEARISH" in uoa_flow:
+        score -= 18; reasons.append(f"Smart money BEARISH (${abs(uoa_prem/1e6):.0f}M put heavy)")
+        votes["bear"] += 1
+    else:
+        votes["neutral"] += 1
+
+    # 2. ML Ensemble (67 features + SPY/QQQ context)
+    ml_sig  = ml_signal.get("signal", "HOLD")
+    ml_conf = ml_signal.get("confidence", 0) or 0
+    ml_prob = ml_signal.get("probability", 0.5) or 0.5
+    if ml_sig == "BUY" and ml_conf >= 30:
+        pts = min(30, int(ml_conf * 0.4))
+        score += pts; reasons.append(f"ML ensemble BUY (conf {ml_conf}%, prob {ml_prob:.0%})")
+        votes["bull"] += 1
+    elif ml_sig == "SELL" and ml_conf >= 30:
+        pts = min(30, int(ml_conf * 0.4))
+        score -= pts; reasons.append(f"ML ensemble SELL (conf {ml_conf}%, prob {ml_prob:.0%})")
+        votes["bear"] += 1
+    else:
+        votes["neutral"] += 1
+
+    # ── TIER 2: MARKET STRUCTURE (±20 pts each) ─────────────────────────────
+
+    # 3. GEX + Max Pain gravity
+    gex      = float(mm_data.get("gex_total", 0) or 0)
+    max_pain = float(mm_data.get("max_pain", price) or price)
+    pain_pull = (max_pain - price) / max(price, 1) * 100  # % to max pain
+    if gex > 100:
+        score += 12; reasons.append(f"GEX +{gex:.0f}M: dealers long gamma → stabilizing")
+        votes["bull"] += 1
+    elif gex < -100:
+        score -= 12; reasons.append(f"GEX {gex:.0f}M: dealers short gamma → amplifying moves")
+        votes["bear"] += 1
+    else:
+        votes["neutral"] += 1
+    if pain_pull > 3:
+        score += 8; reasons.append(f"Max Pain ${max_pain:.0f} is {pain_pull:.1f}% above — magnetic pull UP")
+        votes["bull"] += 1
+    elif pain_pull < -3:
+        score -= 8; reasons.append(f"Max Pain ${max_pain:.0f} is {abs(pain_pull):.1f}% below — pull DOWN")
+        votes["bear"] += 1
+
+    # 4. DarthVader institutional intelligence
+    dv_state = dv_result.get("tsla_state", {}).get("state", "") if dv_result else ""
+    dv_risk  = dv_result.get("risk_mode", "NORMAL") if dv_result else "NORMAL"
+    dv_conf  = float(dv_result.get("tsla_state", {}).get("confidence", 0) or 0) if dv_result else 0
+    if "CAPITULATION_BOUNCE" in dv_state and dv_conf > 0.5:
+        score += 20; reasons.append(f"DarthVader: CAPITULATION BOUNCE ({dv_conf:.0%} conf)")
+        votes["bull"] += 1
+    elif "ACCUMULATION" in dv_state:
+        score += 15; votes["bull"] += 1
+    elif "LIQUIDITY_VACUUM" in dv_state and dv_risk == "DEFENSIVE":
+        score -= 15; reasons.append("DarthVader: DEFENSIVE — institutional caution")
+        votes["bear"] += 1
+    elif "DISTRIBUTION" in dv_state or "MEAN_REVERSION" in dv_state:
+        score -= 10; votes["bear"] += 1
+    else:
+        votes["neutral"] += 1
+
+    # ── TIER 3: TECHNICAL (±10 pts each) ────────────────────────────────────
+
+    # 5. Main multi-factor signal
+    if signal == "BUY":
+        pts = min(10, max(3, strength // 10))
+        score += pts; votes["bull"] += 1
+    elif signal == "SELL":
+        pts = min(10, max(3, strength // 10))
+        score -= pts; votes["bear"] += 1
+    else:
+        votes["neutral"] += 1
+
+    # 6. Entry/Exit score composite
+    entry_score = entry_data.get("entry_score", 0) or 0
+    if entry_score >= 70:
+        score += 10; reasons.append(f"Entry score STRONG ({entry_score}/100)")
+        votes["bull"] += 1
+    elif entry_score >= 50:
+        score += 5; votes["bull"] += 1
+    if exit_score >= 70:
+        score -= 10; reasons.append(f"Exit score HIGH ({exit_score}/100) — overbought")
+        votes["bear"] += 1
+    elif exit_score >= 55:
+        score -= 5; votes["bear"] += 1
+
+    # 7. HMM regime
+    hmm_reg = hmm_result.get("regime", "NEUTRAL") if hmm_result else "NEUTRAL"
+    if "BULL" in hmm_reg:
+        score += 8; votes["bull"] += 1
+    elif "BEAR" in hmm_reg:
+        score -= 8; votes["bear"] += 1
+    else:
+        votes["neutral"] += 1
+
+    # 8. SPY/QQQ macro backdrop
+    macro_score = float(spy_data.get("macro_score", 0) or 0)
+    spy_ob = spy_data.get("spy_ob", False)
+    spy_os = spy_data.get("spy_os", False)
+    qqq_ob = spy_data.get("qqq_ob", False)
+    qqq_os = spy_data.get("qqq_os", False)
+    if spy_ob and qqq_ob:
+        score -= 10; reasons.append("SPY + QQQ both overbought — market stretched")
+        votes["bear"] += 1
+    elif spy_os and qqq_os:
+        score += 10; reasons.append("SPY + QQQ both oversold — market washed out")
+        votes["bull"] += 1
+    elif macro_score >= 20:
+        score += 6; votes["bull"] += 1
+    elif macro_score <= -20:
+        score -= 6; votes["bear"] += 1
+    else:
+        votes["neutral"] += 1
+
+    # ── TIER 4: CONFIRMING (±5 pts each) ────────────────────────────────────
+
+    # 9. Capitulation bounce
+    if cap_result and cap_result.get("detected"):
+        cap_conv = cap_result.get("conviction", 0) or 0
+        if cap_conv >= 60:
+            score += 5; votes["bull"] += 1
+        else:
+            votes["neutral"] += 1
+
+    # 10. Ichimoku cloud
+    cloud = ichi.get("cloud_signal", "NEUTRAL") if ichi else "NEUTRAL"
+    if "BULL" in cloud.upper():
+        score += 5; votes["bull"] += 1
+    elif "BEAR" in cloud.upper():
+        score -= 5; votes["bear"] += 1
+    else:
+        votes["neutral"] += 1
+
+    # 11. News sentiment
+    news_score = float(news_data.get("score", 0) or 0) if news_data else 0
+    if news_score >= 20:
+        score += 5; votes["bull"] += 1
+    elif news_score <= -20:
+        score -= 5; votes["bear"] += 1
+    else:
+        votes["neutral"] += 1
+
+    # 12. Momentum (price action confirmation)
+    ret_1b = float(indicators.get("ret_1b", 0) or 0)
+    ret_3b = float(indicators.get("ret_3b", 0) or 0)
+    if ret_1b > 0.003 and ret_3b > 0.005:
+        score += 5; votes["bull"] += 1
+    elif ret_1b < -0.003 and ret_3b < -0.005:
+        score -= 5; votes["bear"] += 1
+    else:
+        votes["neutral"] += 1
+
+    # ── FINAL DECISION ───────────────────────────────────────────────────────
+    score = max(-100, min(100, score))
+
+    total_votes = votes["bull"] + votes["bear"] + votes["neutral"]
+    bull_pct    = round(votes["bull"] / max(total_votes, 1) * 100)
+    bear_pct    = round(votes["bear"] / max(total_votes, 1) * 100)
+    conviction  = max(bull_pct, bear_pct)
+
+    if score >= 60:
+        action = "STRONG BUY";  color = "#00ff88"
+    elif score >= 30:
+        action = "BUY";         color = "#69f0ae"
+    elif score <= -60:
+        action = "STRONG SELL"; color = "#ff1744"
+    elif score <= -30:
+        action = "SELL";        color = "#ff6d00"
+    else:
+        action = "HOLD";        color = "#00e5ff"
+
+    # Risk level
+    vix = float(spy_data.get("vix", 20) or 20)
+    abs_gex = abs(gex)
+    if vix >= 35 or abs_gex >= 500:
+        risk = "EXTREME"
+    elif vix >= 25 or abs_gex >= 200:
+        risk = "HIGH"
+    elif vix >= 18 or abs_gex >= 100:
+        risk = "MEDIUM"
+    else:
+        risk = "LOW"
+
+    # Top 3 reasons (deduplicated)
+    top_reasons = reasons[:3] if reasons else ["Insufficient signal confluence"]
+
+    return {
+        "action":        action,
+        "score":         score,
+        "conviction":    conviction,
+        "bull_votes":    votes["bull"],
+        "bear_votes":    votes["bear"],
+        "neutral_votes": votes["neutral"],
+        "total_models":  total_votes,
+        "reasons":       top_reasons,
+        "risk":          risk,
+        "color":         color,
+        "vix":           round(vix, 1),
+        "gex":           round(gex, 0),
+    }
+
 def run_analysis():
     global last_signal
     print(f"\n[ANALYSIS] {TICKER} @ {datetime.now().strftime('%H:%M:%S')}...", flush=True)
@@ -5095,6 +5331,9 @@ def run_analysis():
             if _earn_ctx.get("earnings_mode"):
                 _earn_warn = f"\n⚠️ *EARNINGS IN {_earn_ctx.get('days_away','?')} DAYS* — use tighter stops, expect IV crush after\n"
 
+            _ms = state.get("master_signal", {})
+            _ms_line = f"\n🖖 *SPOCK: {_ms.get('action','?')}* | Score: {_ms.get('score',0):+d}/100 | Conviction: {_ms.get('conviction',0)}%"
+
             wa_msg = (
                 f"{emoji} {TICKER} *{signal} SIGNAL*\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -5110,6 +5349,7 @@ def run_analysis():
                 f"\n"
                 f"⏰ Pre-Mkt: {pm_pct:+.1f}% | 📰 News: {news_s}\n"
                 f"🧠 HMM: {regime_str} | ☁ Cloud: {cloud_str}\n"
+                f"{_ms_line}\n"
                 f"{_earn_warn}"
                 f"{tranches_txt}\n"
                 f"📌 *Why:*\n  {top3}"
@@ -5399,6 +5639,35 @@ def run_analysis():
             }
             ml_signal = _get_ml_signal(_ml_features)
             state["ml_signal"] = ml_signal
+
+            # ── MASTER SIGNAL — synthesize all models ──────────────────────
+            try:
+                master = calculate_master_signal(
+                    signal      = signal,
+                    strength    = strength,
+                    ml_signal   = ml_signal,
+                    mm_data     = mm_data,
+                    uoa_data    = uoa_data,
+                    dv_result   = dv_result,
+                    entry_data  = entry_data,
+                    peak_data   = peak_data,
+                    exit_score  = exit_score,
+                    spy_data    = spy_data,
+                    cap_result  = cap_result,
+                    ichi        = ichi,
+                    hmm_result  = hmm_result,
+                    news_data   = news_data,
+                    indicators  = indicators,
+                    price       = price,
+                )
+                state["master_signal"] = master
+                print(f"  🖖 SPOCK MASTER: {master['action']} | score={master['score']:+d} | "
+                      f"conviction={master['conviction']}% | risk={master['risk']} | "
+                      f"bulls={master['bull_votes']} bears={master['bear_votes']}", flush=True)
+            except Exception as _me:
+                print(f"  ⚠️ Master signal error: {_me}", flush=True)
+                state["master_signal"] = {"action":"HOLD","score":0,"conviction":0,
+                                          "risk":"MEDIUM","color":"#00e5ff","reasons":[]}
             _regime_str = ml_signal.get('regime', '')
             print(f"  [ML] signal={ml_signal.get('signal')} conf={ml_signal.get('confidence')} "
                   f"regime={_regime_str} matched={ml_signal.get('features_matched','?')}/{ml_signal.get('features_total','?')} "
@@ -6484,7 +6753,8 @@ def api_debug_ml():
         result["feature_cols"] = _ml_model_cache.get("feature_cols", [])
         result["auc"]          = _ml_model_cache.get("auc", 0)
     # 4. Show last ML signal from state
-    result["ml_signal"] = state.get("ml_signal", {})
+    result["ml_signal"]     = state.get("ml_signal", {})
+    result["master_signal"] = state.get("master_signal", {})
     result["earnings_context"] = state.get("earnings_context", {})
     result["alert_scorecard"]  = _get_alert_scorecard()
     return jsonify(result)
@@ -9214,7 +9484,7 @@ function updateUI(s) {
     function(){renderMMPanel(s.mm_data||{},s.dark_pool||{},s.price||0);},
     function(){renderInstModels(s.institutional_models||{},s.indicators||{});},
     function(){if(s.darthvader)renderDarthVader(s.darthvader);},
-    function(){window._lastState=s;renderMLPanel(s.ml_signal||{});},
+    function(){window._lastState=s;renderSpockPanel(s.master_signal||{});renderMLPanel(s.ml_signal||{});},
     function(){try{renderCapBounce(s.capitulation||null);}catch(e){}},
     function(){try{renderPOCPanel(s.poc_data||{},s.vol_profile||[],s.price||0);}catch(e){}},
   ].forEach(function(fn,i){try{fn();}catch(e){console.warn('Panel['+i+']: '+e.message);}});
@@ -10545,6 +10815,62 @@ function _resetQuickReadBar(){
   if(tEl)tEl.textContent='—';
 }
 
+
+function renderSpockPanel(ms) {
+  if (!ms || typeof ms !== 'object') return;
+  var action = ms.action || 'HOLD';
+  var score  = ms.score  || 0;
+  var conv   = ms.conviction || 0;
+  var risk   = ms.risk   || 'MEDIUM';
+  var color  = ms.color  || '#00e5ff';
+  var reasons = ms.reasons || [];
+
+  // Action text
+  var actEl = document.getElementById('masterAction');
+  if (actEl) { actEl.textContent = action; actEl.style.color = color; }
+
+  // Score
+  var scoreEl = document.getElementById('masterScore');
+  if (scoreEl) { scoreEl.textContent = (score >= 0 ? '+' : '') + score; scoreEl.style.color = color; }
+
+  // Conviction bar
+  var convEl = document.getElementById('masterConv');
+  if (convEl) { convEl.textContent = conv + '%'; convEl.style.color = color; }
+  var barEl = document.getElementById('masterConvBar');
+  if (barEl) { barEl.style.width = conv + '%'; barEl.style.background = color; }
+
+  // Votes
+  var bEl = document.getElementById('masterBulls');
+  var nEl = document.getElementById('masterNeutral');
+  var beEl = document.getElementById('masterBears');
+  if (bEl)  bEl.textContent  = ms.bull_votes    || 0;
+  if (nEl)  nEl.textContent  = ms.neutral_votes  || 0;
+  if (beEl) beEl.textContent = ms.bear_votes     || 0;
+
+  // Risk
+  var riskEl = document.getElementById('masterRisk');
+  if (riskEl) {
+    riskEl.textContent = risk;
+    riskEl.style.color = risk==='EXTREME'?'#ff1744':risk==='HIGH'?'#ff6d00':risk==='MEDIUM'?'#ffb300':'#00ff88';
+  }
+
+  // Reasons
+  var reasonEl = document.getElementById('masterReasons');
+  if (reasonEl && reasons.length) {
+    reasonEl.innerHTML = reasons.slice(0,3).map(function(r){
+      return '<div>▸ ' + r + '</div>';
+    }).join('');
+  }
+
+  // Background glow
+  var bg = document.getElementById('masterBg');
+  if (bg) {
+    var glow = action.includes('BUY')  ? 'rgba(0,255,136,0.05)'  :
+               action.includes('SELL') ? 'rgba(255,23,68,0.05)'  :
+                                         'rgba(0,10,20,0.95)';
+    bg.style.background = glow;
+  }
+}
 
 function renderMLPanel(ml) {
   if(!ml || typeof ml !== 'object') return;
@@ -12003,6 +12329,55 @@ setTimeout(pollSpockStatus, 5000);
 
   <!-- DV INTELLIGENCE ROW — STATE + PROB side by side -->
   <div style="display:grid;grid-template-columns:2fr 1fr;gap:1px;background:var(--border);">
+  <!-- ═══ SPOCK MASTER SIGNAL PANEL ═══ -->
+  <div class="panel" id="master-panel" style="grid-column:1/-1;padding:0;overflow:hidden;border:2px solid rgba(0,255,136,0.4);background:#000a12;">
+    <div id="masterBg" style="padding:18px 24px;transition:background 0.5s;background:rgba(0,10,20,0.95);">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">
+
+        <!-- Action -->
+        <div style="display:flex;align-items:center;gap:20px;">
+          <div>
+            <div style="font-size:9px;letter-spacing:3px;color:var(--text-dim);margin-bottom:4px;">SPOCK DECISION</div>
+            <div id="masterAction" style="font-size:36px;font-weight:900;letter-spacing:4px;font-family:var(--font-mono);color:#00e5ff;">ANALYZING</div>
+          </div>
+          <div style="text-align:center;">
+            <div style="font-size:9px;letter-spacing:2px;color:var(--text-dim);">SCORE</div>
+            <div id="masterScore" style="font-size:28px;font-weight:700;font-family:var(--font-mono);color:#00e5ff;">—</div>
+            <div style="font-size:9px;color:var(--text-dim);">/ 100</div>
+          </div>
+        </div>
+
+        <!-- Conviction Meter -->
+        <div style="flex:1;min-width:200px;max-width:350px;">
+          <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+            <span style="font-size:9px;letter-spacing:2px;color:var(--text-dim);">CONVICTION</span>
+            <span id="masterConv" style="font-size:11px;font-weight:700;color:#00e5ff;">—%</span>
+          </div>
+          <div style="background:rgba(255,255,255,0.06);border-radius:4px;height:8px;overflow:hidden;">
+            <div id="masterConvBar" style="height:100%;width:0%;background:#00ff88;border-radius:4px;transition:width 0.5s;"></div>
+          </div>
+          <div style="display:flex;justify-content:space-between;margin-top:8px;">
+            <span style="font-size:9px;color:#00ff88;">● <span id="masterBulls">0</span> BULL</span>
+            <span style="font-size:9px;color:var(--text-dim);"><span id="masterNeutral">0</span> NEUTRAL</span>
+            <span style="font-size:9px;color:#ff3355;">● <span id="masterBears">0</span> BEAR</span>
+          </div>
+        </div>
+
+        <!-- Risk + Reasons -->
+        <div style="text-align:right;">
+          <div style="margin-bottom:8px;">
+            <span style="font-size:9px;letter-spacing:2px;color:var(--text-dim);">RISK </span>
+            <span id="masterRisk" style="font-size:12px;font-weight:700;letter-spacing:2px;color:#ffb300;">—</span>
+          </div>
+          <div id="masterReasons" style="font-size:9px;color:var(--text-dim);text-align:right;max-width:300px;line-height:1.6;">
+            Waiting for data...
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
   <!-- PANEL A: TSLA STATE ENGINE -->
   <!-- ML DIRECTIONAL SIGNAL PANEL -->
   <div class="panel" id="ml-panel" style="grid-column:1/-1;border:2px solid rgba(0,229,255,0.3);background:rgba(0,10,20,0.98);">
