@@ -4780,16 +4780,25 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
     bear_pct    = round(votes["bear"] / max(total_votes, 1) * 100)
     conviction  = max(bull_pct, bear_pct)
 
-    if score >= 60:
+    # Require BOTH score threshold AND minimum conviction
+    min_conv_buy  = 55   # at least 55% of models must agree for BUY
+    min_conv_sell = 55   # at least 55% of models must agree for SELL
+
+    if score >= 65 and conviction >= min_conv_buy:
         action = "STRONG BUY";  color = "#00ff88"
-    elif score >= 30:
+    elif score >= 40 and conviction >= min_conv_buy:
         action = "BUY";         color = "#69f0ae"
-    elif score <= -60:
+    elif score <= -65 and conviction >= min_conv_sell:
         action = "STRONG SELL"; color = "#ff1744"
-    elif score <= -30:
+    elif score <= -40 and conviction >= min_conv_sell:
         action = "SELL";        color = "#ff6d00"
     else:
         action = "HOLD";        color = "#00e5ff"
+        # Show WHY it's HOLD if score was close
+        if score >= 40 and conviction < min_conv_buy:
+            action = "HOLD — LOW CONVICTION"; color = "#ffb300"
+        elif score <= -40 and conviction < min_conv_sell:
+            action = "HOLD — LOW CONVICTION"; color = "#ffb300"
 
     # Risk level
     vix = float(spy_data.get("vix", 20) or 20)
@@ -5296,16 +5305,30 @@ def run_analysis():
         # Momentum confirmation: don't alert BUY if price trend is down
         _recent_momentum = float(closes.pct_change(3).iloc[-1] or 0)
         _above_vwap_now  = price >= float(indicators.get("vwap", price) or price)
-        _momentum_ok_buy  = _recent_momentum >= -0.003  # not falling more than 0.3%
-        _momentum_ok_sell = _recent_momentum <= 0.003   # not rising more than 0.3%
+        _momentum_ok_buy  = _recent_momentum >= -0.003
+        _momentum_ok_sell = _recent_momentum <= 0.003
+
+        # SPOCK conviction check — don't alert if SPOCK disagrees
+        _spock = state.get("master_signal", {})
+        _spock_action    = _spock.get("action", "HOLD")
+        _spock_conv      = _spock.get("conviction", 0) or 0
+        _spock_ok_buy    = _spock_conv >= 55 and "BUY"  in _spock_action
+        _spock_ok_sell   = _spock_conv >= 55 and "SELL" in _spock_action
 
         if signal != "HOLD" and signal != last_signal:
-            # Require momentum confirmation for alerts
+            # Momentum check
             if signal == "BUY"  and not _momentum_ok_buy:
                 print(f"  ⚠️ BUY suppressed — momentum down ({_recent_momentum:.3%})", flush=True)
                 signal = "HOLD"
             if signal == "SELL" and not _momentum_ok_sell:
                 print(f"  ⚠️ SELL suppressed — momentum up ({_recent_momentum:.3%})", flush=True)
+                signal = "HOLD"
+            # SPOCK conviction check
+            if signal == "BUY"  and not _spock_ok_buy:
+                print(f"  ⚠️ BUY suppressed — SPOCK conviction too low ({_spock_conv}% / need 55%)", flush=True)
+                signal = "HOLD"
+            if signal == "SELL" and not _spock_ok_sell:
+                print(f"  ⚠️ SELL suppressed — SPOCK conviction too low ({_spock_conv}% / need 55%)", flush=True)
                 signal = "HOLD"
 
         if signal != "HOLD" and signal != last_signal:
@@ -10827,7 +10850,15 @@ function renderSpockPanel(ms) {
 
   // Action text
   var actEl = document.getElementById('masterAction');
-  if (actEl) { actEl.textContent = action; actEl.style.color = color; }
+  if (actEl) {
+    if (action && action.includes(' — ')) {
+      var parts = action.split(' — ');
+      actEl.innerHTML = '<span>' + parts[0] + '</span><div style="font-size:11px;letter-spacing:1px;margin-top:3px;opacity:0.7;">' + parts[1] + '</div>';
+    } else {
+      actEl.textContent = action || 'ANALYZING';
+    }
+    actEl.style.color = color;
+  }
 
   // Score
   var scoreEl = document.getElementById('masterScore');
