@@ -5560,7 +5560,7 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
         "gex":           round(gex, 0),
     }
 
-def run_analysis():
+def run_analysis(refresh_4h=True, refresh_news=True):
     global last_signal
     print(f"\n[ANALYSIS] {TICKER} @ {datetime.now().strftime('%H:%M:%S')}...", flush=True)
     try:
@@ -5652,14 +5652,20 @@ def run_analysis():
             spy_data = {"macro_score":0,"macro_signal":"ERROR","spy_trend":"UNKNOWN","spy_change_pct":0,"beta_20d":2.0,"vix":20,"vix_regime":"UNKNOWN","rs_signal":"NEUTRAL","divergence_warning":False,"expected_tsla_move":0,"tsla_spy_deviation":0}
 
         # ══ NEWS ENGINE ══
-        print("  📰 Fetching real-time news...")
-        try:
-            raw_articles = fetch_news()
-            news_data    = calculate_news_sentiment(raw_articles)
-        except Exception as _e:
-            print(f"  ⚠️ News error: {_e}")
-            raw_articles = []
-            news_data    = {"score":0,"signal":"ERROR","bull_count":0,"bear_count":0,"articles":[]}
+        if refresh_news or not state.get("news_data"):
+            print("  📰 Fetching real-time news...")
+            try:
+                raw_articles = fetch_news()
+                news_data    = calculate_news_sentiment(raw_articles)
+                state["news_data"] = news_data
+            except Exception as _e:
+                print(f"  ⚠️ News error: {_e}")
+                raw_articles = []
+                news_data    = {"score":0,"signal":"ERROR","bull_count":0,"bear_count":0,"articles":[]}
+        else:
+            print("  📰 News: [cached]", flush=True)
+            news_data    = state.get("news_data", {"score":0,"signal":"NEUTRAL","articles":[]})
+            raw_articles = news_data.get("articles", [])
 
         # ══ EXTENDED HOURS ENGINE ══
         print("  ⏰ Fetching extended hours data...")
@@ -6005,18 +6011,22 @@ def run_analysis():
             print(f"  Capitulation detector error: {_cap_e}", flush=True)
             state["capitulation"] = {}
 
-        # ── TSLA 4h Multi-Timeframe Analysis ────────────────────
-        try:
-            tsla_4h_data = calculate_tsla_4h(TICKER)
-            state["tsla_4h"] = tsla_4h_data
-            print(f"  📊 TSLA 4h: RSI={tsla_4h_data['rsi_4h']} | "
-                  f"Trend={tsla_4h_data['trend_4h']} | "
-                  f"MACD={'▲' if tsla_4h_data['macd_bull_4h'] else '▼'} | "
-                  f"BB={tsla_4h_data['bb_pct_4h']:.2f}", flush=True)
-        except Exception as _4he:
-            print(f"  ⚠️ TSLA 4h error: {_4he}", flush=True)
-            tsla_4h_data = {}
-            state["tsla_4h"] = {}
+        # ── TSLA 4h Multi-Timeframe Analysis (cached every 15 min) ─────
+        if refresh_4h or not state.get("tsla_4h"):
+            try:
+                tsla_4h_data = calculate_tsla_4h(TICKER)
+                state["tsla_4h"] = tsla_4h_data
+                print(f"  📊 TSLA 4h: RSI={tsla_4h_data['rsi_4h']} | "
+                      f"Trend={tsla_4h_data['trend_4h']} | "
+                      f"MACD={'▲' if tsla_4h_data['macd_bull_4h'] else '▼'} | "
+                      f"BB={tsla_4h_data['bb_pct_4h']:.2f}", flush=True)
+            except Exception as _4he:
+                print(f"  ⚠️ TSLA 4h error: {_4he}", flush=True)
+                tsla_4h_data = state.get("tsla_4h", {})
+        else:
+            tsla_4h_data = state.get("tsla_4h", {})
+            print(f"  📊 TSLA 4h: [cached] RSI={tsla_4h_data.get('rsi_4h','?')} "
+                  f"Trend={tsla_4h_data.get('trend_4h','?')}", flush=True)
 
         # ── DarthVader 1.0 — Institutional Intelligence ──────────
         dv_result = {}  # default if calculate_darthvader throws
@@ -6673,12 +6683,142 @@ def fetch_institutional_periodically():
         time.sleep(6 * 3600)
 
 
+# ── Tiered frequency caches ─────────────────────────────────────────────────
+_cache_4h      = {"ts": 0, "data": None}   # refresh every 15 min
+_cache_news    = {"ts": 0, "data": None}   # refresh every 15 min
+_price_history = []                         # rolling 1-min price ticks
+
+def _get_quick_price():
+    """Fetch just the current price — fast, lightweight."""
+    try:
+        import schwab_client as sc_mod
+        sc = sc_mod.get_client() if hasattr(sc_mod, "get_client") else None
+        if sc:
+            q = sc_mod.get_quote(TICKER)
+            if q and q.get("price"):
+                return float(q["price"])
+    except Exception:
+        pass
+    try:
+        import yfinance as yf
+        t = yf.Ticker(TICKER)
+        fast = t.fast_info
+        return float(fast.get("last_price") or fast.get("regularMarketPrice") or 0)
+    except Exception:
+        return None
+
+
+def _check_flash_move(current_price):
+    """
+    Check if price moved >1% in the last 1-5 minutes.
+    Returns (triggered, pct_move, direction) 
+    """
+    if len(_price_history) < 2:
+        return False, 0, ""
+    oldest = _price_history[0]["price"]
+    if oldest <= 0:
+        return False, 0, ""
+    pct = (current_price - oldest) / oldest * 100
+    if abs(pct) >= 1.0:
+        direction = "UP" if pct > 0 else "DOWN"
+        return True, round(pct, 2), direction
+    return False, 0, ""
+
+
+def _fast_price_loop():
+    """
+    Tier 1: runs every 60s during market hours.
+    Checks price only — triggers full analysis on flash moves.
+    """
+    import time as _t
+    print("[PRICE-LOOP] 1-min price monitor started", flush=True)
+    _last_alert_price = 0
+    _last_flash_ts    = 0
+
+    while True:
+        try:
+            now = datetime.now()
+            # Only run during market hours (Mon-Fri 9:30-16:00 ET)
+            is_market = (now.weekday() < 5 and
+                         (now.hour > 9 or (now.hour == 9 and now.minute >= 30)) and
+                         now.hour < 16)
+
+            if is_market:
+                price = _get_quick_price()
+                if price and price > 0:
+                    # Add to rolling 5-min history
+                    _price_history.append({"ts": time.time(), "price": price})
+                    # Keep only last 5 ticks (5 min window)
+                    while len(_price_history) > 5:
+                        _price_history.pop(0)
+
+                    # Update state price immediately
+                    if state.get("price"):
+                        state["price"] = price
+
+                    # Flash move detection
+                    flash, pct, direction = _check_flash_move(price)
+                    now_ts = time.time()
+                    if flash and (now_ts - _last_flash_ts) > 300:  # 5-min cooldown
+                        _last_flash_ts = now_ts
+                        print(f"[PRICE-LOOP] ⚡ FLASH MOVE: {pct:+.2f}% in ~5min "
+                              f"({direction}) @ ${price}", flush=True)
+                        # Send immediate WA alert for big moves
+                        if abs(pct) >= 2.0:
+                            emoji = "🚀" if direction == "UP" else "💥"
+                            _flash_msg = (
+                                f"{emoji} {TICKER} *FLASH MOVE* {pct:+.2f}% in 5min\n"
+                                f"💰 Price: *${price}*\n"
+                                f"⚡ Triggered immediate analysis"
+                            )
+                            _send_whatsapp(_flash_msg, "flash_move")
+                        # Trigger full analysis immediately
+                        import threading as _tflash
+                        _tflash.Thread(target=run_analysis, daemon=True).start()
+
+                    print(f"[PRICE] ${price} | "
+                          f"{'📈' if pct >= 0 else '📉'} {pct:+.2f}% (5min) | "
+                          f"{'MARKET' if is_market else 'CLOSED'}", flush=True)
+
+        except Exception as e:
+            print(f"[PRICE-LOOP] Error: {e}", flush=True)
+
+        _t.sleep(60)  # check every 60 seconds
+
+
 def monitor_loop():
+    """
+    Tier 2: Full analysis every 5 minutes.
+    Uses caches for slow-changing signals (4h, news).
+    """
     cycle = 0
     while True:
         cycle += 1
+        now_ts = time.time()
         print(f"[LOOP] cycle {cycle} starting", flush=True)
-        run_analysis()
+
+        # Decide what to refresh this cycle
+        refresh_4h   = (now_ts - _cache_4h["ts"])   > 900   # every 15 min
+        refresh_news = (now_ts - _cache_news["ts"]) > 900   # every 15 min
+
+        if refresh_4h:
+            print(f"[LOOP] Refreshing 4h cache (was {(now_ts-_cache_4h['ts'])/60:.0f}min old)", flush=True)
+        if refresh_news:
+            print(f"[LOOP] Refreshing news cache", flush=True)
+
+        run_analysis(
+            refresh_4h   = refresh_4h,
+            refresh_news = refresh_news,
+        )
+
+        # Update caches after run
+        if refresh_4h:
+            _cache_4h["ts"]   = now_ts
+            _cache_4h["data"] = state.get("tsla_4h", {})
+        if refresh_news:
+            _cache_news["ts"]   = now_ts
+            _cache_news["data"] = state.get("news_data", {})
+
         print(f"[LOOP] cycle {cycle} done, sleeping {CHECK_INTERVAL}s", flush=True)
         time.sleep(CHECK_INTERVAL)
 
@@ -7903,6 +8043,15 @@ def api_schwab_complete_auth_post():
         "next_step": "Copy token_json and set as SCHWAB_TOKEN_JSON in Railway Variables",
         "token_json": token_json,
     })
+
+@app.route("/api/price_ticks")
+def api_price_ticks():
+    """Recent 1-min price ticks for flash move monitoring."""
+    return jsonify({
+        "ticks":      _price_history[-10:],
+        "flash_move": _check_flash_move(state.get("price", 0)),
+    })
+
 
 @app.route("/api/spock/accuracy")
 def api_spock_accuracy():
@@ -14986,9 +15135,12 @@ def start_background_threads():
     except Exception as e:
         print(f"  ⚠️ First analysis error: {e}")
     # Start continuous loops (monitor_loop already calls run_analysis every 5min)
-    for target in [fetch_institutional_periodically, monitor_loop, _weekly_retrain_scheduler]:
+    for target in [fetch_institutional_periodically, monitor_loop,
+                   _weekly_retrain_scheduler, _fast_price_loop]:
         try:
             threading.Thread(target=target, daemon=True).start()
+            if target.__name__ == "_fast_price_loop":
+                print("  ✅ 1-min price monitor started", flush=True)
         except Exception as e:
             print(f"  ⚠️ Thread error ({target.__name__}): {e}")
 
