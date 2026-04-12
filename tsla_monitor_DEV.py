@@ -7294,14 +7294,22 @@ def _run_ml_retrain():
                     if hasattr(spy5.columns, "levels"): spy5.columns = spy5.columns.get_level_values(0)
                 except Exception: spy5 = yf.Ticker("SPY").history(period="2y", interval="1h")
             spy_closes = spy5["Close"].astype(float).reset_index(drop=True)
-            min_len    = min(len(closes), len(spy_closes))
-            closes     = closes.iloc[:min_len]
-            highs      = highs.iloc[:min_len]
-            lows       = lows.iloc[:min_len]
-            volumes    = volumes.iloc[:min_len]
-            spy_closes = spy_closes.iloc[:min_len]
-            idx        = hist5.index[:min_len]
-            spy_ok     = True
+            # Don't trim TSLA to SPY length — pad SPY instead
+            # This prevents losing 90% of training data when SPY has fewer bars
+            tsla_len = len(closes)
+            spy_len  = len(spy_closes)
+            if spy_len < tsla_len:
+                # Pad SPY with last known value to match TSLA length
+                pad = _pd_rt.Series(
+                    [float(spy_closes.iloc[-1])] * (tsla_len - spy_len),
+                    index=range(spy_len, tsla_len)
+                )
+                spy_closes = _pd_rt.concat([spy_closes, pad]).reset_index(drop=True)
+                print(f"[ML-RETRAIN] SPY padded {spy_len}→{tsla_len} bars", flush=True)
+            elif spy_len > tsla_len:
+                spy_closes = spy_closes.iloc[:tsla_len]
+            idx    = hist5.index[:tsla_len]
+            spy_ok = True
         except Exception as _spy_e:
             print(f"[ML-RETRAIN] SPY failed: {_spy_e}", flush=True)
             spy_closes = _pd_rt.Series(0.0, index=closes.index)
