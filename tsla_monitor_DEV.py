@@ -129,6 +129,7 @@ state = {
     "mm_data":   {},   # Market maker: GEX, Max Pain, options flow
     "uoa_data":  {},   # Unusual options activity — sweeps, whales, flow
     "ml_signal": {"signal":"HOLD","confidence":0,"probability":0.5,"available":False},
+    "tsla_4h":      {},
     "master_signal": {"action":"HOLD","score":0,"conviction":0,"risk":"MEDIUM",
                       "color":"#00e5ff","reasons":[],"bull_votes":0,"bear_votes":0},
     "dark_pool": {},   # Dark pool levels
@@ -1077,6 +1078,30 @@ def calculate_spy_analysis(tsla_closes, tsla_price):
             )
             # QQQ 5-day momentum
             result["qqq_mom_5d"] = round((qqq_price / float(qqq_closes.iloc[-6]) - 1)*100, 2) if len(qqq_closes) > 5 else 0
+            # QQQ 4h RSI (resample from 1h)
+            try:
+                qqq_1h = yf.Ticker("QQQ").history(period="60d", interval="1h")
+                if not qqq_1h.empty and len(qqq_1h) > 14:
+                    _q1c = qqq_1h["Close"].astype(float)
+                    qqq_4h = _q1c.resample("4h").last().dropna()
+                    if len(qqq_4h) > 14:
+                        _q4d = qqq_4h.diff()
+                        _q4g = _q4d.where(_q4d>0,0).rolling(14).mean()
+                        _q4l = -_q4d.where(_q4d<0,0).rolling(14).mean()
+                        qqq_rsi_4h = round(float((100-100/(1+_q4g/(_q4l+1e-9))).iloc[-1]),1)
+                        result["qqq_rsi_4h"] = qqq_rsi_4h
+                        result["qqq_ob_4h"]  = qqq_rsi_4h > 70
+                        result["qqq_os_4h"]  = qqq_rsi_4h < 30
+                        # Combined SPY+QQQ 4h both overbought = STRONG warning
+                        result["mtf_both_ob"] = result.get("spy_ob_4h",False) and qqq_rsi_4h > 70
+                        result["mtf_both_os"] = result.get("spy_os_4h",False) and qqq_rsi_4h < 30
+                        print(f"  📊 QQQ RSI — 4h:{qqq_rsi_4h} | Daily:{qqq_rsi}", flush=True)
+            except Exception:
+                result["qqq_rsi_4h"] = qqq_rsi
+                result["qqq_ob_4h"] = qqq_rsi > 70
+                result["qqq_os_4h"] = qqq_rsi < 30
+                result["mtf_both_ob"] = False
+                result["mtf_both_os"] = False
 
         # VIX
         if vix_closes is not None and len(vix_closes):
@@ -1156,6 +1181,43 @@ def calculate_spy_analysis(tsla_closes, tsla_price):
         result["spy_ema200"] = round(spy_ema200, 2)
         result["spy_ob"]     = spy_rsi > 70
         result["spy_os"]     = spy_rsi < 30
+
+        # SPY 1-hour RSI (from 1h bars)
+        try:
+            spy_1h = yf.Ticker("SPY").history(period="60d", interval="1h")
+            if not spy_1h.empty and len(spy_1h) > 14:
+                _s1c  = spy_1h["Close"].astype(float)
+                _s1d  = _s1c.diff()
+                _s1g  = _s1d.where(_s1d>0,0).rolling(14).mean()
+                _s1l  = -_s1d.where(_s1d<0,0).rolling(14).mean()
+                spy_rsi_1h = round(float((100-100/(1+_s1g/(_s1l+1e-9))).iloc[-1]),1)
+                # Resample 1h → 4h
+                spy_4h = _s1c.resample("4h").last().dropna()
+                if len(spy_4h) > 14:
+                    _s4d = spy_4h.diff()
+                    _s4g = _s4d.where(_s4d>0,0).rolling(14).mean()
+                    _s4l = -_s4d.where(_s4d<0,0).rolling(14).mean()
+                    spy_rsi_4h = round(float((100-100/(1+_s4g/(_s4l+1e-9))).iloc[-1]),1)
+                else:
+                    spy_rsi_4h = spy_rsi_1h
+                result["spy_rsi_1h"]  = spy_rsi_1h
+                result["spy_rsi_4h"]  = spy_rsi_4h
+                result["spy_ob_1h"]   = spy_rsi_1h > 70
+                result["spy_os_1h"]   = spy_rsi_1h < 30
+                result["spy_ob_4h"]   = spy_rsi_4h > 70
+                result["spy_os_4h"]   = spy_rsi_4h < 30
+                # Multi-timeframe confluence
+                result["spy_mtf_ob"]  = spy_rsi_4h > 70 and spy_rsi > 65  # 4h + daily both OB
+                result["spy_mtf_os"]  = spy_rsi_4h < 30 and spy_rsi < 35  # 4h + daily both OS
+                print(f"  📊 SPY RSI — Daily:{spy_rsi} | 4h:{spy_rsi_4h} | 1h:{spy_rsi_1h}", flush=True)
+                if result["spy_mtf_ob"]: print("  ⚠️ SPY MULTI-TIMEFRAME OVERBOUGHT", flush=True)
+                if result["spy_mtf_os"]: print("  ✅ SPY MULTI-TIMEFRAME OVERSOLD — bounce potential", flush=True)
+        except Exception as _1he:
+            result["spy_rsi_1h"] = spy_rsi; result["spy_rsi_4h"] = spy_rsi
+            result["spy_ob_1h"] = result["spy_ob"]; result["spy_ob_4h"] = result["spy_ob"]
+            result["spy_os_1h"] = result["spy_os"]; result["spy_os_4h"] = result["spy_os"]
+            result["spy_mtf_ob"] = False; result["spy_mtf_os"] = False
+
         # SPY MACD
         _sema12 = spy_closes.ewm(span=12, adjust=False).mean()
         _sema26 = spy_closes.ewm(span=26, adjust=False).mean()
@@ -4588,6 +4650,610 @@ def log_alert(message, alert_key="default"):
 last_signal = None
 
 
+
+
+# ─────────────────────────────────────────────────────────────
+#  SPOCK BRAIN — Self-Learning Decision Engine
+# ─────────────────────────────────────────────────────────────
+import uuid as _uuid
+
+_spock_decisions = []   # rolling log of all SPOCK decisions + outcomes
+_spock_accuracy  = {    # running accuracy stats
+    "total": 0, "correct_1h": 0, "correct_4h": 0, "correct_1d": 0,
+    "win_rate_1h": None, "win_rate_4h": None, "win_rate_1d": None,
+    "by_action": {},     # per-action win rates
+    "by_conviction": {}, # high/low conviction win rates
+    "last_correction":   None,
+    "corrections_fired": 0,
+}
+_spock_weights = {      # SPOCK tier weights — self-adjusting
+    "uoa":        30,   # Tier 1
+    "ml":         30,
+    "gex":        20,   # Tier 2
+    "darthvader": 20,
+    "signal":     10,   # Tier 3
+    "entry_exit": 10,
+    "hmm":         8,
+    "macro":      10,
+    "ofi":        10,   # Tier 3.5 volume
+    "absorption":  6,
+    "poc":         5,
+    "vol_4h":      6,
+    "cap":         5,   # Tier 4
+    "ichimoku":    5,
+    "news":        5,
+    "momentum":    5,
+}
+
+
+def _spock_log_decision(action, score, conviction, price, features_snapshot,
+                        mtf_dir, mtf_conf, reasons):
+    """Log a SPOCK decision for later outcome measurement."""
+    if action == "HOLD" and "LOW CONVICTION" not in action:
+        return  # only log actionable decisions
+    decision = {
+        "id":          str(_uuid.uuid4())[:8],
+        "timestamp":   time.time(),
+        "price":       round(price, 2),
+        "action":      action,
+        "score":       score,
+        "conviction":  conviction,
+        "mtf_dir":     mtf_dir,
+        "mtf_conf":    mtf_conf,
+        "reasons":     reasons[:3],
+        "features":    {k: round(float(v), 4) for k, v in features_snapshot.items()
+                       if isinstance(v, (int, float))},
+        # Outcomes — filled in later
+        "price_1h":    None, "price_4h":   None, "price_1d":   None,
+        "outcome_1h":  None, "outcome_4h": None, "outcome_1d": None,
+        "pnl_1h":      None, "pnl_4h":    None, "pnl_1d":     None,
+        "measured":    False,
+    }
+    _spock_decisions.append(decision)
+    # Keep last 500 decisions
+    if len(_spock_decisions) > 500:
+        _spock_decisions.pop(0)
+    print(f"[SPOCK-BRAIN] Decision logged: {action} @ ${price} "
+          f"| score={score:+d} | conv={conviction}% | id={decision['id']}", flush=True)
+
+
+def _spock_measure_outcomes(current_price):
+    """
+    Check past decisions against current price.
+    Called every analysis cycle.
+    """
+    now = time.time()
+    changed = False
+
+    for dec in _spock_decisions:
+        if dec.get("measured"):
+            continue
+        elapsed_h = (now - dec["timestamp"]) / 3600
+        entry_price = dec["price"]
+        if entry_price <= 0:
+            continue
+
+        pnl = (current_price - entry_price) / entry_price * 100
+        action = dec["action"]
+        # Correct = price moved in signal direction > 0.3%
+        def _outcome(pnl_pct, action):
+            threshold = 0.3
+            if   action in ("BUY","STRONG BUY")   and pnl_pct >  threshold: return "CORRECT"
+            elif action in ("SELL","STRONG SELL")  and pnl_pct < -threshold: return "CORRECT"
+            elif abs(pnl_pct) < threshold:                                    return "NEUTRAL"
+            else:                                                              return "WRONG"
+
+        # 1-hour outcome
+        if elapsed_h >= 1.0 and dec["outcome_1h"] is None:
+            dec["price_1h"]   = round(current_price, 2)
+            dec["pnl_1h"]     = round(pnl, 3)
+            dec["outcome_1h"] = _outcome(pnl, action)
+            changed = True
+            print(f"[SPOCK-BRAIN] 1h outcome: {dec['id']} {action} @ ${entry_price} → "
+                  f"${current_price} ({pnl:+.2f}%) = {dec['outcome_1h']}", flush=True)
+
+        # 4-hour outcome
+        if elapsed_h >= 4.0 and dec["outcome_4h"] is None:
+            dec["price_4h"]   = round(current_price, 2)
+            dec["pnl_4h"]     = round(pnl, 3)
+            dec["outcome_4h"] = _outcome(pnl, action)
+            changed = True
+            print(f"[SPOCK-BRAIN] 4h outcome: {dec['id']} {action} @ ${entry_price} → "
+                  f"${current_price} ({pnl:+.2f}%) = {dec['outcome_4h']}", flush=True)
+
+        # 1-day outcome
+        if elapsed_h >= 24.0 and dec["outcome_1d"] is None:
+            dec["price_1d"]   = round(current_price, 2)
+            dec["pnl_1d"]     = round(pnl, 3)
+            dec["outcome_1d"] = _outcome(pnl, action)
+            dec["measured"]   = True
+            changed = True
+            print(f"[SPOCK-BRAIN] 1d outcome: {dec['id']} {action} @ ${entry_price} → "
+                  f"${current_price} ({pnl:+.2f}%) = {dec['outcome_1d']}", flush=True)
+
+    if changed:
+        _spock_update_accuracy()
+
+
+def _spock_update_accuracy():
+    """Recompute rolling accuracy stats from decision log."""
+    # Use last 50 measured decisions
+    measured = [d for d in _spock_decisions if d.get("outcome_1h") is not None][-50:]
+    if not measured:
+        return
+
+    total     = len(measured)
+    corr_1h   = sum(1 for d in measured if d["outcome_1h"]  == "CORRECT")
+    measured_4h = [d for d in measured if d.get("outcome_4h")]
+    measured_1d = [d for d in measured if d.get("outcome_1d")]
+    corr_4h   = sum(1 for d in measured_4h if d["outcome_4h"] == "CORRECT")
+    corr_1d   = sum(1 for d in measured_1d if d["outcome_1d"] == "CORRECT")
+
+    _spock_accuracy["total"]        = total
+    _spock_accuracy["correct_1h"]   = corr_1h
+    _spock_accuracy["win_rate_1h"]  = round(corr_1h / total * 100, 1) if total else None
+    _spock_accuracy["win_rate_4h"]  = round(corr_4h / len(measured_4h) * 100, 1) if measured_4h else None
+    _spock_accuracy["win_rate_1d"]  = round(corr_1d / len(measured_1d) * 100, 1) if measured_1d else None
+
+    # By action
+    for action in ("BUY","STRONG BUY","SELL","STRONG SELL"):
+        grp = [d for d in measured if d["action"] == action and d["outcome_1h"]]
+        if grp:
+            wr = round(sum(1 for d in grp if d["outcome_1h"]=="CORRECT") / len(grp) * 100, 1)
+            _spock_accuracy["by_action"][action] = {"total": len(grp), "win_rate_1h": wr}
+
+    # By conviction level
+    high_conv = [d for d in measured if d["conviction"] >= 70 and d["outcome_1h"]]
+    low_conv  = [d for d in measured if d["conviction"] < 55  and d["outcome_1h"]]
+    if high_conv:
+        _spock_accuracy["by_conviction"]["high_70plus"] = round(
+            sum(1 for d in high_conv if d["outcome_1h"]=="CORRECT") / len(high_conv) * 100, 1)
+    if low_conv:
+        _spock_accuracy["by_conviction"]["low_under55"] = round(
+            sum(1 for d in low_conv if d["outcome_1h"]=="CORRECT") / len(low_conv) * 100, 1)
+
+    wr1h = _spock_accuracy["win_rate_1h"]
+    wr4h = _spock_accuracy["win_rate_4h"]
+    print(f"[SPOCK-BRAIN] Accuracy: 1h={wr1h}% | 4h={wr4h}% | "
+          f"n={total} decisions", flush=True)
+
+    # Trigger self-correction if win rate too low
+    if total >= 20 and wr1h is not None and wr1h < 55:
+        _spock_self_correct(measured)
+
+
+def _spock_self_correct(measured_decisions):
+    """
+    Self-correction: when win rate < 55%, analyze what went wrong
+    and adjust SPOCK weights + trigger ML retrain with correct labels.
+    """
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    if _spock_accuracy.get("last_correction"):
+        last = _spock_accuracy["last_correction"]
+        # Don't correct more than once per 24h
+        if (time.time() - last) < 86400:
+            return
+
+    wrong = [d for d in measured_decisions if d.get("outcome_1h") == "WRONG"]
+    print(f"[SPOCK-BRAIN] ⚠️ Self-correction triggered! win_rate={_spock_accuracy['win_rate_1h']}% "
+          f"| {len(wrong)} wrong decisions", flush=True)
+
+    # Analyze which features are most common in wrong decisions
+    feature_wrong_avg = {}
+    feature_right_avg = {}
+    right = [d for d in measured_decisions if d.get("outcome_1h") == "CORRECT"]
+
+    all_feats = set()
+    for d in measured_decisions:
+        all_feats.update(d.get("features", {}).keys())
+
+    for feat in all_feats:
+        wrong_vals = [d["features"].get(feat, 0) for d in wrong if feat in d.get("features", {})]
+        right_vals = [d["features"].get(feat, 0) for d in right if feat in d.get("features", {})]
+        if wrong_vals:
+            feature_wrong_avg[feat] = sum(wrong_vals) / len(wrong_vals)
+        if right_vals:
+            feature_right_avg[feat] = sum(right_vals) / len(right_vals)
+
+    # Weight adjustments — reduce weight for features dominant in wrong calls
+    weight_changes = []
+    for tier, weight_key in [
+        ("ofi", "ofi"), ("absorption", "absorption"),
+        ("uoa", "uoa"), ("ml", "ml"),
+    ]:
+        wrong_ofi  = abs(feature_wrong_avg.get("ofi_ratio", 0))
+        right_ofi  = abs(feature_right_avg.get("ofi_ratio", 0))
+        if wrong_ofi > right_ofi * 1.5:
+            # OFI was higher in wrong calls — reduce its weight
+            old_w = _spock_weights.get("ofi", 10)
+            new_w = max(4, old_w - 3)
+            _spock_weights["ofi"] = new_w
+            weight_changes.append(f"ofi: {old_w}→{new_w}")
+            break
+
+    # Check if wrong calls clustered in certain conviction range
+    wrong_conv = [d["conviction"] for d in wrong]
+    if wrong_conv and sum(wrong_conv)/len(wrong_conv) < 60:
+        # Wrong calls were mostly low conviction — raise threshold
+        print("[SPOCK-BRAIN] Wrong calls were low conviction — raising conviction gate to 60%", flush=True)
+
+    print(f"[SPOCK-BRAIN] Weight adjustments: {weight_changes}", flush=True)
+    print(f"[SPOCK-BRAIN] Triggering corrective retrain...", flush=True)
+
+    # Trigger ML retrain — the new training labels will reflect actual outcomes
+    import threading as _thr2
+    _thr2.Thread(target=_run_ml_retrain, daemon=True).start()
+
+    _spock_accuracy["last_correction"] = time.time()
+    _spock_accuracy["corrections_fired"] = _spock_accuracy.get("corrections_fired", 0) + 1
+
+
+def _spock_detect_breakout(price, closes, volumes, mm_data, spy_data):
+    """
+    Breakout volume detector.
+    Checks if price is crossing a key level with or without volume confirmation.
+    Returns breakout signal for SPOCK scoring.
+    """
+    result = {"breakout": False, "fake": False, "level": None,
+              "direction": None, "vol_ratio": 1.0, "score": 0, "reason": ""}
+    try:
+        # Key levels: max pain, round numbers near price, recent highs/lows
+        max_pain = float(mm_data.get("max_pain", 0) or 0)
+        round_levels = [round(price / 5) * 5 + i*5 for i in range(-4, 5)]
+        key_levels = sorted(set([max_pain] + round_levels + [
+            round(closes.max() / 5) * 5,   # recent high
+            round(closes.min() / 5) * 5,   # recent low
+        ]))
+        key_levels = [l for l in key_levels if 0 < l < price * 2]
+
+        # Volume ratio vs 20-bar avg
+        vol_now = float(volumes.iloc[-1]) if len(volumes) > 0 else 0
+        vol_avg = float(volumes.iloc[-20:].mean()) if len(volumes) >= 20 else vol_now
+        vol_ratio = vol_now / (vol_avg + 1e-9)
+        result["vol_ratio"] = round(vol_ratio, 2)
+
+        prev_price = float(closes.iloc[-2]) if len(closes) >= 2 else price
+
+        # Check if price just crossed a key level
+        for level in key_levels:
+            if abs(level - price) / price < 0.005:   # within 0.5% of key level
+                crossed_up   = prev_price < level <= price
+                crossed_down = prev_price > level >= price
+
+                if crossed_up or crossed_down:
+                    result["level"]     = level
+                    result["direction"] = "UP" if crossed_up else "DOWN"
+
+                    if vol_ratio >= 2.0:
+                        # High volume = confirmed breakout
+                        result["breakout"] = True
+                        pts = 15 if vol_ratio >= 3.0 else 10
+                        result["score"]  = pts if crossed_up else -pts
+                        result["reason"] = (
+                            f"{'↑' if crossed_up else '↓'} Breakout through ${level:.0f} "
+                            f"on {vol_ratio:.1f}x volume — CONFIRMED"
+                        )
+                    elif vol_ratio < 0.7:
+                        # Low volume = likely fake/trap
+                        result["fake"]   = True
+                        pts = -10
+                        result["score"]  = pts if crossed_up else 10
+                        result["reason"] = (
+                            f"{'↑' if crossed_up else '↓'} Break of ${level:.0f} "
+                            f"on LOW volume ({vol_ratio:.1f}x) — POSSIBLE FAKE"
+                        )
+                    break
+
+    except Exception as e:
+        print(f"  ⚠️ Breakout detector error: {e}", flush=True)
+    return result
+
+def calculate_tsla_4h(ticker=None):
+    """
+    Compute TSLA technical indicators on 4-hour bars.
+    Returns dict with RSI, MACD, BB, EMA, trend state.
+    """
+    _ticker = ticker or TICKER
+    result = {
+        "rsi_4h": 50.0, "macd_hist_4h": 0.0, "bb_pct_4h": 0.5,
+        "above_ema20_4h": True, "above_ema50_4h": True,
+        "trend_4h": "NEUTRAL", "ob_4h": False, "os_4h": False,
+        "macd_bull_4h": False, "vol_ratio_4h": 1.0,
+        "ema20_4h": 0.0, "ema50_4h": 0.0,
+    }
+    try:
+        import yfinance as yf
+        import numpy as np
+
+        # Fetch 1h bars and resample to 4h
+        hist_1h = yf.Ticker(_ticker).history(period="60d", interval="1h")
+        if hist_1h.empty or len(hist_1h) < 20:
+            return result
+
+        closes_1h  = hist_1h["Close"].astype(float)
+        volumes_1h = hist_1h["Volume"].astype(float)
+
+        # Resample to 4h OHLCV
+        closes_4h  = closes_1h.resample("4h").last().dropna()
+        volumes_4h = volumes_1h.resample("4h").sum().reindex(closes_4h.index, fill_value=0)
+
+        if len(closes_4h) < 14:
+            return result
+
+        price_4h = float(closes_4h.iloc[-1])
+
+        # RSI 14 on 4h
+        delta = closes_4h.diff()
+        gain  = delta.where(delta > 0, 0).rolling(14).mean()
+        loss  = -delta.where(delta < 0, 0).rolling(14).mean()
+        rsi_4h = round(float((100 - 100 / (1 + gain / (loss + 1e-9))).iloc[-1]), 1)
+
+        # MACD on 4h
+        ema12 = closes_4h.ewm(span=12, adjust=False).mean()
+        ema26 = closes_4h.ewm(span=26, adjust=False).mean()
+        macd  = ema12 - ema26
+        sig   = macd.ewm(span=9, adjust=False).mean()
+        macd_hist_4h = float((macd - sig).iloc[-1])
+        macd_prev    = float((macd - sig).iloc[-2]) if len(closes_4h) > 2 else macd_hist_4h
+        macd_cross_up = macd_hist_4h > 0 and macd_prev <= 0   # fresh bull cross
+
+        # Bollinger %B on 4h
+        ma20  = closes_4h.rolling(20).mean()
+        std20 = closes_4h.rolling(20).std().replace(0, 1)
+        bb_pct_4h = float(((closes_4h - (ma20 - 2*std20)) / (4*std20 + 1e-9)).iloc[-1])
+
+        # EMA 20 and 50 on 4h
+        ema20_4h = float(closes_4h.ewm(span=20, adjust=False).mean().iloc[-1])
+        ema50_4h = float(closes_4h.ewm(span=50, adjust=False).mean().iloc[-1]) if len(closes_4h) >= 50 else ema20_4h
+
+        # Volume ratio (current 4h bar vs avg of last 20 4h bars)
+        vol_avg = float(volumes_4h.iloc[-20:-1].mean() or 1)
+        vol_ratio_4h = float(volumes_4h.iloc[-1]) / vol_avg
+
+        # 4h trend state
+        above_ema20 = price_4h > ema20_4h
+        above_ema50 = price_4h > ema50_4h
+        if above_ema20 and above_ema50 and macd_hist_4h > 0:
+            trend_4h = "BULLISH"
+        elif not above_ema20 and not above_ema50 and macd_hist_4h < 0:
+            trend_4h = "BEARISH"
+        elif above_ema20 and not above_ema50:
+            trend_4h = "RECOVERING"
+        elif not above_ema20 and above_ema50:
+            trend_4h = "WEAKENING"
+        else:
+            trend_4h = "NEUTRAL"
+
+        result.update({
+            "rsi_4h":         rsi_4h,
+            "macd_hist_4h":   round(macd_hist_4h, 4),
+            "macd_bull_4h":   macd_hist_4h > 0,
+            "macd_cross_up":  macd_cross_up,
+            "bb_pct_4h":      round(bb_pct_4h, 3),
+            "ema20_4h":       round(ema20_4h, 2),
+            "ema50_4h":       round(ema50_4h, 2),
+            "above_ema20_4h": above_ema20,
+            "above_ema50_4h": above_ema50,
+            "vol_ratio_4h":   round(vol_ratio_4h, 2),
+            "trend_4h":       trend_4h,
+            "ob_4h":          rsi_4h > 70,
+            "os_4h":          rsi_4h < 30,
+            "price_4h":       round(price_4h, 2),
+        })
+
+    except Exception as e:
+        print(f"  ⚠️ TSLA 4h error: {e}", flush=True)
+
+    return result
+
+
+def calculate_spock_mtf_narrative(tsla_4h, spy_data, price):
+    """
+    SPOCK multi-timeframe narrative engine.
+    Synthesizes TSLA 4h + SPY 4h + QQQ 4h into a next-move estimate.
+
+    Returns dict:
+        direction:   UP / DOWN / SIDEWAYS
+        magnitude:   small / medium / large
+        timeframe:   intraday / swing
+        confidence:  LOW / MEDIUM / HIGH / VERY HIGH
+        narrative:   human-readable explanation
+        tsla_state:  what TSLA is doing on 4h
+        spy_state:   what SPY is doing on 4h
+        alignment:   CONFIRMED / CONTRADICTED / NEUTRAL
+    """
+    t_rsi    = tsla_4h.get("rsi_4h", 50)
+    t_trend  = tsla_4h.get("trend_4h", "NEUTRAL")
+    t_macd   = tsla_4h.get("macd_hist_4h", 0)
+    t_cross  = tsla_4h.get("macd_cross_up", False)
+    t_bb     = tsla_4h.get("bb_pct_4h", 0.5)
+    t_ob     = tsla_4h.get("ob_4h", False)
+    t_os     = tsla_4h.get("os_4h", False)
+    t_ema20  = tsla_4h.get("above_ema20_4h", True)
+    t_ema50  = tsla_4h.get("above_ema50_4h", True)
+    t_vol    = tsla_4h.get("vol_ratio_4h", 1.0)
+
+    s_rsi_4h = float(spy_data.get("spy_rsi_4h", 50) or 50)
+    s_ob_4h  = spy_data.get("spy_ob_4h", False)
+    s_os_4h  = spy_data.get("spy_os_4h", False)
+    s_rsi_d  = float(spy_data.get("spy_rsi", 50) or 50)
+    s_mtf_ob = spy_data.get("spy_mtf_ob", False)
+    s_mtf_os = spy_data.get("spy_mtf_os", False)
+
+    q_rsi_4h = float(spy_data.get("qqq_rsi_4h", 50) or 50)
+    q_ob_4h  = spy_data.get("qqq_ob_4h", False)
+    q_os_4h  = spy_data.get("qqq_os_4h", False)
+
+    mtf_both_ob = spy_data.get("mtf_both_ob", False)
+    mtf_both_os = spy_data.get("mtf_both_os", False)
+
+    bull_signals = 0
+    bear_signals = 0
+    reasons      = []
+
+    # ── Analyze TSLA 4h ──────────────────────────────────────────────────────
+    if t_os:
+        bull_signals += 2
+        reasons.append(f"TSLA 4h RSI oversold ({t_rsi:.0f}) — bounce historically likely")
+    elif t_rsi < 40:
+        bull_signals += 1
+        reasons.append(f"TSLA 4h RSI approaching oversold ({t_rsi:.0f})")
+    elif t_ob:
+        bear_signals += 2
+        reasons.append(f"TSLA 4h RSI overbought ({t_rsi:.0f}) — pullback risk")
+    elif t_rsi > 60:
+        bear_signals += 1
+
+    if t_cross:
+        bull_signals += 2
+        reasons.append("TSLA 4h MACD just crossed bullish — momentum shift")
+    elif t_macd > 0 and t_macd > 0:
+        bull_signals += 1
+    elif t_macd < 0:
+        bear_signals += 1
+
+    if t_trend == "BULLISH":
+        bull_signals += 1
+        reasons.append("TSLA 4h trend BULLISH (above EMA20+50, MACD positive)")
+    elif t_trend == "BEARISH":
+        bear_signals += 2
+        reasons.append("TSLA 4h trend BEARISH (below EMA20+50)")
+    elif t_trend == "RECOVERING":
+        bull_signals += 1
+        reasons.append("TSLA recovering — above EMA20 but not yet EMA50")
+    elif t_trend == "WEAKENING":
+        bear_signals += 1
+
+    if t_bb < 0.1:
+        bull_signals += 1
+        reasons.append("TSLA near lower Bollinger band on 4h — mean reversion likely")
+    elif t_bb > 0.9:
+        bear_signals += 1
+        reasons.append("TSLA near upper Bollinger band on 4h — stretched")
+
+    if t_vol > 2.0:
+        # Very high 4h volume — strong confirmation
+        if bull_signals > bear_signals:
+            bull_signals += 2
+            reasons.append(f"Strong 4h volume surge ({t_vol:.1f}x avg) — institutional conviction BUY")
+        elif bear_signals > bull_signals:
+            bear_signals += 2
+            reasons.append(f"Strong 4h volume surge ({t_vol:.1f}x avg) — institutional conviction SELL")
+        else:
+            reasons.append(f"High 4h volume ({t_vol:.1f}x avg) — watching for direction")
+    elif t_vol > 1.5:
+        if bull_signals > bear_signals:
+            bull_signals += 1
+            reasons.append(f"Elevated 4h volume ({t_vol:.1f}x avg) confirming bullish move")
+        elif bear_signals > bull_signals:
+            bear_signals += 1
+            reasons.append(f"Elevated 4h volume ({t_vol:.1f}x avg) confirming bearish move")
+    elif t_vol < 0.5:
+        # Very low volume — low conviction, fade the move
+        reasons.append(f"Low 4h volume ({t_vol:.1f}x avg) — low conviction, be cautious")
+
+    # ── Cross-reference SPY/QQQ 4h ──────────────────────────────────────────
+    if mtf_both_ob:
+        bear_signals += 3
+        reasons.append(f"SPY+QQQ both overbought on 4h+daily (SPY:{s_rsi_4h:.0f}, QQQ:{q_rsi_4h:.0f}) — market top risk")
+    elif mtf_both_os:
+        bull_signals += 3
+        reasons.append(f"SPY+QQQ both oversold on 4h+daily — market bottom, TSLA to follow")
+    elif s_ob_4h and q_ob_4h:
+        bear_signals += 2
+        reasons.append(f"SPY+QQQ both overbought on 4h (SPY:{s_rsi_4h:.0f}, QQQ:{q_rsi_4h:.0f})")
+    elif s_os_4h and q_os_4h:
+        bull_signals += 2
+        reasons.append(f"SPY+QQQ both oversold on 4h — market finding support")
+    elif s_ob_4h:
+        bear_signals += 1
+        reasons.append(f"SPY overbought on 4h (RSI {s_rsi_4h:.0f})")
+    elif s_os_4h:
+        bull_signals += 1
+        reasons.append(f"SPY oversold on 4h (RSI {s_rsi_4h:.0f})")
+
+    # ── Alignment check ──────────────────────────────────────────────────────
+    # TSLA oversold + SPY oversold = maximum confluence bull
+    # TSLA oversold + SPY overbought = TSLA-specific problem
+    tsla_bull = bull_signals > bear_signals
+    tsla_bear = bear_signals > bull_signals
+
+    if t_os and (s_os_4h or q_os_4h):
+        alignment = "CONFIRMED"
+        bull_signals += 1
+        reasons.append("✅ Triple confluence: TSLA oversold + market oversold")
+    elif t_ob and (s_ob_4h or q_ob_4h):
+        alignment = "CONFIRMED"
+        bear_signals += 1
+        reasons.append("⚠️ Triple confluence: TSLA overbought + market overbought")
+    elif t_os and s_ob_4h:
+        alignment = "CONTRADICTED"
+        reasons.append("⚡ CONFLICT: TSLA oversold but SPY overbought — TSLA-specific weakness, caution")
+    elif t_ob and s_os_4h:
+        alignment = "CONTRADICTED"
+        reasons.append("⚡ CONFLICT: TSLA overbought but SPY oversold — TSLA running ahead, fade risk")
+    else:
+        alignment = "NEUTRAL"
+
+    # ── Final direction ──────────────────────────────────────────────────────
+    net = bull_signals - bear_signals
+    total = bull_signals + bear_signals + 1
+
+    if net >= 4:
+        direction  = "UP"
+        magnitude  = "large" if net >= 6 else "medium"
+        timeframe  = "swing (1-3 days)" if t_trend in ("BULLISH","RECOVERING") else "intraday"
+        confidence = "VERY HIGH" if net >= 6 else "HIGH"
+    elif net >= 2:
+        direction  = "UP"
+        magnitude  = "small" if net == 2 else "medium"
+        timeframe  = "intraday to swing"
+        confidence = "MEDIUM"
+    elif net <= -4:
+        direction  = "DOWN"
+        magnitude  = "large" if net <= -6 else "medium"
+        timeframe  = "swing (1-3 days)" if t_trend == "BEARISH" else "intraday"
+        confidence = "VERY HIGH" if net <= -6 else "HIGH"
+    elif net <= -2:
+        direction  = "DOWN"
+        magnitude  = "small" if net == -2 else "medium"
+        timeframe  = "intraday to swing"
+        confidence = "MEDIUM"
+    else:
+        direction  = "SIDEWAYS"
+        magnitude  = "small"
+        timeframe  = "intraday"
+        confidence = "LOW"
+
+    # Build TSLA state string
+    tsla_state_str = (
+        f"RSI {t_rsi:.0f} "
+        f"({'OVERSOLD' if t_os else 'OVERBOUGHT' if t_ob else 'NEUTRAL'}) | "
+        f"MACD {'▲' if t_macd > 0 else '▼'} | "
+        f"{'Above' if t_ema20 else 'Below'} EMA20 | "
+        f"Trend: {t_trend}"
+    )
+    spy_state_str = (
+        f"SPY 4h RSI {s_rsi_4h:.0f} "
+        f"({'OB' if s_ob_4h else 'OS' if s_os_4h else 'OK'}) | "
+        f"QQQ 4h RSI {q_rsi_4h:.0f} "
+        f"({'OB' if q_ob_4h else 'OS' if q_os_4h else 'OK'})"
+    )
+
+    return {
+        "direction":   direction,
+        "magnitude":   magnitude,
+        "timeframe":   timeframe,
+        "confidence":  confidence,
+        "alignment":   alignment,
+        "tsla_state":  tsla_state_str,
+        "spy_state":   spy_state_str,
+        "reasons":     reasons[:4],
+        "bull_signals": bull_signals,
+        "bear_signals": bear_signals,
+        "net_score":   net,
+    }
+
 def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
                              dv_result, entry_data, peak_data, exit_score,
                              spy_data, cap_result, ichi, hmm_result,
@@ -4721,11 +5387,32 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
     spy_os = spy_data.get("spy_os", False)
     qqq_ob = spy_data.get("qqq_ob", False)
     qqq_os = spy_data.get("qqq_os", False)
-    if spy_ob and qqq_ob:
-        score -= 10; reasons.append("SPY + QQQ both overbought — market stretched")
+    # Multi-timeframe confluence — much stronger signal
+    spy_mtf_ob = spy_data.get("spy_mtf_ob", False)
+    spy_mtf_os = spy_data.get("spy_mtf_os", False)
+    mtf_both_ob = spy_data.get("mtf_both_ob", False)
+    mtf_both_os = spy_data.get("mtf_both_os", False)
+    spy_rsi_4h = float(spy_data.get("spy_rsi_4h", 50) or 50)
+    qqq_rsi_4h = float(spy_data.get("qqq_rsi_4h", 50) or 50)
+
+    if mtf_both_ob:
+        score -= 15; reasons.append(f"SPY+QQQ overbought on 4h+daily (SPY 4h RSI:{spy_rsi_4h:.0f}, QQQ 4h RSI:{qqq_rsi_4h:.0f})")
+        votes["bear"] += 1
+    elif mtf_both_os:
+        score += 15; reasons.append(f"SPY+QQQ oversold on 4h+daily — high-conviction bounce setup")
+        votes["bull"] += 1
+    elif spy_ob and qqq_ob:
+        score -= 10; reasons.append("SPY + QQQ both overbought daily — market stretched")
         votes["bear"] += 1
     elif spy_os and qqq_os:
-        score += 10; reasons.append("SPY + QQQ both oversold — market washed out")
+        score += 10; reasons.append("SPY + QQQ both oversold daily — market washed out")
+        votes["bull"] += 1
+    # 4h alone is also meaningful
+    elif spy_rsi_4h > 72:
+        score -= 6; reasons.append(f"SPY overbought on 4h (RSI {spy_rsi_4h:.0f}) — pullback risk")
+        votes["bear"] += 1
+    elif spy_rsi_4h < 28:
+        score += 6; reasons.append(f"SPY oversold on 4h (RSI {spy_rsi_4h:.0f}) — bounce likely")
         votes["bull"] += 1
     elif macro_score >= 20:
         score += 6; votes["bull"] += 1
@@ -4733,6 +5420,49 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
         score -= 6; votes["bear"] += 1
     else:
         votes["neutral"] += 1
+
+    # ── TIER 3.5: VOLUME SIGNALS (±10 pts each) ─────────────────────────────────
+
+    # 8b. OFI — Order Flow Imbalance (institutional buy/sell pressure)
+    _dv_ft    = dv_result.get("features", {}) if isinstance(dv_result, dict) else {}
+    ofi_ratio  = float(_dv_ft.get("ofi_ratio",  0) or 0)
+    absorption = float(_dv_ft.get("absorption",  0) or 0)
+    if ofi_ratio > 2.0:
+        score += 10; reasons.append(f"OFI {ofi_ratio:.1f}x — institutions actively BUYING")
+        votes["bull"] += 1
+    elif ofi_ratio < -2.0:
+        score -= 10; reasons.append(f"OFI {ofi_ratio:.1f}x — institutions actively SELLING")
+        votes["bear"] += 1
+    else:
+        votes["neutral"] += 1
+
+    # 8c. Absorption — institutions defending a price level
+    if absorption > 2.0:
+        score += 6; reasons.append(f"High absorption ({absorption:.1f}x) — smart money holding price")
+        votes["bull"] += 1
+    elif absorption < 0.3:
+        score -= 4; reasons.append("No absorption — price level not defended")
+        votes["bear"] += 1
+
+    # 8d. Volume Profile POC — price above = bullish, below = bearish
+    poc_data  = state.get("poc_data", {}) if isinstance(state, dict) else {}
+    poc_price = float(poc_data.get("poc", 0) or 0)
+    if poc_price > 0:
+        poc_dist = (price - poc_price) / price * 100
+        if poc_dist > 2:
+            score += 5; reasons.append(f"Price {poc_dist:.1f}% above POC ${poc_price:.0f} — bullish structure")
+            votes["bull"] += 1
+        elif poc_dist < -2:
+            score -= 5; reasons.append(f"Price {abs(poc_dist):.1f}% below POC ${poc_price:.0f} — bearish structure")
+            votes["bear"] += 1
+
+    # 8e. 4h volume — high volume confirms the dominant direction
+    tsla_4h_vol = float(state.get("tsla_4h", {}).get("vol_ratio_4h", 1.0) or 1.0) if isinstance(state, dict) else 1.0
+    if tsla_4h_vol > 2.0 and score != 0:
+        amp = 6 if score > 0 else -6
+        score += amp
+        reasons.append(f"4h volume surge ({tsla_4h_vol:.1f}x avg) — institutional conviction")
+        votes["bull" if amp > 0 else "bear"] += 1
 
     # ── TIER 4: CONFIRMING (±5 pts each) ────────────────────────────────────
 
@@ -5275,6 +6005,19 @@ def run_analysis():
             print(f"  Capitulation detector error: {_cap_e}", flush=True)
             state["capitulation"] = {}
 
+        # ── TSLA 4h Multi-Timeframe Analysis ────────────────────
+        try:
+            tsla_4h_data = calculate_tsla_4h(TICKER)
+            state["tsla_4h"] = tsla_4h_data
+            print(f"  📊 TSLA 4h: RSI={tsla_4h_data['rsi_4h']} | "
+                  f"Trend={tsla_4h_data['trend_4h']} | "
+                  f"MACD={'▲' if tsla_4h_data['macd_bull_4h'] else '▼'} | "
+                  f"BB={tsla_4h_data['bb_pct_4h']:.2f}", flush=True)
+        except Exception as _4he:
+            print(f"  ⚠️ TSLA 4h error: {_4he}", flush=True)
+            tsla_4h_data = {}
+            state["tsla_4h"] = {}
+
         # ── DarthVader 1.0 — Institutional Intelligence ──────────
         dv_result = {}  # default if calculate_darthvader throws
         try:
@@ -5620,6 +6363,19 @@ def run_analysis():
                 # Market breadth composite
                 "market_ob":       1 if (spy_data.get("spy_ob") and spy_data.get("qqq_ob")) else 0,
                 "market_os":       1 if (spy_data.get("spy_os") and spy_data.get("qqq_os")) else 0,
+                # Multi-timeframe SPY/QQQ (NEW — 4h + 1h)
+                "spy_rsi_4h":      float(spy_data.get("spy_rsi_4h", 50) or 50),
+                "spy_rsi_1h":      float(spy_data.get("spy_rsi_1h", 50) or 50),
+                "spy_ob_4h":       1 if spy_data.get("spy_ob_4h", False) else 0,
+                "spy_os_4h":       1 if spy_data.get("spy_os_4h", False) else 0,
+                "spy_ob_1h":       1 if spy_data.get("spy_ob_1h", False) else 0,
+                "spy_os_1h":       1 if spy_data.get("spy_os_1h", False) else 0,
+                "spy_mtf_ob":      1 if spy_data.get("spy_mtf_ob", False) else 0,
+                "spy_mtf_os":      1 if spy_data.get("spy_mtf_os", False) else 0,
+                "qqq_rsi_4h":      float(spy_data.get("qqq_rsi_4h", 50) or 50),
+                "qqq_ob_4h":       1 if spy_data.get("qqq_ob_4h", False) else 0,
+                "mtf_both_ob":     1 if spy_data.get("mtf_both_ob", False) else 0,
+                "mtf_both_os":     1 if spy_data.get("mtf_both_os", False) else 0,
                 # Daily context
                 "daily_ret_so_far": _daily_ret,
                 # EMA / trend
@@ -5661,7 +6417,8 @@ def run_analysis():
                 "iv_skew":         _iv_skew,
             }
             ml_signal = _get_ml_signal(_ml_features)
-            state["ml_signal"] = ml_signal
+            state["ml_signal"]         = ml_signal
+            state["_last_ml_features"] = _ml_features  # for SPOCK decision logging
 
             # ── MASTER SIGNAL — synthesize all models ──────────────────────
             try:
@@ -5683,7 +6440,65 @@ def run_analysis():
                     indicators  = indicators,
                     price       = price,
                 )
+                # Add MTF narrative
+                mtf = calculate_spock_mtf_narrative(
+                    tsla_4h  = state.get("tsla_4h", {}),
+                    spy_data = spy_data,
+                    price    = price,
+                )
+                master["mtf"] = mtf
+
+                # Breakout volume detector
+                try:
+                    breakout = _spock_detect_breakout(
+                        price, closes, volumes, mm_data, spy_data)
+                    master["breakout"] = breakout
+                    if breakout["score"] != 0:
+                        print(f"  🚨 BREAKOUT: {breakout['reason']}", flush=True)
+                except Exception as _be:
+                    master["breakout"] = {}
+
                 state["master_signal"] = master
+
+                # Log decision for self-learning
+                if master["action"] not in ("HOLD",):
+                    try:
+                        _ml_feats = state.get("_last_ml_features", {})
+                        _spock_log_decision(
+                            action    = master["action"],
+                            score     = master["score"],
+                            conviction= master["conviction"],
+                            price     = price,
+                            features_snapshot = _ml_feats,
+                            mtf_dir   = mtf.get("direction","?"),
+                            mtf_conf  = mtf.get("confidence","?"),
+                            reasons   = master["reasons"],
+                        )
+                    except Exception as _le:
+                        pass
+
+                # Measure outcomes of past decisions
+                try:
+                    _spock_measure_outcomes(price)
+                except Exception as _oe:
+                    pass
+
+                # Add accuracy stats to state
+                state["spock_accuracy"] = _spock_accuracy
+                state["spock_weights"]  = _spock_weights
+                print(f"  🖖 SPOCK MTF: {mtf['direction']} {mtf['magnitude']} | "
+                      f"conf={mtf['confidence']} | align={mtf['alignment']}", flush=True)
+                # Apply breakout score to master
+                bk = master.get("breakout", {})
+                if bk.get("score", 0) != 0:
+                    master["score"] = max(-100, min(100, master["score"] + bk["score"]))
+                    if bk["score"] > 0:
+                        master["reasons"].insert(0, bk["reason"])
+                        master["bull_votes"] += 1
+                    else:
+                        master["reasons"].insert(0, bk["reason"])
+                        master["bear_votes"] += 1
+
                 print(f"  🖖 SPOCK MASTER: {master['action']} | score={master['score']:+d} | "
                       f"conviction={master['conviction']}% | risk={master['risk']} | "
                       f"bulls={master['bull_votes']} bears={master['bear_votes']}", flush=True)
@@ -6583,6 +7398,15 @@ def _run_ml_retrain():
                 _spy_mom_r, _spy_a200_r,
                 _qqq_rsi_r, _qqq_ob_r, _qqq_os_r, _qqq_mbull_r, _qqq_mom_r, _qqq_bull_r,
                 _mkt_ob_r, _mkt_os_r,
+                # MTF proxies (daily values used in training)
+                _spy_rsi_r, _spy_rsi_r,
+                _spy_ob_r, _spy_os_r,
+                _spy_ob_r, _spy_os_r,
+                1 if _spy_ob_r and _spy_ob_r else 0,
+                1 if _spy_os_r and _spy_os_r else 0,
+                _qqq_rsi_r, _qqq_ob_r,
+                1 if _spy_ob_r and _qqq_ob_r else 0,
+                1 if _spy_os_r and _qqq_os_r else 0,
                 ]
                 X_rows.append(row)
                 future = float(closes.iloc[min(i+FORWARD, n-1)])
@@ -6620,11 +7444,17 @@ def _run_ml_retrain():
             "pc_ratio","pc_delta",
             # Schwab Greeks
             "delta_atm","gamma_exposure","theta_decay","vega_exposure","iv_skew",
-            # SPY/QQQ market context (NEW)
+            # SPY/QQQ market context
             "spy_rsi","spy_ob","spy_os","spy_macd_bull","spy_bb_pct",
             "spy_mom_5d","spy_above_200",
             "qqq_rsi","qqq_ob","qqq_os","qqq_macd_bull","qqq_mom_5d","qqq_bull",
             "market_ob","market_os",
+            # Multi-timeframe SPY/QQQ (4h + 1h) — NEW
+            "spy_rsi_4h","spy_rsi_1h",
+            "spy_ob_4h","spy_os_4h","spy_ob_1h","spy_os_1h",
+            "spy_mtf_ob","spy_mtf_os",
+            "qqq_rsi_4h","qqq_ob_4h",
+            "mtf_both_ob","mtf_both_os",
         ]
 
         assert len(feat_cols)==X.shape[1], f"Mismatch {len(feat_cols)} vs {X.shape[1]}"
@@ -6723,6 +7553,34 @@ def _run_ml_retrain():
         _ml_load_errors = []
         print(f"[ML-RETRAIN] Saved — {pkg['model_name']} AUC={auc:.3f} on {len(X)} bars, {len(feat_cols)} features.", flush=True)
 
+        # ── Feature importance (LightGBM gives the clearest view) ──
+        try:
+            lgbm_model = next((m for m in models_trained if "LGB" in type(m).__name__), None)
+            if lgbm_model and hasattr(lgbm_model, "feature_importances_"):
+                importances = lgbm_model.feature_importances_
+                feat_imp = sorted(zip(feat_cols, importances), key=lambda x: -x[1])
+                print("[ML-RETRAIN] === TOP 20 FEATURE IMPORTANCE ===", flush=True)
+                for fname, imp in feat_imp[:20]:
+                    bar = "█" * int(imp / max(importances) * 20)
+                    group = ("SPY/QQQ" if any(x in fname for x in ["spy_","qqq_","market_"])
+                             else "Greeks" if any(x in fname for x in ["delta","gamma","theta","vega","iv_skew"])
+                             else "Options" if any(x in fname for x in ["iv_","pc_","earn"])
+                             else "TSLA")
+                    print(f"  [{group:7s}] {fname:25s} {imp:6.1f}  {bar}", flush=True)
+
+                # Group importance by category
+                spy_qqq_imp = sum(imp for f, imp in feat_imp if any(x in f for x in ["spy_","qqq_","market_"]))
+                tsla_imp    = sum(imp for f, imp in feat_imp if not any(x in f for x in ["spy_","qqq_","market_"]))
+                total_imp   = spy_qqq_imp + tsla_imp
+                print(f"[ML-RETRAIN] SPY/QQQ importance: {spy_qqq_imp/total_imp*100:.1f}%  "
+                      f"TSLA-specific: {tsla_imp/total_imp*100:.1f}%", flush=True)
+
+                # Store in pkg for API access
+                pkg["feature_importance"] = {f: float(i) for f, i in feat_imp}
+                pkg["spy_qqq_importance_pct"] = round(spy_qqq_imp/total_imp*100, 1)
+        except Exception as _fie:
+            print(f"[ML-RETRAIN] Feature importance error: {_fie}", flush=True)
+
         try:
             print("[ML-RETRAIN] Triggering re-analysis...", flush=True)
             run_analysis()
@@ -6778,6 +7636,9 @@ def api_debug_ml():
     # 4. Show last ML signal from state
     result["ml_signal"]     = state.get("ml_signal", {})
     result["master_signal"] = state.get("master_signal", {})
+    result["tsla_4h"]        = state.get("tsla_4h", {})
+    result["spock_accuracy"] = state.get("spock_accuracy", {})
+    result["spock_weights"]  = state.get("spock_weights", {})
     result["earnings_context"] = state.get("earnings_context", {})
     result["alert_scorecard"]  = _get_alert_scorecard()
     return jsonify(result)
@@ -7042,6 +7903,34 @@ def api_schwab_complete_auth_post():
         "next_step": "Copy token_json and set as SCHWAB_TOKEN_JSON in Railway Variables",
         "token_json": token_json,
     })
+
+@app.route("/api/spock/accuracy")
+def api_spock_accuracy():
+    """SPOCK self-learning accuracy dashboard."""
+    decisions = _spock_decisions[-100:]  # last 100
+    measured  = [d for d in decisions if d.get("outcome_1h")]
+    return jsonify({
+        "accuracy":    _spock_accuracy,
+        "weights":     _spock_weights,
+        "total_logged": len(_spock_decisions),
+        "recent_decisions": [
+            {
+                "id":         d["id"],
+                "time":       datetime.fromtimestamp(d["timestamp"]).strftime("%H:%M"),
+                "action":     d["action"],
+                "price":      d["price"],
+                "score":      d["score"],
+                "conviction": d["conviction"],
+                "outcome_1h": d.get("outcome_1h"),
+                "outcome_4h": d.get("outcome_4h"),
+                "pnl_1h":     d.get("pnl_1h"),
+                "pnl_4h":     d.get("pnl_4h"),
+                "reasons":    d.get("reasons", []),
+            }
+            for d in reversed(decisions[-20:])
+        ],
+    })
+
 
 @app.route("/api/alert_scorecard")
 def api_alert_scorecard():
@@ -7515,7 +8404,7 @@ def _get_ml_signal(features_dict):
         if pkg is None: return empty
         cols = pkg["feature_cols"]
         row_data = {c: float(features_dict.get(c, 0) or 0) for c in cols}
-        _is_stale = len(cols) != 67
+        _is_stale = len(cols) != 79
         X_df   = pd.DataFrame([row_data], columns=cols)
         X_s    = pkg["scaler"].transform(X_df)
         X_s_df = pd.DataFrame(X_s, columns=cols)
@@ -9507,7 +10396,7 @@ function updateUI(s) {
     function(){renderMMPanel(s.mm_data||{},s.dark_pool||{},s.price||0);},
     function(){renderInstModels(s.institutional_models||{},s.indicators||{});},
     function(){if(s.darthvader)renderDarthVader(s.darthvader);},
-    function(){window._lastState=s;renderSpockPanel(s.master_signal||{});renderMLPanel(s.ml_signal||{});},
+    function(){window._lastState=s;renderSpockPanel(s.master_signal||{});renderSpockAccuracy(s.spock_accuracy||{});renderMLPanel(s.ml_signal||{});},
     function(){try{renderCapBounce(s.capitulation||null);}catch(e){}},
     function(){try{renderPOCPanel(s.poc_data||{},s.vol_profile||[],s.price||0);}catch(e){}},
   ].forEach(function(fn,i){try{fn();}catch(e){console.warn('Panel['+i+']: '+e.message);}});
@@ -10893,6 +11782,38 @@ function renderSpockPanel(ms) {
     }).join('');
   }
 
+  // MTF Analysis
+  var mtf = ms.mtf || {};
+  if (mtf.direction) {
+    var dirColor = mtf.direction==='UP' ? '#00ff88' : mtf.direction==='DOWN' ? '#ff3355' : '#ffb300';
+    var confColor = mtf.confidence==='VERY HIGH'?'#00ff88':mtf.confidence==='HIGH'?'#69f0ae':mtf.confidence==='MEDIUM'?'#ffb300':'#666';
+
+    var nmEl = document.getElementById('mtfNextMove');
+    if (nmEl) {
+      nmEl.textContent = (mtf.direction==='UP' ? '▲ ' : mtf.direction==='DOWN' ? '▼ ' : '◆ ')
+                        + mtf.direction + ' — ' + (mtf.magnitude||'').toUpperCase();
+      nmEl.style.color = dirColor;
+    }
+    var confEl = document.getElementById('mtfConf');
+    if (confEl) {
+      confEl.textContent = (mtf.confidence||'') + ' confidence | ' + (mtf.timeframe||'');
+      confEl.style.color = confColor;
+    }
+    var alEl = document.getElementById('mtfAlignment');
+    if (alEl) {
+      alEl.textContent = mtf.alignment || '—';
+      alEl.style.color = mtf.alignment==='CONFIRMED'?'#00ff88':mtf.alignment==='CONTRADICTED'?'#ff3355':'#ffb300';
+    }
+    var t4El = document.getElementById('tsla4hState');
+    if (t4El) { t4El.textContent = mtf.tsla_state || '—'; }
+    var sqEl = document.getElementById('spyQqq4h');
+    if (sqEl) { sqEl.textContent = mtf.spy_state || '—'; }
+    var mrEl = document.getElementById('mtfReasons');
+    if (mrEl && mtf.reasons && mtf.reasons.length) {
+      mrEl.innerHTML = mtf.reasons.map(function(r){ return '▸ ' + r; }).join('&nbsp;&nbsp;|&nbsp;&nbsp;');
+    }
+  }
+
   // Background glow
   var bg = document.getElementById('masterBg');
   if (bg) {
@@ -10900,6 +11821,27 @@ function renderSpockPanel(ms) {
                action.includes('SELL') ? 'rgba(255,23,68,0.05)'  :
                                          'rgba(0,10,20,0.95)';
     bg.style.background = glow;
+  }
+}
+
+function renderSpockAccuracy(acc) {
+  if (!acc) return;
+  var wr1h = acc.win_rate_1h, wr4h = acc.win_rate_4h, wr1d = acc.win_rate_1d;
+  var col = function(v) {
+    if (v === null || v === undefined) return '#666';
+    return v >= 70 ? '#00ff88' : v >= 60 ? '#ffb300' : '#ff3355';
+  };
+  var el1h = document.getElementById('accWin1h');
+  var el4h = document.getElementById('accWin4h');
+  var el1d = document.getElementById('accWin1d');
+  var elN  = document.getElementById('accTotal');
+  var elC  = document.getElementById('accCorrections');
+  if (el1h) { el1h.textContent = wr1h !== null ? wr1h + '%' : '—'; el1h.style.color = col(wr1h); }
+  if (el4h) { el4h.textContent = wr4h !== null ? wr4h + '%' : '—'; el4h.style.color = col(wr4h); }
+  if (el1d) { el1d.textContent = wr1d !== null ? wr1d + '%' : '—'; el1d.style.color = col(wr1d); }
+  if (elN)  { elN.textContent  = acc.total || 0; }
+  if (elC && acc.corrections_fired > 0) {
+    elC.textContent = '⚡ ' + acc.corrections_fired + ' self-correction' + (acc.corrections_fired > 1 ? 's' : '') + ' fired';
   }
 }
 
@@ -12406,6 +13348,44 @@ setTimeout(pollSpockStatus, 5000);
         </div>
 
       </div>
+
+      <!-- MTF Analysis Row -->
+      <div id="spockMtfRow" style="border-top:1px solid rgba(255,255,255,0.06);padding:12px 24px;display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:16px;align-items:center;">
+        <div>
+          <div style="font-size:8px;letter-spacing:2px;color:var(--text-dim);margin-bottom:4px;">TSLA 4H</div>
+          <div id="tsla4hState" style="font-size:10px;color:#00e5ff;font-family:var(--font-mono);">Loading...</div>
+        </div>
+        <div>
+          <div style="font-size:8px;letter-spacing:2px;color:var(--text-dim);margin-bottom:4px;">SPY / QQQ 4H</div>
+          <div id="spyQqq4h" style="font-size:10px;color:#00e5ff;font-family:var(--font-mono);">Loading...</div>
+        </div>
+        <div>
+          <div style="font-size:8px;letter-spacing:2px;color:var(--text-dim);margin-bottom:4px;">ALIGNMENT</div>
+          <div id="mtfAlignment" style="font-size:12px;font-weight:700;letter-spacing:1px;color:#ffb300;">—</div>
+        </div>
+        <div style="text-align:right;">
+          <div style="font-size:8px;letter-spacing:2px;color:var(--text-dim);margin-bottom:4px;">SPOCK NEXT MOVE</div>
+          <div id="mtfNextMove" style="font-size:14px;font-weight:900;font-family:var(--font-mono);color:#00ff88;">—</div>
+          <div id="mtfConf" style="font-size:9px;color:var(--text-dim);margin-top:2px;">—</div>
+        </div>
+      </div>
+      <div id="mtfReasons" style="border-top:1px solid rgba(255,255,255,0.04);padding:8px 24px;font-size:9px;color:var(--text-dim);line-height:1.9;"></div>
+
+      <!-- SPOCK Accuracy Bar -->
+      <div style="border-top:1px solid rgba(255,255,255,0.06);padding:8px 24px;display:flex;align-items:center;gap:24px;flex-wrap:wrap;">
+        <div style="font-size:8px;letter-spacing:2px;color:var(--text-dim);">SPOCK ACCURACY</div>
+        <div style="display:flex;gap:16px;font-size:9px;font-family:var(--font-mono);">
+          <span>1H: <span id="accWin1h" style="color:#00ff88;">—</span></span>
+          <span>4H: <span id="accWin4h" style="color:#00ff88;">—</span></span>
+          <span>1D: <span id="accWin1d" style="color:#00ff88;">—</span></span>
+          <span style="color:var(--text-dim);">|</span>
+          <span>N: <span id="accTotal" style="color:#00e5ff;">—</span> decisions</span>
+          <span style="color:var(--text-dim);">|</span>
+          <span>TARGET: <span style="color:#ffb300;">70%</span></span>
+        </div>
+        <div id="accCorrections" style="font-size:8px;color:#ff6d00;margin-left:auto;"></div>
+      </div>
+
     </div>
   </div>
 
@@ -12414,7 +13394,7 @@ setTimeout(pollSpockStatus, 5000);
   <div class="panel" id="ml-panel" style="grid-column:1/-1;border:2px solid rgba(0,229,255,0.3);background:rgba(0,10,20,0.98);">
     <div class="panel-title" onclick="togglePanel('ml-panel')" style="cursor:pointer;">
       🧠 ML DIRECTIONAL SIGNAL
-      <span id="mlPanelHeader" style="font-size:9px;color:var(--text-dim);">ENSEMBLE · 67 FEATURES · AUC — · SCHWAB + SPY/QQQ + 5-MIN BARS</span>
+      <span id="mlPanelHeader" style="font-size:9px;color:var(--text-dim);">ENSEMBLE · 79 FEATURES · AUC — · SCHWAB + SPY/QQQ MTF + 5-MIN BARS</span>
       <span class="panel-collapse-btn" id="btn-ml-panel">▾</span>
     </div>
     <div style="display:grid;grid-template-columns:180px 1fr 1fr 1fr;gap:16px;align-items:start;">
@@ -13973,7 +14953,12 @@ def start_background_threads():
             "spy_rsi","spy_ob","spy_os","spy_macd_bull","spy_bb_pct",
             "spy_mom_5d","spy_above_200",
             "qqq_rsi","qqq_ob","qqq_os","qqq_macd_bull","qqq_mom_5d","qqq_bull",
-            "market_ob","market_os"
+            "market_ob","market_os",
+            "spy_rsi_4h","spy_rsi_1h",
+            "spy_ob_4h","spy_os_4h","spy_ob_1h","spy_os_1h",
+            "spy_mtf_ob","spy_mtf_os",
+            "qqq_rsi_4h","qqq_ob_4h",
+            "mtf_both_ob","mtf_both_os"
         ]
     try:
         pkg = _load_ml_model()
