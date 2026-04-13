@@ -1098,7 +1098,16 @@ def calculate_spy_analysis(tsla_closes, tsla_price):
                 qqq_1h = yf.Ticker("QQQ").history(period="60d", interval="1h")
                 if not qqq_1h.empty and len(qqq_1h) > 14:
                     _q1c = qqq_1h["Close"].astype(float)
-                    qqq_4h = _q1c.resample("4h").last().dropna()
+                    try:
+                        import pytz as _ptz2
+                        _et2 = _ptz2.timezone("America/New_York")
+                        _q1c_et = _q1c.copy()
+                        if _q1c_et.index.tz is None:
+                            _q1c_et.index = _q1c_et.index.tz_localize("UTC")
+                        _q1c_et.index = _q1c_et.index.tz_convert(_et2)
+                        qqq_4h = _q1c_et.resample("4h", offset="9h30min").last().dropna()
+                    except Exception:
+                        qqq_4h = _q1c.resample("4h").last().dropna()
                     if len(qqq_4h) > 14:
                         _q4d = qqq_4h.diff()
                         _q4g = _q4d.where(_q4d>0,0).rolling(14).mean()
@@ -1206,8 +1215,17 @@ def calculate_spy_analysis(tsla_closes, tsla_price):
                 _s1g  = _s1d.where(_s1d>0,0).rolling(14).mean()
                 _s1l  = -_s1d.where(_s1d<0,0).rolling(14).mean()
                 spy_rsi_1h = round(float((100-100/(1+_s1g/(_s1l+1e-9))).iloc[-1]),1)
-                # Resample 1h → 4h
-                spy_4h = _s1c.resample("4h").last().dropna()
+                # Resample 1h → 4h with ET timezone alignment
+                try:
+                    import pytz as _ptz
+                    _et = _ptz.timezone("America/New_York")
+                    _s1c_et = _s1c.copy()
+                    if _s1c_et.index.tz is None:
+                        _s1c_et.index = _s1c_et.index.tz_localize("UTC")
+                    _s1c_et.index = _s1c_et.index.tz_convert(_et)
+                    spy_4h = _s1c_et.resample("4h", offset="9h30min").last().dropna()
+                except Exception:
+                    spy_4h = _s1c.resample("4h").last().dropna()
                 if len(spy_4h) > 14:
                     _s4d = spy_4h.diff()
                     _s4g = _s4d.where(_s4d>0,0).rolling(14).mean()
@@ -4988,9 +5006,26 @@ def calculate_tsla_4h(ticker=None):
         closes_1h  = hist_1h["Close"].astype(float)
         volumes_1h = hist_1h["Volume"].astype(float)
 
-        # Resample to 4h OHLCV
-        closes_4h  = closes_1h.resample("4h").last().dropna()
-        volumes_4h = volumes_1h.resample("4h").sum().reindex(closes_4h.index, fill_value=0)
+        # Resample to 4h — must convert to ET first so bars align to market hours
+        # UTC resample("4h") gives wrong boundaries (market opens at 13:30 UTC)
+        try:
+            import pytz
+            et = pytz.timezone("America/New_York")
+            closes_et  = closes_1h.copy()
+            volumes_et = volumes_1h.copy()
+            if closes_et.index.tz is None:
+                closes_et.index  = closes_et.index.tz_localize("UTC")
+                volumes_et.index = volumes_et.index.tz_localize("UTC")
+            closes_et.index  = closes_et.index.tz_convert(et)
+            volumes_et.index = volumes_et.index.tz_convert(et)
+            # Resample with 9:30 ET offset so bars = 9:30-13:30, 13:30-16:00 etc
+            closes_4h  = closes_et.resample("4h", offset="9h30min").last().dropna()
+            volumes_4h = volumes_et.resample("4h", offset="9h30min").sum().reindex(
+                closes_4h.index, fill_value=0)
+        except Exception:
+            # Fallback: use UTC resample (less accurate but works)
+            closes_4h  = closes_1h.resample("4h").last().dropna()
+            volumes_4h = volumes_1h.resample("4h").sum().reindex(closes_4h.index, fill_value=0)
 
         if len(closes_4h) < 14:
             return result
