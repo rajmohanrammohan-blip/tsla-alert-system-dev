@@ -2713,9 +2713,25 @@ def calculate_market_maker_data(ticker_symbol, current_price):
         # ── IV Rank / Signal ──
         if iv_list:
             iv_now   = round(float(np.median(iv_list)) * 100, 1)
-            iv_high  = round(float(np.percentile(iv_list, 90)) * 100, 1)
-            iv_low   = round(float(np.percentile(iv_list, 10)) * 100, 1)
-            iv_rank  = round((iv_now - iv_low) / (iv_high - iv_low + 1e-9) * 100, 1) if iv_high > iv_low else 50
+            # True IV Rank: compare ATM IV to 52-week range from historical IV
+            # Fetch historical IV via yfinance VIX as proxy for market IV
+            try:
+                import yfinance as _yf2
+                _iv_hist = _yf2.Ticker(TICKER).history(period="1y", interval="1d")
+                if not _iv_hist.empty and len(_iv_hist) > 50:
+                    # Use (High-Low)/Close as realized vol proxy for 52wk range
+                    _rv = ((_iv_hist["High"] - _iv_hist["Low"]) / _iv_hist["Close"] * 100)
+                    iv_high = round(float(_rv.quantile(0.90)), 1)
+                    iv_low  = round(float(_rv.quantile(0.10)), 1)
+                    iv_rank = round((iv_now - iv_low) / (iv_high - iv_low + 1e-9) * 100, 1) if iv_high > iv_low else 50
+                    iv_rank = max(0, min(100, iv_rank))
+                else:
+                    raise ValueError("no history")
+            except Exception:
+                # Fallback: use chain cross-sectional percentile
+                iv_high = round(float(np.percentile(iv_list, 90)) * 100, 1)
+                iv_low  = round(float(np.percentile(iv_list, 10)) * 100, 1)
+                iv_rank = round((iv_now - iv_low) / (iv_high - iv_low + 1e-9) * 100, 1) if iv_high > iv_low else 50
             result["iv_current"] = iv_now
             result["iv_rank"]    = iv_rank
             result["iv_signal"]  = (
@@ -5695,7 +5711,26 @@ def run_analysis(refresh_4h=True, refresh_news=True):
 
         # ══ INSTITUTIONAL / WALL STREET MODELS ══
         opens_s  = hist["Open"]
-        vwap_r   = calculate_vwap(highs, lows, closes, volumes)
+        # VWAP must reset daily — filter to today's bars only
+        from datetime import date as _date
+        _today_str = str(_date.today())
+        _today_mask = hist.index.date == _date.today()
+        if _today_mask.sum() > 0:
+            _h_today = hist[_today_mask]
+            _vwap_h = _h_today["High"].astype(float)
+            _vwap_l = _h_today["Low"].astype(float)
+            _vwap_c = _h_today["Close"].astype(float)
+            _vwap_v = _h_today["Volume"].astype(float)
+        else:
+            # Weekend/pre-market: use last trading day
+            _last_date = hist.index.date[-1]
+            _mask = hist.index.date == _last_date
+            _h_today = hist[_mask]
+            _vwap_h = _h_today["High"].astype(float)
+            _vwap_l = _h_today["Low"].astype(float)
+            _vwap_c = _h_today["Close"].astype(float)
+            _vwap_v = _h_today["Volume"].astype(float)
+        vwap_r   = calculate_vwap(_vwap_h, _vwap_l, _vwap_c, _vwap_v)
         kalman_r = calculate_kalman_filter(closes)
         zscore_r = calculate_zscore(closes)
         kelly_r  = calculate_kelly(closes)
@@ -5964,7 +5999,9 @@ def run_analysis(refresh_4h=True, refresh_news=True):
         try:
             price_bins = {}
             _bin_size  = 1.0   # $1 price buckets
-            for i in range(-60, 0):
+            # Use last 30 trading days = ~2340 bars of 5-min data
+            _poc_lookback = min(2340, len(closes))
+            for i in range(-_poc_lookback, 0):
                 _h = float(highs.iloc[i])
                 _l = float(lows.iloc[i])
                 _v = float(volumes.iloc[i])
