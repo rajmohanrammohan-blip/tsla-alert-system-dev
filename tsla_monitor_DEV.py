@@ -5596,6 +5596,7 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
 def run_analysis(refresh_4h=True, refresh_news=True):
     global last_signal
     print(f"\n[ANALYSIS] {TICKER} @ {datetime.now().strftime('%H:%M:%S')}...", flush=True)
+    poc_data = state.get("poc_data", {})  # init early — computed later, use last known until then
     try:
         # ── Fetch price history — Schwab first, yfinance fallback ──
         hist = None
