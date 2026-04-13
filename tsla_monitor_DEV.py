@@ -7781,6 +7781,13 @@ def _run_ml_retrain():
         except Exception as _re: print(f"[ML-RETRAIN] Regime models: {_re}", flush=True)
         _ml_model_cache = pkg
         _ml_load_errors = []
+        # Remove stale old pkl files so they can't be loaded by mistake
+        import os as _os2
+        for _old_name in ["tsla_model.pkl", "./tsla_model.pkl"]:
+            try:
+                if _os2.path.exists(_old_name) and _old_name != pkl_path:
+                    _os2.remove(_old_name)
+            except Exception: pass
         print(f"[ML-RETRAIN] Saved — {pkg['model_name']} AUC={auc:.3f} on {len(X)} bars, {len(feat_cols)} features.", flush=True)
 
         # ── Feature importance (LightGBM gives the clearest view) ──
@@ -15210,7 +15217,9 @@ def start_background_threads():
             if len(loaded_cols) != len(_EXPECTED_ML_FEATURES):
                 print(f"[STARTUP] ⚠️ ML feature count mismatch: loaded={len(loaded_cols)} expected={len(_EXPECTED_ML_FEATURES)} — retraining with enhanced model...", flush=True)
                 global _ml_model_cache
-                _ml_model_cache = None
+                _ml_model_cache = None   # clear so retrain can write fresh
+                # Keep old pkg available via local var for first analysis cycle
+                _startup_stale_pkg = pkg
                 threading.Thread(target=_run_ml_retrain, daemon=True).start()
             else:
                 n_models = pkg.get("n_models", 1)
