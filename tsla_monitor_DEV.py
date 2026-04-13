@@ -7425,16 +7425,18 @@ def _run_ml_retrain():
 
         # 7. Build feature rows — LOOKBACK scales with bar interval
         n = len(closes)
-        if n >= 5000:
-            LOOKBACK = 78   # 5-min: 78 bars ~ 1 trading day
+        # 60 trading days * 78 bars/day = 4680 bars (yfinance 60d 5-min)
+        # 2 years * 252 days * 78 bars/day = 39,312 bars (Schwab 2yr 5-min)
+        if n >= 4000:
+            LOOKBACK = 78   # 5-min bars — 1 trading day lookback
             MIN_START = 200
-            FORWARD   = 6   # predict 30min ahead (6x5min)
-        elif n >= 1000:
-            LOOKBACK = 7    # 1h: 7 bars ~ 1 trading day
+            FORWARD   = 6   # predict 30min ahead (6x5min bars)
+        elif n >= 800:
+            LOOKBACK = 7    # 1h bars — 1 trading day lookback
             MIN_START = 50
             FORWARD   = 2   # predict 2h ahead
         else:
-            LOOKBACK = 5    # daily: 5 bars ~ 1 week
+            LOOKBACK = 5    # daily bars — 1 week lookback
             MIN_START = 30
             FORWARD   = 1   # predict next day
         print(f"[ML-RETRAIN] Using LOOKBACK={LOOKBACK} FORWARD={FORWARD}", flush=True)
@@ -7642,7 +7644,7 @@ def _run_ml_retrain():
                 skipped_errors += 1
                 if skipped_errors <= 3: print(f"[ML-RETRAIN] bar {i} err: {_le}", flush=True)
         print(f"[ML-RETRAIN] {len(X_rows)} samples ({skipped_errors} errors), pos_rate={sum(y_rows)/max(len(y_rows),1):.2f}", flush=True)
-        min_samples = 50 if FORWARD == 1 else 200   # daily bars need fewer samples
+        min_samples = 500 if FORWARD == 6 else (50 if FORWARD == 1 else 200)
         if len(X_rows) < min_samples:
             print(f"[ML-RETRAIN] Not enough samples ({len(X_rows)} < {min_samples})", flush=True); return
 
