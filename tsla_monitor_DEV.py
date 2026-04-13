@@ -555,6 +555,21 @@ def generate_signal(indicators, price):
     elif obv_trend < 0:
         score -= 10; reasons.append("OBV falling — distribution pressure ▼")
 
+    # POC / Value Area in generate_signal
+    _poc_s = indicators.get("poc_price", 0) or 0
+    _vah_s = indicators.get("vah", 0) or 0
+    _val_s = indicators.get("val", 0) or 0
+    _cur   = float(indicators.get("current_price", 0) or price_arg)
+    if _poc_s > 0:
+        if _vah_s > 0 and _cur > _vah_s:
+            score += 12; reasons.append(f"Price above VAH ${_vah_s:.0f} — value area breakout ▲")
+        elif _val_s > 0 and _cur < _val_s:
+            score -= 12; reasons.append(f"Price below VAL ${_val_s:.0f} — value area breakdown ▼")
+        elif _cur > _poc_s * 1.01:
+            score += 5; reasons.append(f"Price above POC ${_poc_s:.0f}")
+        elif _cur < _poc_s * 0.99:
+            score -= 5; reasons.append(f"Price below POC ${_poc_s:.0f}")
+
     # ════════════════════════════════════════════════════
     # INSTITUTIONAL / WALL STREET MODEL SCORING
     # Each model contributes independently — confluence
@@ -5444,17 +5459,35 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
         score -= 4; reasons.append("No absorption — price level not defended")
         votes["bear"] += 1
 
-    # 8d. Volume Profile POC — price above = bullish, below = bearish
+    # 8d. Volume Profile POC + Value Area — institutional support/resistance
     poc_data  = state.get("poc_data", {}) if isinstance(state, dict) else {}
     poc_price = float(poc_data.get("poc", 0) or 0)
+    vah       = float(poc_data.get("vah", 0) or 0)
+    val       = float(poc_data.get("val", 0) or 0)
+    in_va     = poc_data.get("in_va", True)
+
     if poc_price > 0:
         poc_dist = (price - poc_price) / price * 100
-        if poc_dist > 2:
+
+        # Price vs VAH (Value Area High) — breakout above = bullish
+        if vah > 0 and price > vah:
+            score += 10; reasons.append(f"Price ABOVE Value Area High ${vah:.0f} — bullish breakout")
+            votes["bull"] += 1
+        # Price vs VAL (Value Area Low) — break below = bearish
+        elif val > 0 and price < val:
+            score -= 10; reasons.append(f"Price BELOW Value Area Low ${val:.0f} — bearish breakdown")
+            votes["bear"] += 1
+        # Price vs POC (inside value area)
+        elif poc_dist > 1.5:
             score += 5; reasons.append(f"Price {poc_dist:.1f}% above POC ${poc_price:.0f} — bullish structure")
             votes["bull"] += 1
-        elif poc_dist < -2:
+        elif poc_dist < -1.5:
             score -= 5; reasons.append(f"Price {abs(poc_dist):.1f}% below POC ${poc_price:.0f} — bearish structure")
             votes["bear"] += 1
+        else:
+            # Price AT POC — magnet zone, low directional signal
+            reasons.append(f"Price at POC ${poc_price:.0f} — magnet zone, watch for breakout direction")
+            votes["neutral"] += 1
 
     # 8e. 4h volume — high volume confirms the dominant direction
     tsla_4h_vol = float(state.get("tsla_4h", {}).get("vol_ratio_4h", 1.0) or 1.0) if isinstance(state, dict) else 1.0
@@ -5757,9 +5790,13 @@ def run_analysis(refresh_4h=True, refresh_news=True):
         indicators = {
             "rsi": rsi, "macd": macd_val, "macd_signal": macd_sig, "macd_hist": macd_hist,
             "prev_macd_hist": prev_macd_hist,
-            "vix":   float(spy_data.get("vix", 20) or 20),
-            "ret_1b": float(closes.pct_change(1).iloc[-1] or 0),
-            "ret_3b": float(closes.pct_change(3).iloc[-1] or 0),
+            "vix":        float(spy_data.get("vix", 20) or 20),
+            "ret_1b":     float(closes.pct_change(1).iloc[-1] or 0),
+            "ret_3b":     float(closes.pct_change(3).iloc[-1] or 0),
+            "poc_price":  float(poc_data.get("poc", 0) or 0),
+            "vah":        float(poc_data.get("vah", 0) or 0),
+            "val":        float(poc_data.get("val", 0) or 0),
+            "current_price": price,
             "bb_upper": bb_upper, "bb_mid": bb_mid, "bb_lower": bb_lower,
             "ema50": ema50, "ema200": ema200,
             "volume_ratio": vol_ratio,
@@ -6373,6 +6410,12 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 # Market breadth composite
                 "market_ob":       1 if (spy_data.get("spy_ob") and spy_data.get("qqq_ob")) else 0,
                 "market_os":       1 if (spy_data.get("spy_os") and spy_data.get("qqq_os")) else 0,
+                # Volume Profile / POC features
+                "poc_dist":        float(poc_data.get("price_vs_poc", 0) or 0) / 100,  # % from POC
+                "above_poc":       1 if poc_data.get("above_poc", True) else 0,
+                "in_value_area":   1 if poc_data.get("in_va", True) else 0,
+                "above_vah":       1 if price > float(poc_data.get("vah", price) or price) else 0,
+                "below_val":       1 if price < float(poc_data.get("val", price) or price) else 0,
                 # Multi-timeframe SPY/QQQ (NEW — 4h + 1h)
                 "spy_rsi_4h":      float(spy_data.get("spy_rsi_4h", 50) or 50),
                 "spy_rsi_1h":      float(spy_data.get("spy_rsi_1h", 50) or 50),
@@ -7476,7 +7519,39 @@ def _run_ml_retrain():
                 dist_from_low  = (price-l20)/(l20+1e-9)
                 absorption     = abs(float(highs.iloc[i])-float(lows.iloc[i]))/(price+1e-9)
 
-                # SPY/QQQ market context for this bar date
+                # Volume Profile POC — rolling 50-bar window
+                _poc_dist_r = 0.0; _above_poc_r = 1; _in_va_r = 1
+                _above_vah_r = 0; _below_val_r = 0
+                try:
+                    _w = 50
+                    _bc = closes.iloc[max(0,i-_w):i+1]
+                    _bv = volumes.iloc[max(0,i-_w):i+1] if len(volumes) > i else _bc * 0
+                    if len(_bc) > 10:
+                        _bn = {}
+                        for _bp2, _bv2 in zip(_bc, _bv):
+                            _k2 = round(float(_bp2)/0.5)*0.5
+                            _bn[_k2] = _bn.get(_k2, 0) + float(_bv2)
+                        if _bn:
+                            _poc2 = max(_bn, key=_bn.get)
+                            _sb   = sorted(_bn.keys())
+                            _tv   = sum(_bn.values()); _tgt = _tv*0.70
+                            _ac   = 0; _vlo = _poc2; _vhi = _poc2
+                            _li   = _sb.index(_poc2); _hi2 = _li
+                            while _ac < _tgt and (_li>0 or _hi2<len(_sb)-1):
+                                _lv = _bn.get(_sb[_li-1],0) if _li>0 else 0
+                                _hv = _bn.get(_sb[_hi2+1],0) if _hi2<len(_sb)-1 else 0
+                                if _lv>=_hv and _li>0: _li-=1; _vlo=_sb[_li]; _ac+=_lv
+                                elif _hi2<len(_sb)-1: _hi2+=1; _vhi=_sb[_hi2]; _ac+=_hv
+                                else: break
+                            _cp = float(price)
+                            _poc_dist_r  = (_cp-_poc2)/(_poc2+1e-9)
+                            _above_poc_r = 1 if _cp>_poc2 else 0
+                            _in_va_r     = 1 if _vlo<=_cp<=_vhi else 0
+                            _above_vah_r = 1 if _cp>_vhi else 0
+                            _below_val_r = 1 if _cp<_vlo else 0
+                except Exception: pass
+
+            # SPY/QQQ market context for this bar date
                 _spy_rsi_r=50.0;_spy_ob_r=0;_spy_os_r=0;_spy_mbull_r=1;_spy_bb_r=0.5;_spy_mom_r=0.0;_spy_a200_r=1
                 _qqq_rsi_r=50.0;_qqq_ob_r=0;_qqq_os_r=0;_qqq_mbull_r=1;_qqq_mom_r=0.0;_qqq_bull_r=1;_mkt_ob_r=0;_mkt_os_r=0
                 if bar_date is not None:
@@ -7546,6 +7621,8 @@ def _run_ml_retrain():
                 _spy_mom_r, _spy_a200_r,
                 _qqq_rsi_r, _qqq_ob_r, _qqq_os_r, _qqq_mbull_r, _qqq_mom_r, _qqq_bull_r,
                 _mkt_ob_r, _mkt_os_r,
+                # Volume Profile POC features (computed per bar)
+                _poc_dist_r, _above_poc_r, _in_va_r, _above_vah_r, _below_val_r,
                 # MTF proxies (daily values used in training)
                 _spy_rsi_r, _spy_rsi_r,
                 _spy_ob_r, _spy_os_r,
@@ -7597,6 +7674,8 @@ def _run_ml_retrain():
             "spy_mom_5d","spy_above_200",
             "qqq_rsi","qqq_ob","qqq_os","qqq_macd_bull","qqq_mom_5d","qqq_bull",
             "market_ob","market_os",
+            # Volume Profile / POC
+            "poc_dist","above_poc","in_value_area","above_vah","below_val",
             # Multi-timeframe SPY/QQQ (4h + 1h) — NEW
             "spy_rsi_4h","spy_rsi_1h",
             "spy_ob_4h","spy_os_4h","spy_ob_1h","spy_os_1h",
@@ -8561,7 +8640,7 @@ def _get_ml_signal(features_dict):
         if pkg is None: return empty
         cols = pkg["feature_cols"]
         row_data = {c: float(features_dict.get(c, 0) or 0) for c in cols}
-        _is_stale = len(cols) != 79
+        _is_stale = len(cols) != 84
         X_df   = pd.DataFrame([row_data], columns=cols)
         X_s    = pkg["scaler"].transform(X_df)
         X_s_df = pd.DataFrame(X_s, columns=cols)
@@ -13551,7 +13630,7 @@ setTimeout(pollSpockStatus, 5000);
   <div class="panel" id="ml-panel" style="grid-column:1/-1;border:2px solid rgba(0,229,255,0.3);background:rgba(0,10,20,0.98);">
     <div class="panel-title" onclick="togglePanel('ml-panel')" style="cursor:pointer;">
       🧠 ML DIRECTIONAL SIGNAL
-      <span id="mlPanelHeader" style="font-size:9px;color:var(--text-dim);">ENSEMBLE · 79 FEATURES · AUC — · SCHWAB + SPY/QQQ MTF + 5-MIN BARS</span>
+      <span id="mlPanelHeader" style="font-size:9px;color:var(--text-dim);">ENSEMBLE · 84 FEATURES · AUC — · SCHWAB + SPY/QQQ MTF + POC + 5-MIN BARS</span>
       <span class="panel-collapse-btn" id="btn-ml-panel">▾</span>
     </div>
     <div style="display:grid;grid-template-columns:180px 1fr 1fr 1fr;gap:16px;align-items:start;">
@@ -15115,7 +15194,9 @@ def start_background_threads():
             "spy_ob_4h","spy_os_4h","spy_ob_1h","spy_os_1h",
             "spy_mtf_ob","spy_mtf_os",
             "qqq_rsi_4h","qqq_ob_4h",
-            "mtf_both_ob","mtf_both_os"
+            "mtf_both_ob","mtf_both_os",
+            # POC / Volume Profile
+            "poc_dist","above_poc","in_value_area","above_vah","below_val"
         ]
     try:
         pkg = _load_ml_model()
