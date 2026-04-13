@@ -1137,7 +1137,7 @@ def calculate_spy_analysis(tsla_closes, tsla_price):
             )
             result["vix_history"] = [
                 {"date": str(vix_closes.index[i].date()), "vix": round(float(vix_closes.iloc[i]), 2)}
-                for i in range(-60, 0) if abs(i) <= len(vix_closes)
+                for i in range(-min(60, len(vix_closes)), 0) if abs(i) <= len(vix_closes)
             ]
 
         # Align returns — skip if SPY data unavailable
@@ -1302,7 +1302,7 @@ def calculate_spy_analysis(tsla_closes, tsla_price):
              "price": round(float(spy_closes.iloc[i]), 2),
              "ema20": round(float(spy_ema20_ser.iloc[i]), 2),
              "ema50": round(float(spy_ema50_ser.iloc[i]), 2)}
-            for i in range(-60, 0)
+            for i in range(-min(60, len(spy_closes)), 0)
         ]
 
         # RS chart — normalized to 100 at 60 days ago
@@ -1310,7 +1310,7 @@ def calculate_spy_analysis(tsla_closes, tsla_price):
         base_spy  = float(spy_closes.iloc[-60])  if len(spy_closes)  >= 60 else float(spy_closes.iloc[0])
         base_qqq  = float(qqq_closes.iloc[-60])  if qqq_closes is not None and len(qqq_closes) >= 60 else None
         result["rs_history"] = []
-        for i in range(-60, 0):
+        for i in range(-min(60, len(tsla_closes), len(spy_closes)), 0):
             try:
                 entry = {
                     "date": str(tsla_closes.index[i].date()),
@@ -1412,7 +1412,7 @@ def calculate_vwap(high, low, close, volume):
         "history": [
             {"date": str(close.index[i].date()), "vwap": round(vwap.iloc[i], 2),
              "u1": round((vwap+std).iloc[i],2), "l1": round((vwap-std).iloc[i],2)}
-            for i in range(-60, 0)
+            for i in range(-min(60, len(close)), 0)
         ]
     }
 
@@ -1460,7 +1460,7 @@ def calculate_kalman_filter(prices):
                           else "BEARISH" if velocities[-1] < 0 and acceleration < 0
                           else "NEUTRAL",
         "history":        [{"date": str(prices.index[i].date()), "filtered": filtered[i]}
-                           for i in range(-60, 0) if i < len(filtered)]
+                           for i in range(-min(60, len(filtered)), 0) if i < len(filtered)]
     }
 
 
@@ -1486,7 +1486,7 @@ def calculate_zscore(prices, window=20):
         "rolling_mean": round(rolling_mean.iloc[-1], 2),
         "rolling_std":  round(rolling_std.iloc[-1], 2),
         "history":      [{"date": str(prices.index[i].date()), "z": round(zscore.iloc[i], 3)}
-                         for i in range(-60, 0) if not pd.isna(zscore.iloc[i])]
+                         for i in range(-min(60, len(zscore)), 0) if not pd.isna(zscore.iloc[i])]
     }
 
 
@@ -1648,7 +1648,7 @@ def calculate_smart_money_index(opens, closes, volumes):
         "trend_5d":   round(trend_5, 3),
         "signal":     signal,
         "history":    [{"date": str(closes.index[i].date()), "smi": round(smi_norm.iloc[i], 3)}
-                       for i in range(-60, 0) if not pd.isna(smi_norm.iloc[i])]
+                       for i in range(-min(60, len(smi_norm)), 0) if not pd.isna(smi_norm.iloc[i])]
     }
 
 
@@ -3624,7 +3624,7 @@ def calculate_cta_sizing(
         roll_vol = returns.rolling(20).std() * (252 ** 0.5)
         result["vol_history"] = [
             {"date": str(roll_vol.index[i].date()), "vol": round(float(roll_vol.iloc[i]) * 100, 2)}
-            for i in range(-60, 0) if not np.isnan(roll_vol.iloc[i])
+            for i in range(-min(60, len(roll_vol)), 0) if not np.isnan(roll_vol.iloc[i])
         ]
 
         # ══════════════════════════════════════════════════
@@ -6070,7 +6070,7 @@ def run_analysis(refresh_4h=True, refresh_news=True):
             macd_line   = exp12 - exp26
             signal_line = macd_line.ewm(span=9, adjust=False).mean()
             histogram   = macd_line - signal_line
-            for i in range(-60, 0):
+            for i in range(-min(60, len(histogram)), 0):
                 h = float(histogram.iloc[i])
                 macd_history.append({
                     "date":   str(closes.index[i].date()),
