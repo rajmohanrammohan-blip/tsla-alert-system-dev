@@ -1958,6 +1958,9 @@ def calculate_exit_analysis(closes, highs, lows, volumes, indicators, inst_model
             elif dist_to_res < 3:
                 exit_score += 8; exit_reasons.append(f"Approaching Fibonacci resistance ${fib.get("nearest_resistance","")}")
 
+        # Cap at 100 — scores above 100 erode user trust
+        exit_score = min(100, exit_score)
+
         # Determine urgency
         if exit_score >= 70:
             urgency = "SELL NOW"
@@ -2713,22 +2716,31 @@ def calculate_market_maker_data(ticker_symbol, current_price):
         # ── IV Rank / Signal ──
         if iv_list:
             iv_now   = round(float(np.median(iv_list)) * 100, 1)
-            # True IV Rank: compare ATM IV to 52-week range from historical IV
-            # Fetch historical IV via yfinance VIX as proxy for market IV
+            # IV Rank: compare current ATM IV to 52-week IV range
+            # Use the options chain front-month ATM IV vs historical range
             try:
                 import yfinance as _yf2
-                _iv_hist = _yf2.Ticker(TICKER).history(period="1y", interval="1d")
-                if not _iv_hist.empty and len(_iv_hist) > 50:
-                    # Use (High-Low)/Close as realized vol proxy for 52wk range
-                    _rv = ((_iv_hist["High"] - _iv_hist["Low"]) / _iv_hist["Close"] * 100)
-                    iv_high = round(float(_rv.quantile(0.90)), 1)
-                    iv_low  = round(float(_rv.quantile(0.10)), 1)
-                    iv_rank = round((iv_now - iv_low) / (iv_high - iv_low + 1e-9) * 100, 1) if iv_high > iv_low else 50
+                _vix_hist = _yf2.Ticker("^VIX").history(period="1y", interval="1d")
+                if not _vix_hist.empty and len(_vix_hist) > 50:
+                    _vix_closes = _vix_hist["Close"].astype(float)
+                    _vix_high52 = float(_vix_closes.max())
+                    _vix_low52  = float(_vix_closes.min())
+                    _vix_now    = float(_vix_closes.iloc[-1])
+                    # Scale: current TSLA IV relative to VIX range
+                    _vix_rank   = (_vix_now - _vix_low52) / (_vix_high52 - _vix_low52 + 1e-9) * 100
+                    # Blend: 50% VIX rank + 50% chain percentile rank
+                    _chain_high = round(float(np.percentile(iv_list, 90)) * 100, 1)
+                    _chain_low  = round(float(np.percentile(iv_list, 10)) * 100, 1)
+                    _chain_rank = (_chain_high > 0 and
+                                   round((iv_now - _chain_low) / (_chain_high - _chain_low + 1e-9) * 100, 1))
+                    iv_rank = round((_vix_rank * 0.6 + (_chain_rank or 50) * 0.4), 1)
                     iv_rank = max(0, min(100, iv_rank))
+                    iv_high = _chain_high
+                    iv_low  = _chain_low
                 else:
-                    raise ValueError("no history")
+                    raise ValueError("no VIX history")
             except Exception:
-                # Fallback: use chain cross-sectional percentile
+                # Fallback: chain cross-sectional percentile
                 iv_high = round(float(np.percentile(iv_list, 90)) * 100, 1)
                 iv_low  = round(float(np.percentile(iv_list, 10)) * 100, 1)
                 iv_rank = round((iv_now - iv_low) / (iv_high - iv_low + 1e-9) * 100, 1) if iv_high > iv_low else 50
@@ -4572,8 +4584,13 @@ def send_whatsapp(message, alert_key="default"):
         print(f"🔔 ALERT (WhatsApp off): {message[:80]}...")
         return False
     # Throttle: don't resend same alert type within WA_THROTTLE_MIN minutes
-    # Track alert for quality scoring
-    _cur_price = state.get("price", 0) or 0
+    # Track alert for quality scoring — use freshest price
+    _live_p, _price_age = _get_live_price()
+    _cur_price = _live_p or state.get("price", 0) or 0
+    _price_stale = _price_age is None or _price_age > 300
+    if _price_stale:
+        print(f"  ⚠️ Alert price may be stale (age={_price_age}s) — skipping alert", flush=True)
+        return  # Don't send alert with stale price
     _cur_signal = state.get("signal", "HOLD")
     _alert_outcomes.append({
         "alert_key":  alert_key,
@@ -4592,7 +4609,16 @@ def send_whatsapp(message, alert_key="default"):
     last = _last_wa_send.get(alert_key)
     if last and (datetime.now() - last).total_seconds() < WA_THROTTLE_MIN * 60:
         print(f"⏳ WhatsApp throttled ({alert_key}) — {WA_THROTTLE_MIN}min cooldown")
-        return False
+        return
+    # Price delta deduplication — don't repeat same alert if price barely moved
+    _last_alert_price = state.get(f"_last_alert_price_{alert_key}", 0) or 0
+    _cur_p = state.get("price", 0) or 0
+    if _last_alert_price > 0 and _cur_p > 0:
+        _delta_pct = abs(_cur_p - _last_alert_price) / _last_alert_price * 100
+        if _delta_pct < 0.5 and last and (datetime.now() - last).total_seconds() < 1800:
+            print(f"⏳ Alert deduplicated ({alert_key}) — price only moved {_delta_pct:.2f}% (need 0.5%)")
+            return
+    state[f"_last_alert_price_{alert_key}"] = _cur_p
     try:
         # Green API endpoint
         url = (
@@ -4684,6 +4710,21 @@ def _get_alert_scorecard():
             "avg_chg_1d":  round(sum(s["avg_chg_1d"]) / max(n1d, 1), 2) if n1d > 0 else None,
         }
     return result
+
+
+def _get_live_price():
+    """Get freshest available price — from 1-min tick, then state, then Schwab."""
+    # _price_history has 1-min ticks
+    if _price_history:
+        tick = _price_history[-1]
+        age  = time.time() - tick.get("ts", 0)
+        if age < 300:  # less than 5 min old
+            return float(tick["price"]), age
+    # Fall back to state
+    sp = state.get("price")
+    if sp:
+        return float(sp), 999
+    return None, None
 
 
 def log_alert(message, alert_key="default"):
@@ -6178,6 +6219,13 @@ def run_analysis(refresh_4h=True, refresh_news=True):
         _spock_ok_buy    = _spock_conv >= 55 and "BUY"  in _spock_action
         _spock_ok_sell   = _spock_conv >= 55 and "SELL" in _spock_action
 
+        # Signal coherence — check last alert direction to prevent BUY+SELL flip
+        _last_sell_time = _last_wa_send.get("signal_SELL")
+        _last_buy_time  = _last_wa_send.get("signal_BUY")
+        _atr = float(indicators.get("atr_ratio", 0.01) or 0.01) * price * 5  # 5x ATR = meaningful move
+        _last_sell_price = state.get("_last_sell_price", 0) or 0
+        _last_buy_price  = state.get("_last_buy_price", 0) or 0
+
         if signal != "HOLD" and signal != last_signal:
             # Momentum check
             if signal == "BUY"  and not _momentum_ok_buy:
@@ -6193,6 +6241,20 @@ def run_analysis(refresh_4h=True, refresh_news=True):
             if signal == "SELL" and not _spock_ok_sell:
                 print(f"  ⚠️ SELL suppressed — SPOCK conviction too low ({_spock_conv}% / need 55%)", flush=True)
                 signal = "HOLD"
+            # Coherence: suppress BUY if SELL fired recently AND price hasn't moved 1 ATR
+            if signal == "BUY" and _last_sell_time:
+                _sell_age_min = (datetime.now() - _last_sell_time).total_seconds() / 60
+                _price_moved  = abs(price - _last_sell_price) if _last_sell_price else 999
+                if _sell_age_min < 60 and _price_moved < _atr:
+                    print(f"  ⚠️ BUY suppressed — SELL fired {_sell_age_min:.0f}min ago, price only moved ${_price_moved:.2f} (need ${_atr:.2f})", flush=True)
+                    signal = "HOLD"
+            # Coherence: suppress SELL if BUY fired recently AND price hasn't moved 1 ATR
+            if signal == "SELL" and _last_buy_time:
+                _buy_age_min  = (datetime.now() - _last_buy_time).total_seconds() / 60
+                _price_moved  = abs(price - _last_buy_price) if _last_buy_price else 999
+                if _buy_age_min < 60 and _price_moved < _atr:
+                    print(f"  ⚠️ SELL suppressed — BUY fired {_buy_age_min:.0f}min ago, price only moved ${_price_moved:.2f} (need ${_atr:.2f})", flush=True)
+                    signal = "HOLD"
 
         if signal != "HOLD" and signal != last_signal:
             emoji  = "🟢" if signal == "BUY" else "🔴"
@@ -6230,8 +6292,8 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 f"  P/C: {mm_data.get("pc_ratio","?")} | {mm_data.get("hedging_pressure","?")[:30]}\n"
                 f"\n"
                 f"🌍 *Macro*\n"
-                f"  SPY: {spy_data.get("spy_trend","?")} | VIX: {vix}\n"
-                f"  {spy_data.get("macro_signal","?")}\n"
+                f"  SPY: {(state.get("spy_data") or spy_data).get("spy_trend","UNKNOWN")} | VIX: {vix}\n"
+                f"  {(state.get("spy_data") or spy_data).get("macro_signal","?")}\n"
                 f"\n"
                 f"⏰ Pre-Mkt: {pm_pct:+.1f}% | 📰 News: {news_s}\n"
                 f"🧠 HMM: {regime_str} | ☁ Cloud: {cloud_str}\n"
@@ -6249,6 +6311,9 @@ def run_analysis(refresh_4h=True, refresh_news=True):
             })
             state["alerts_log"] = state["alerts_log"][:50]
             last_signal = signal
+            # Track last alert prices for coherence check
+            if signal == "BUY":  state["_last_buy_price"]  = price
+            if signal == "SELL": state["_last_sell_price"] = price
 
         # ── Whale / UOA WhatsApp alert ──
         prev_uoa_whales = state.get("_prev_uoa_whales", 0)
@@ -6660,7 +6725,7 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 f"  🛑 Invalidation: ${entry_data.get("invalidation","?")}\n"
                 f"\n"
                 f"🔍 *Signals:* {top3_entry}\n"
-                f"🌍 SPY: {spy_data.get("spy_trend","?")} | VIX: {spy_data.get("vix","?")}"
+                f"🌍 SPY: {(state.get("spy_data") or spy_data).get("spy_trend","UNKNOWN")} | VIX: {(state.get("spy_data") or spy_data).get("vix","?")}"
             )
             log_alert(wa_msg, alert_key="entry_signal")
         state["_prev_entry_score"] = curr_entry
@@ -6722,7 +6787,7 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 f"\n"
                 f"🛑 Hard Stop: ${stop}\n"
                 f"📊 GEX: {mm_data.get('gex_total',0):+.0f}M | MaxPain: ${mm_data.get("max_pain","?")}\n"
-                f"🌍 SPY: {spy_data.get("spy_trend","?")} | VIX: {spy_data.get("vix","?")}\n"
+                f"🌍 SPY: {(state.get("spy_data") or spy_data).get("spy_trend","UNKNOWN")} | VIX: {(state.get("spy_data") or spy_data).get("vix","?")}\n"
                 f"\n"
                 f"📌 *Exit Reasons:*\n" +
                 "\n".join(f"  • {r}" for r in top_exit)
@@ -6750,7 +6815,7 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"VIX just crossed *{curr_vix}* (was {prev_vix})\n"
                 f"📉 TSLA expected move: {spy_data.get("expected_tsla_move","?")}%\n"
-                f"🌍 SPY Trend: {spy_data.get("spy_trend","?")}\n"
+                f"🌍 SPY Trend: {(state.get("spy_data") or spy_data).get("spy_trend","UNKNOWN")}\n"
                 f"Risk-off mode — consider reducing exposure"
             )
             log_alert(wa_msg, alert_key="vix_spike")
@@ -12300,7 +12365,9 @@ async function fetchState() {
 async function manualRefresh() { await fetch('/api/refresh'); setTimeout(fetchState,2000); }
 showChartTab('price');
 fetchState();
-setInterval(fetchState,10000);
+// Call immediately on load so metrics populate without waiting
+fetchState();
+setInterval(fetchState,5000);
 setTimeout(fetchState, 5000);
 setTimeout(fetchState, 15000);
 setTimeout(function(){ if(chart){ chart.resize(); chart.update(); } }, 300);
