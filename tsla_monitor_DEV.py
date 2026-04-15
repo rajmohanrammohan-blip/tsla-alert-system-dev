@@ -3033,6 +3033,49 @@ NEWS_KEYWORDS = {
 }
 
 
+def fetch_stocktwits_sentiment(ticker="TSLA"):
+    """
+    Fetch StockTwits bull/bear ratio — free API, no key needed.
+    Contrarian signal: >85% bulls = sell, <20% bulls = buy.
+    """
+    result = {"bull_pct": None, "bear_pct": None, "signal": "NEUTRAL",
+              "message_vol": None, "contrarian_signal": None}
+    try:
+        import requests as _req
+        url = f"https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json"
+        resp = _req.get(url, timeout=5,
+                       headers={"User-Agent": "Mozilla/5.0"})
+        if resp.status_code == 200:
+            data = resp.json()
+            msgs = data.get("messages", [])
+            if msgs:
+                bulls = sum(1 for m in msgs if m.get("entities", {}).get("sentiment", {}).get("basic") == "Bullish")
+                bears = sum(1 for m in msgs if m.get("entities", {}).get("sentiment", {}).get("basic") == "Bearish")
+                total = bulls + bears
+                if total > 0:
+                    bull_pct = round(bulls / total * 100, 1)
+                    bear_pct = round(bears / total * 100, 1)
+                    result["bull_pct"]      = bull_pct
+                    result["bear_pct"]      = bear_pct
+                    result["message_vol"]   = len(msgs)
+                    # Contrarian: extreme bulls = sell signal, extreme bears = buy
+                    if bull_pct > 85:
+                        result["signal"] = "CONTRARIAN_SELL"
+                        result["contrarian_signal"] = f"StockTwits {bull_pct:.0f}% bulls — extreme, contrarian SELL"
+                    elif bull_pct < 20:
+                        result["signal"] = "CONTRARIAN_BUY"
+                        result["contrarian_signal"] = f"StockTwits {bull_pct:.0f}% bulls — extreme fear, contrarian BUY"
+                    elif bull_pct > 65:
+                        result["signal"] = "BULLISH_CROWD"
+                    elif bull_pct < 40:
+                        result["signal"] = "BEARISH_CROWD"
+                    print(f"  🐦 StockTwits {ticker}: {bull_pct:.0f}% bulls / {bear_pct:.0f}% bears "
+                          f"({len(msgs)} msgs) → {result['signal']}", flush=True)
+    except Exception as _ste:
+        pass
+    return result
+
+
 def fetch_news():
     """
     Aggregates news from 6 sources, scores sentiment, ranks impact.
@@ -4857,6 +4900,280 @@ _spock_weights = {      # SPOCK tier weights — self-adjusting
 }
 
 
+def calculate_swing_context(closes, highs, lows, price, mm_data):
+    """
+    Multi-day swing context:
+    - Weekly OI gravitational center
+    - Daily candle pattern (bullish engulfing, morning star)
+    - Descending channel from ATH
+    - Key weekly support/resistance
+    """
+    import numpy as np
+    result = {
+        "weekly_gravity":   None,  # max OI strike for this week
+        "daily_pattern":    None,  # candle pattern name
+        "pattern_signal":   "NEUTRAL",
+        "channel_top":      None,  # descending channel resistance
+        "channel_mid":      None,
+        "in_channel":       None,
+        "swing_bias":       "NEUTRAL",
+        "swing_reasons":    [],
+    }
+    try:
+        # Weekly OI gravity = Max Pain (already computed)
+        result["weekly_gravity"] = mm_data.get("max_pain")
+
+        # Daily candle patterns from last 3 daily closes
+        if len(closes) >= 78 * 3:  # 3 trading days of 5-min bars
+            def _daily_ohlc(i_day):
+                """Get OHLC for i_day days ago (0=today)"""
+                start = -(i_day+1)*78
+                end   = -i_day*78 if i_day > 0 else len(closes)
+                sl = slice(max(0, len(closes)+start), max(0, len(closes)+end) if end < 0 else len(closes))
+                d_c = closes.iloc[sl]
+                d_h = highs.iloc[sl]
+                d_l = lows.iloc[sl]
+                if len(d_c) == 0: return None
+                return {
+                    "open":  float(d_c.iloc[0]),
+                    "close": float(d_c.iloc[-1]),
+                    "high":  float(d_h.max()),
+                    "low":   float(d_l.min()),
+                }
+
+            d0 = _daily_ohlc(0)  # today
+            d1 = _daily_ohlc(1)  # yesterday
+            d2 = _daily_ohlc(2)  # 2 days ago
+
+            if d0 and d1:
+                # Bullish engulfing: yesterday red, today green and bigger
+                if (d1["close"] < d1["open"] and       # yesterday red
+                    d0["close"] > d0["open"] and       # today green
+                    d0["close"] > d1["open"] and       # today close > yesterday open
+                    d0["open"]  < d1["close"]):        # today open < yesterday close
+                    result["daily_pattern"]  = "BULLISH_ENGULFING"
+                    result["pattern_signal"] = "BUY"
+                    result["swing_reasons"].append("Daily bullish engulfing — high conviction reversal signal")
+
+                # Bearish engulfing
+                elif (d1["close"] > d1["open"] and
+                      d0["close"] < d0["open"] and
+                      d0["close"] < d1["open"] and
+                      d0["open"]  > d1["close"]):
+                    result["daily_pattern"]  = "BEARISH_ENGULFING"
+                    result["pattern_signal"] = "SELL"
+                    result["swing_reasons"].append("Daily bearish engulfing — distribution signal")
+
+                # Morning star (3-day): big down, small body, big up
+                elif d2 and (d2["close"] < d2["open"] and
+                             abs(d1["close"]-d1["open"]) < abs(d2["close"]-d2["open"]) * 0.5 and
+                             d0["close"] > d0["open"] and
+                             d0["close"] > (d2["open"] + d2["close"])/2):
+                    result["daily_pattern"]  = "MORNING_STAR"
+                    result["pattern_signal"] = "BUY"
+                    result["swing_reasons"].append("Morning star pattern — 3-day bullish reversal confirmed")
+
+        # Descending channel from Dec 2025 ATH ($498.83)
+        # Channel: ATH=$498.83 on ~Dec 17 2025, roughly 120 trading days ago
+        # Slope: approximate ~$1/day decline
+        _ath     = 498.83
+        _days_since_ath = 120  # approximate
+        _slope   = (_ath - price) / _days_since_ath
+        _ch_top  = round(_ath - _slope * (_days_since_ath - 10), 2)  # channel resistance
+        _ch_mid  = round(_ch_top - (_ath - price) * 0.3, 2)
+        result["channel_top"] = _ch_top
+        result["channel_mid"] = _ch_mid
+        result["in_channel"]  = price < _ch_top
+
+        if price > _ch_top * 0.98:  # within 2% of channel resistance
+            result["swing_reasons"].append(f"Near descending channel resistance ${_ch_top:.0f} — caution")
+            result["swing_bias"] = "BEARISH"
+        elif price < _ch_mid * 0.98:
+            result["swing_reasons"].append(f"Well below channel mid ${_ch_mid:.0f} — oversold swing")
+            result["swing_bias"] = "BULLISH"
+
+        # Set overall swing bias
+        if result["pattern_signal"] == "BUY":
+            result["swing_bias"] = "BULLISH"
+        elif result["pattern_signal"] == "SELL":
+            result["swing_bias"] = "BEARISH"
+
+    except Exception as _se:
+        pass
+    return result
+
+
+def calculate_market_breadth(spy_data):
+    """
+    Fetch VIX term structure (VIX vs VIX3M) and market breadth.
+    VIX backwardation = panic, weight mean-reversion signals higher.
+    """
+    result = {
+        "vix":         spy_data.get("vix", 20),
+        "vix3m":       None,
+        "vix_backw":   False,   # VIX > VIX3M = backwardation = panic
+        "vix_contango":False,   # VIX < VIX3M = normal = risk-on
+        "term_spread": None,    # VIX - VIX3M
+        "breadth_signal": "NEUTRAL",
+    }
+    try:
+        import yfinance as _yf_b
+        # VIX3M (3-month VIX) — VIXM or ^VIX3M
+        _v3m = _yf_b.Ticker("^VIX3M").history(period="5d", interval="1d")
+        if not _v3m.empty:
+            vix3m = round(float(_v3m["Close"].iloc[-1]), 2)
+            vix   = float(result["vix"] or 20)
+            spread = round(vix - vix3m, 2)
+            result["vix3m"]       = vix3m
+            result["term_spread"] = spread
+            result["vix_backw"]   = spread > 0    # VIX > VIX3M = backwardation
+            result["vix_contango"]= spread < -1   # normal market
+            if spread > 2:
+                result["breadth_signal"] = "PANIC"      # strong backwardation
+            elif spread > 0:
+                result["breadth_signal"] = "STRESS"     # mild backwardation
+            elif spread < -3:
+                result["breadth_signal"] = "COMPLACENT" # very steep contango
+            else:
+                result["breadth_signal"] = "NORMAL"
+            print(f"  📊 VIX Term: {vix:.1f} vs VIX3M:{vix3m:.1f} spread={spread:+.1f} "
+                  f"({result['breadth_signal']})", flush=True)
+    except Exception as _be:
+        pass
+    return result
+
+
+def calculate_vwap_bands(closes, highs, lows, volumes):
+    """
+    Compute intraday VWAP + 1σ/2σ bands from 5-min bars.
+    Also compute anchored VWAP from session low (swing support).
+    
+    Returns dict with vwap, bands, distance, signal.
+    """
+    import numpy as np
+    result = {
+        "vwap": None, "upper1": None, "lower1": None,
+        "upper2": None, "lower2": None,
+        "anchored_vwap": None, "above_vwap": None,
+        "vwap_dist_pct": None, "vwap_signal": "NEUTRAL",
+        "anchored_above": None,
+    }
+    try:
+        typical = (highs + lows + closes) / 3
+        cum_vol  = volumes.cumsum()
+        cum_tp   = (typical * volumes).cumsum()
+        vwap_s   = cum_tp / (cum_vol + 1e-9)
+
+        # Standard deviation bands
+        cum_var  = ((typical - vwap_s) ** 2 * volumes).cumsum()
+        std_s    = (cum_var / (cum_vol + 1e-9)) ** 0.5
+
+        price    = float(closes.iloc[-1])
+        vwap_now = float(vwap_s.iloc[-1])
+        std_now  = float(std_s.iloc[-1])
+
+        result["vwap"]    = round(vwap_now, 2)
+        result["upper1"]  = round(vwap_now + std_now, 2)
+        result["upper2"]  = round(vwap_now + 2*std_now, 2)
+        result["lower1"]  = round(vwap_now - std_now, 2)
+        result["lower2"]  = round(vwap_now - 2*std_now, 2)
+
+        above_vwap = price > vwap_now
+        dist_pct   = (price - vwap_now) / vwap_now * 100
+        result["above_vwap"]    = above_vwap
+        result["vwap_dist_pct"] = round(dist_pct, 3)
+
+        # VWAP signal
+        if price > vwap_now + std_now:
+            result["vwap_signal"] = "EXTENDED_ABOVE"   # overbought vs VWAP
+        elif price > vwap_now:
+            result["vwap_signal"] = "ABOVE_VWAP"        # bullish
+        elif price > vwap_now - std_now:
+            result["vwap_signal"] = "BELOW_VWAP"        # bearish
+        else:
+            result["vwap_signal"] = "EXTENDED_BELOW"    # oversold vs VWAP
+
+        # Anchored VWAP from session low (last 20 bars)
+        low_idx = int(lows.iloc[-78:].values.argmin())  # low of day
+        if low_idx >= 0:
+            anc_typical = typical.iloc[-78+low_idx:]
+            anc_vol     = volumes.iloc[-78+low_idx:]
+            anc_cv      = (anc_typical * anc_vol).cumsum()
+            anc_v       = anc_vol.cumsum()
+            anc_vwap    = float((anc_cv / (anc_v + 1e-9)).iloc[-1])
+            result["anchored_vwap"]  = round(anc_vwap, 2)
+            result["anchored_above"] = price > anc_vwap
+
+    except Exception as e:
+        pass
+    return result
+
+
+def calculate_vwap_bands_daily(closes, highs, lows, volumes):
+    """Same but filters to today's bars only before computing."""
+    from datetime import date as _d
+    try:
+        _today = _d.today()
+        _mask  = closes.index.date == _today
+        if _mask.sum() < 3:
+            _last_date = closes.index.date[-1]
+            _mask = closes.index.date == _last_date
+        return calculate_vwap_bands(
+            closes[_mask], highs[_mask], lows[_mask], volumes[_mask])
+    except Exception:
+        return calculate_vwap_bands(closes, highs, lows, volumes)
+
+
+# ── Signal Weight Feedback — rolling accuracy per signal type ────────────────
+_signal_accuracy_table = {}   # {signal_type: {correct:0, total:0, weight_adj:1.0}}
+
+def _update_signal_weight(signal_type, was_correct):
+    """Update rolling accuracy for a signal type and adjust its SPOCK weight."""
+    if signal_type not in _signal_accuracy_table:
+        _signal_accuracy_table[signal_type] = {
+            "correct": 0, "total": 0, "weight_adj": 1.0, "history": []}
+    entry = _signal_accuracy_table[signal_type]
+    entry["history"].append(1 if was_correct else 0)
+    entry["history"] = entry["history"][-20:]  # rolling 20
+    entry["total"]   = len(entry["history"])
+    entry["correct"] = sum(entry["history"])
+    win_rate = entry["correct"] / max(entry["total"], 1)
+
+    # Adjust weight: good signal → boost, bad signal → reduce
+    if entry["total"] >= 5:
+        if win_rate >= 0.70:
+            entry["weight_adj"] = min(1.5, entry["weight_adj"] + 0.05)
+        elif win_rate >= 0.55:
+            entry["weight_adj"] = min(1.2, entry["weight_adj"])
+        elif win_rate < 0.40:
+            entry["weight_adj"] = max(0.5, entry["weight_adj"] - 0.1)
+        elif win_rate < 0.50:
+            entry["weight_adj"] = max(0.7, entry["weight_adj"] - 0.05)
+
+    print(f"[FEEDBACK] {signal_type}: {win_rate:.0%} win ({entry['correct']}/{entry['total']}) "
+          f"→ weight={entry['weight_adj']:.2f}", flush=True)
+
+
+def get_signal_weight(signal_type):
+    """Get current weight multiplier for a signal type. Default=1.0."""
+    return _signal_accuracy_table.get(signal_type, {}).get("weight_adj", 1.0)
+
+
+def _run_signal_feedback_update(decisions):
+    """
+    Called after outcomes are measured. Updates signal type weights
+    based on which signals were actually correct.
+    """
+    for dec in decisions:
+        if dec.get("outcome_1h") not in ("CORRECT", "WRONG"):
+            continue
+        was_correct = dec["outcome_1h"] == "CORRECT"
+        # Map decision to signal types that contributed
+        action = dec.get("action", "HOLD")
+        for sig_type in ["ml_ensemble", "uoa_flow", "darthvader", "spock_master"]:
+            _update_signal_weight(sig_type, was_correct)
+
+
 def _spock_log_decision(action, score, conviction, price, features_snapshot,
                         mtf_dir, mtf_conf, reasons):
     """Log a SPOCK decision for later outcome measurement."""
@@ -4991,6 +5308,8 @@ def _spock_update_accuracy():
     wr4h = _spock_accuracy["win_rate_4h"]
     print(f"[SPOCK-BRAIN] Accuracy: 1h={wr1h}% | 4h={wr4h}% | "
           f"n={total} decisions", flush=True)
+    # Run signal weight feedback update
+    _run_signal_feedback_update(measured)
 
     # Trigger self-correction if win rate too low
     if total >= 20 and wr1h is not None and wr1h < 55:
@@ -5460,6 +5779,60 @@ def calculate_spock_mtf_narrative(tsla_4h, spy_data, price):
         "net_score":   net,
     }
 
+
+def check_hard_risk_rules(price, spy_data, indicators, mm_data):
+    """
+    Hard override rules that gate all signals regardless of SPOCK score.
+    Returns: (allow_buy, allow_sell, risk_override, reasons)
+    """
+    allow_buy  = True
+    allow_sell = True
+    reasons    = []
+    risk_override = None
+
+    vix       = float(spy_data.get("vix", 20) or 20)
+    spy_rsi4h = float(spy_data.get("spy_rsi_4h", 50) or 50)
+    qqq_rsi4h = float(spy_data.get("qqq_rsi_4h", 50) or 50)
+    gap_pct   = float(indicators.get("gap_pct", 0) or 0)
+    beta      = float(spy_data.get("beta_20d", 2.0) or 2.0)
+    spy_move  = float(spy_data.get("spy_change_pct", 0) or 0)
+    implied_tsla_move = abs(spy_move * beta)
+
+    # Rule 1: VIX > 30 — no new longs
+    if vix > 30:
+        allow_buy = False
+        risk_override = "DEFENSIVE"
+        reasons.append(f"⛔ VIX={vix:.1f} > 30 — no new longs in fear regime")
+
+    # Rule 2: VIX > 25 — reduce size signal
+    elif vix > 25:
+        risk_override = "CAUTION"
+        reasons.append(f"⚠️ VIX={vix:.1f} > 25 — elevated fear, reduce size")
+
+    # Rule 3: SPY + QQQ both 4h RSI > 88 — no new longs
+    if spy_rsi4h > 88 and qqq_rsi4h > 88:
+        allow_buy = False
+        risk_override = "EXTREME"
+        reasons.append(f"⛔ SPY 4h RSI={spy_rsi4h:.0f} + QQQ 4h RSI={qqq_rsi4h:.0f} — market extremely overbought")
+
+    # Rule 4: Gap down > 3% — suppress BUY for first 30 min
+    if gap_pct < -3.0:
+        allow_buy = False
+        reasons.append(f"⛔ Gap down {gap_pct:.1f}% — wait for gap fill attempt before buying")
+
+    # Rule 5: Beta-adjusted SPY move implies > 5% TSLA move
+    if implied_tsla_move > 5.0:
+        risk_override = "EXTREME"
+        reasons.append(f"⚠️ SPY move {spy_move:.1f}% × beta {beta:.1f}x = {implied_tsla_move:.1f}% implied TSLA move")
+
+    # Rule 6: GEX extremely negative (< -300M) — amplified moves, reduce size
+    gex = float(mm_data.get("gex_total", 0) or 0)
+    if gex < -300:
+        risk_override = risk_override or "HIGH"
+        reasons.append(f"⚠️ GEX={gex:.0f}M — dealers short gamma, moves amplified")
+
+    return allow_buy, allow_sell, risk_override, reasons
+
 def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
                              dv_result, entry_data, peak_data, exit_score,
                              spy_data, cap_result, ichi, hmm_result,
@@ -5500,17 +5873,18 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
     else:
         votes["neutral"] += 1
 
-    # 2. ML Ensemble (67 features + SPY/QQQ context)
+    # 2. ML Ensemble — apply feedback weight
     ml_sig  = ml_signal.get("signal", "HOLD")
     ml_conf = ml_signal.get("confidence", 0) or 0
     ml_prob = ml_signal.get("probability", 0.5) or 0.5
+    _ml_w   = get_signal_weight("ml_ensemble")
     if ml_sig == "BUY" and ml_conf >= 30:
-        pts = min(30, int(ml_conf * 0.4))
-        score += pts; reasons.append(f"ML ensemble BUY (conf {ml_conf}%, prob {ml_prob:.0%})")
+        pts = min(30, int(ml_conf * 0.4 * _ml_w))
+        score += pts; reasons.append(f"ML ensemble BUY (conf {ml_conf}%, prob {ml_prob:.0%}, weight={_ml_w:.2f})")
         votes["bull"] += 1
     elif ml_sig == "SELL" and ml_conf >= 30:
-        pts = min(30, int(ml_conf * 0.4))
-        score -= pts; reasons.append(f"ML ensemble SELL (conf {ml_conf}%, prob {ml_prob:.0%})")
+        pts = min(30, int(ml_conf * 0.4 * _ml_w))
+        score -= pts; reasons.append(f"ML ensemble SELL (conf {ml_conf}%, prob {ml_prob:.0%}, weight={_ml_w:.2f})")
         votes["bear"] += 1
     else:
         votes["neutral"] += 1
@@ -5613,6 +5987,18 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
     elif spy_os and qqq_os:
         score += 10; reasons.append("SPY + QQQ both oversold daily — market washed out")
         votes["bull"] += 1
+
+    # VIX term structure — backwardation = panic = favor mean-reversion
+    _breadth = state.get("breadth", {}) if isinstance(state, dict) else {}
+    _term_spread = float(_breadth.get("term_spread", 0) or 0)
+    if _breadth.get("vix_backw") and _term_spread > 2:
+        if score < 0:
+            score += 12; reasons.append(f"VIX backwardation (+{_term_spread:.1f}) — panic peak, mean-reversion likely")
+            votes["bull"] += 1
+        else:
+            reasons.append(f"VIX backwardation — stress elevated, use caution")
+    elif _breadth.get("breadth_signal") == "COMPLACENT":
+        score -= 5; votes["bear"] += 1
     # 4h alone is also meaningful
     elif spy_rsi_4h > 72:
         score -= 6; reasons.append(f"SPY overbought on 4h (RSI {spy_rsi_4h:.0f}) — pullback risk")
@@ -5707,7 +6093,22 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
     else:
         votes["neutral"] += 1
 
-    # 11. News sentiment
+    # 10b. Swing context — daily candle patterns + channel
+    _swing = state.get("swing_context", {}) if isinstance(state, dict) else {}
+    _sw_pattern = _swing.get("pattern_signal", "NEUTRAL")
+    _sw_bias    = _swing.get("swing_bias", "NEUTRAL")
+    if _sw_pattern == "BUY":
+        score += 8; reasons.append(f"Daily {_swing.get('daily_pattern','pattern')} — multi-day bullish setup")
+        votes["bull"] += 1
+    elif _sw_pattern == "SELL":
+        score -= 8; reasons.append(f"Daily {_swing.get('daily_pattern','pattern')} — multi-day bearish setup")
+        votes["bear"] += 1
+    # Channel resistance warning
+    if _swing.get("channel_top") and price >= _swing["channel_top"] * 0.98:
+        score -= 6; reasons.append(f"Near descending channel resistance ${_swing['channel_top']:.0f}")
+        votes["bear"] += 1
+
+    # 11. News sentiment + StockTwits contrarian
     news_score = float(news_data.get("score", 0) or 0) if news_data else 0
     if news_score >= 20:
         score += 5; votes["bull"] += 1
@@ -5715,6 +6116,33 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
         score -= 5; votes["bear"] += 1
     else:
         votes["neutral"] += 1
+    # StockTwits contrarian signal
+    _st = (news_data or {}).get("stocktwits", {})
+    _st_sig = _st.get("signal", "NEUTRAL")
+    if _st_sig == "CONTRARIAN_BUY":
+        score += 7; reasons.append(_st.get("contrarian_signal","StockTwits extreme fear → contrarian BUY"))
+        votes["bull"] += 1
+    elif _st_sig == "CONTRARIAN_SELL":
+        score -= 7; reasons.append(_st.get("contrarian_signal","StockTwits extreme bulls → contrarian SELL"))
+        votes["bear"] += 1
+
+    # 11b. VWAP relationship — institutional reference level
+    _vb = state.get("vwap_bands", {}) if isinstance(state, dict) else {}
+    _vwap_sig = _vb.get("vwap_signal", "NEUTRAL")
+    _anc_above = _vb.get("anchored_above", None)
+    _vwap_dist = float(_vb.get("vwap_dist_pct", 0) or 0)
+    if _vwap_sig == "ABOVE_VWAP" and _anc_above:
+        score += 8; reasons.append(f"Price above VWAP + anchored VWAP — institutional support confirmed")
+        votes["bull"] += 1
+    elif _vwap_sig == "EXTENDED_ABOVE":
+        score -= 5; reasons.append(f"Price extended above VWAP ({_vwap_dist:+.1f}%) — overbought vs VWAP")
+        votes["bear"] += 1
+    elif _vwap_sig == "BELOW_VWAP" and _anc_above is False:
+        score -= 8; reasons.append(f"Price below VWAP and anchored VWAP — institutional selling")
+        votes["bear"] += 1
+    elif _vwap_sig == "EXTENDED_BELOW":
+        score += 5; reasons.append(f"Price extended below VWAP ({_vwap_dist:+.1f}%) — oversold vs VWAP")
+        votes["bull"] += 1
 
     # 12. Momentum (price action confirmation)
     ret_1b = float(indicators.get("ret_1b", 0) or 0)
@@ -5762,6 +6190,14 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
             action = "HOLD — LOW CONVICTION"; color = "#ffb300"
         elif score <= -40 and conviction < min_conv_sell:
             action = "HOLD — LOW CONVICTION"; color = "#ffb300"
+
+    # Apply hard risk rules to SPOCK as well
+    _hr_allow_buy, _, _hr_risk, _hr_reasons = check_hard_risk_rules(
+        price, spy_data, indicators or {}, mm_data)
+    if not _hr_allow_buy and score > 0:
+        score = min(score, 10)   # cap bullish score under hard risk
+        reasons = (_hr_reasons + reasons)[:3]
+        votes["bear"] += 1
 
     # Risk level — includes SPY/QQQ overbought state
     vix = float(spy_data.get("vix", 20) or 20)
@@ -5908,6 +6344,12 @@ def run_analysis(refresh_4h=True, refresh_news=True):
         # ══ SPY / MACRO ENGINE ══
         try:
             spy_data = calculate_spy_analysis(closes, price)
+            # VIX term structure + breadth
+            try:
+                _breadth = calculate_market_breadth(spy_data)
+                spy_data.update(_breadth)
+                state["breadth"] = _breadth
+            except Exception: pass
         except Exception as _e:
             print(f"  ⚠️ SPY analysis error: {_e}")
             spy_data = {"macro_score":0,"macro_signal":"ERROR","spy_trend":"UNKNOWN","spy_change_pct":0,"beta_20d":2.0,"vix":20,"vix_regime":"UNKNOWN","rs_signal":"NEUTRAL","divergence_warning":False,"expected_tsla_move":0,"tsla_spy_deviation":0}
@@ -5918,6 +6360,13 @@ def run_analysis(refresh_4h=True, refresh_news=True):
             try:
                 raw_articles = fetch_news()
                 news_data    = calculate_news_sentiment(raw_articles)
+                # Add StockTwits sentiment
+                try:
+                    _st = fetch_stocktwits_sentiment(TICKER)
+                    news_data["stocktwits"] = _st
+                    if _st.get("contrarian_signal"):
+                        print(f"  ⚡ Contrarian: {_st['contrarian_signal']}", flush=True)
+                except Exception: pass
                 state["news_data"] = news_data
             except Exception as _e:
                 print(f"  ⚠️ News error: {_e}")
@@ -6218,10 +6667,23 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 "in_va":      _val <= price <= _vah,
             }
             print(f"  📊 Volume Profile: POC=${_poc_price} | VAH=${_vah} | VAL=${_val} | Price {'above' if poc_data['above_poc'] else 'below'} POC", flush=True)
-        except Exception as _vpe:
-            print(f"  ⚠️ vol_profile error: {_vpe}")
+
+        except Exception as _vol_profile_err:
+            print(f"  ⚠️ vol_profile error: {_vol_profile_err}", flush=True)
             vol_profile = []
             poc_data    = {}
+
+        # ── Intraday VWAP Bands ────────────────────────────────────────────
+        try:
+            vwap_bands = calculate_vwap_bands_daily(closes, highs, lows, volumes)
+            state["vwap_bands"] = vwap_bands
+            _vb = vwap_bands
+            print(f"  📊 VWAP: ${_vb.get('vwap','?')} | {_vb.get('vwap_signal','?')} | "
+                  f"Dist:{_vb.get('vwap_dist_pct',0):+.2f}% | "
+                  f"Anchored:${_vb.get('anchored_vwap','?')} "
+                  f"({'above' if _vb.get('anchored_above') else 'below'})", flush=True)
+        except Exception as _vwap_err:
+            state["vwap_bands"] = {}
 
         # macd_history — last 60 days of MACD line, signal, histogram
         macd_history = []
@@ -6331,6 +6793,18 @@ def run_analysis(refresh_4h=True, refresh_news=True):
         _above_vwap_now  = price >= float(indicators.get("vwap", price) or price)
         _momentum_ok_buy  = _recent_momentum >= -0.003
         _momentum_ok_sell = _recent_momentum <= 0.003
+
+        # ── HARD RISK RULES — override everything ─────────────────────────
+        _allow_buy, _allow_sell, _risk_ovr, _risk_reasons = check_hard_risk_rules(
+            price, spy_data, indicators, mm_data)
+        if _risk_ovr:
+            state["hard_risk"] = {"override": _risk_ovr, "reasons": _risk_reasons}
+            print(f"  🛡 Hard risk: {_risk_ovr} — {'; '.join(_risk_reasons[:2])}", flush=True)
+        if signal == "BUY"  and not _allow_buy:
+            print(f"  ⛔ BUY blocked by hard risk rule: {_risk_reasons[0] if _risk_reasons else ''}", flush=True)
+            signal = "HOLD"
+        if signal == "SELL" and not _allow_sell:
+            signal = "HOLD"
 
         # SPOCK conviction check — don't alert if SPOCK disagrees
         _spock = state.get("master_signal", {})
@@ -6734,6 +7208,17 @@ def run_analysis(refresh_4h=True, refresh_news=True):
 
             # ── MASTER SIGNAL — synthesize all models ──────────────────────
             try:
+                # Swing context
+                try:
+                    _swing = calculate_swing_context(closes, highs, lows, price, mm_data)
+                    state["swing_context"] = _swing
+                    if _swing.get("daily_pattern"):
+                        print(f"  📈 Daily pattern: {_swing['daily_pattern']} ({_swing['pattern_signal']})", flush=True)
+                    if _swing.get("swing_reasons"):
+                        print(f"  📈 Swing: {' | '.join(_swing['swing_reasons'][:2])}", flush=True)
+                except Exception as _swe:
+                    state["swing_context"] = {}
+
                 master = calculate_master_signal(
                     signal      = signal,
                     strength    = strength,
@@ -8163,6 +8648,11 @@ def api_debug_ml():
     result["ml_retraining"] = _ml_retraining
     result["master_signal"] = state.get("master_signal", {})
     result["tsla_4h"]        = state.get("tsla_4h", {})
+    result["vwap_bands"]     = state.get("vwap_bands", {})
+    result["swing_context"]  = state.get("swing_context", {})
+    result["breadth"]        = state.get("breadth", {})
+    result["hard_risk"]      = state.get("hard_risk", {})
+    result["signal_weights"] = _signal_accuracy_table
     result["spock_accuracy"] = state.get("spock_accuracy", {})
     result["spock_weights"]  = state.get("spock_weights", {})
     result["earnings_context"] = state.get("earnings_context", {})
