@@ -89,6 +89,11 @@ except ImportError:
 #  CONFIG
 # ─────────────────────────────────────────────
 TICKER          = "TSLA"
+
+# Per-ticker state cache + watchlist
+_ticker_cache      = {}   # {symbol: {state, timestamp}}
+_WATCHLIST         = ["TSLA", "NVDA", "AAPL", "AMZN", "META", "MSFT", "SPY", "QQQ"]
+_WATCHLIST_SCORES  = {}   # {symbol: {price, change, rsi, score, action}}
 CHECK_INTERVAL  = 300   # seconds (5 min)
 
 # ── WhatsApp via Green API (free tier — real WhatsApp messages) ──
@@ -7854,29 +7859,69 @@ def api_state():
 
 @app.route("/api/switch_ticker")
 def api_switch_ticker():
-    global TICKER
-    sym = request.args.get("ticker","TSLA").upper().strip()
-    if sym and sym.isalpha() and len(sym) <= 6:
-        TICKER = sym
-        # Clear DV cache so it recalculates for new ticker
-        global _DV_CACHE
-        _DV_CACHE = {"ts": 0, "data": None}
-        # Reset state
+    global TICKER, _DV_CACHE, _ml_model_cache, _ml_load_errors
+    sym = request.args.get("ticker", "TSLA").upper().strip()
+    if not sym or not sym.replace(".", "").isalpha() or len(sym) > 6:
+        return jsonify({"status": "error", "msg": "invalid ticker"}), 400
+
+    if sym == TICKER:
+        return jsonify({"status": "same", "ticker": TICKER})
+
+    # Save current ticker state to cache
+    _ticker_cache[TICKER] = {
+        "state":     dict(state),
+        "timestamp": time.time(),
+    }
+
+    TICKER = sym
+
+    # Restore cached state if available and recent (< 10 min)
+    cached = _ticker_cache.get(TICKER)
+    if cached and (time.time() - cached["timestamp"]) < 600:
         state.clear()
-        state.update({"ticker": TICKER, "darthvader": {}, "last_updated": None})
-        print(f"  🔄 Ticker switched to {TICKER}", flush=True)
-        # Clear ML cache so new ticker gets its own model
-        global _ml_model_cache, _ml_load_errors
-        _ml_model_cache = None
-        _ml_load_errors = []
-        # Trigger retrain for new ticker in background
-        threading.Thread(target=_run_ml_retrain, daemon=True).start()
-        print(f"  🤖 ML retrain queued for {TICKER}", flush=True)
-        # Trigger async analysis
-        import threading
+        state.update(cached["state"])
+        print(f"  🔄 Switched to {TICKER} (from cache)", flush=True)
         threading.Thread(target=run_analysis, daemon=True).start()
-        return jsonify({"status": "switched", "ticker": TICKER})
-    return jsonify({"status": "error", "msg": "invalid ticker"}), 400
+        return jsonify({"status": "switched_cached", "ticker": TICKER})
+
+    # Fresh switch — reset state and retrain
+    _DV_CACHE = {"ts": 0, "data": None}
+    state.clear()
+    state.update({"ticker": TICKER, "price": None, "darthvader": {}, "last_updated": None})
+    _ml_model_cache = None
+    _ml_load_errors = []
+    print(f"  🔄 Switched to {TICKER} (fresh)", flush=True)
+    threading.Thread(target=_run_ml_retrain, daemon=True).start()
+    threading.Thread(target=run_analysis, daemon=True).start()
+    return jsonify({"status": "switched", "ticker": TICKER})
+
+
+@app.route("/api/watchlist")
+def api_watchlist():
+    """Return SPOCK quick-read for all watchlist tickers."""
+    return jsonify({
+        "watchlist": _WATCHLIST,
+        "scores":    _WATCHLIST_SCORES,
+        "current":   TICKER,
+    })
+
+
+@app.route("/api/watchlist/add")
+def api_watchlist_add():
+    global _WATCHLIST
+    sym = request.args.get("ticker", "").upper().strip()
+    if sym and sym.replace(".", "").isalpha() and len(sym) <= 6 and sym not in _WATCHLIST:
+        _WATCHLIST.append(sym)
+    return jsonify({"watchlist": _WATCHLIST})
+
+
+@app.route("/api/watchlist/remove")
+def api_watchlist_remove():
+    global _WATCHLIST
+    sym = request.args.get("ticker", "").upper().strip()
+    if sym in _WATCHLIST and sym != TICKER:
+        _WATCHLIST.remove(sym)
+    return jsonify({"watchlist": _WATCHLIST})
 
 
 
@@ -8817,6 +8862,7 @@ def api_debug_ml():
     result["ml_retraining"] = _ml_retraining
     result["master_signal"] = state.get("master_signal", {})
     result["tsla_4h"]        = state.get("tsla_4h", {})
+    result["ticker"]          = TICKER  # always include current ticker in state
     result["vwap_bands"]     = state.get("vwap_bands", {})
     # L2 — sanitize large_prints list for JSON
     _l2_raw = state.get("l2_data", {})
@@ -11053,6 +11099,42 @@ body {
 .vote-neut { background: rgba(74,101,128,0.2); color: var(--dim); }
 
 /* ── ML RETRAIN BANNER ── */
+.qtick {
+  padding: 4px 10px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 11px;
+  color: var(--dim);
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.qtick:hover { border-color: var(--accent); color: var(--accent); }
+.qtick.active { background: var(--accent); color: #000; border-color: var(--accent); font-weight: 700; }
+.wl-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color 0.2s;
+  font-size: 11px;
+}
+.wl-item:hover { border-color: var(--accent); }
+.wl-item.active-ticker { border-color: var(--accent); background: rgba(0,200,255,0.08); }
+.wl-sym { font-weight: 700; color: #fff; }
+.wl-price { color: var(--dim); }
+.wl-chg { font-size: 10px; }
+.wl-score-dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
 .retrain-banner {
   background: rgba(255,179,0,0.08);
   border-bottom: 1px solid var(--hold);
@@ -11102,10 +11184,40 @@ body {
 
 <!-- TOP BAR -->
 <div class="topbar">
-  <div class="topbar-brand">🖖 SPOCK · TSLA INTELLIGENCE</div>
+  <div class="topbar-brand">🖖 SPOCK · <span id="brandTicker">TSLA</span></div>
+
+  <!-- TICKER SEARCH -->
+  <div style="display:flex;align-items:center;gap:8px;">
+    <div style="position:relative">
+      <input id="tickerInput" type="text" placeholder="Symbol..." maxlength="6"
+        style="width:90px;padding:6px 10px;background:var(--bg3);border:1px solid var(--border);
+               color:#fff;font-family:'Space Mono',monospace;font-size:13px;border-radius:4px;
+               text-transform:uppercase;outline:none;"
+        onkeydown="if(event.key==='Enter')switchTicker(this.value)"
+        oninput="this.value=this.value.toUpperCase()">
+    </div>
+    <button onclick="switchTicker(document.getElementById('tickerInput').value)"
+      style="padding:6px 12px;background:var(--accent);color:#000;border:none;
+             font-family:'Space Mono',monospace;font-size:11px;font-weight:700;
+             border-radius:4px;cursor:pointer;">GO</button>
+  </div>
+
+  <!-- QUICK TICKERS -->
+  <div style="display:flex;gap:6px;flex-wrap:wrap;" id="quickTickers">
+    <span class="qtick active" onclick="switchTicker('TSLA')">TSLA</span>
+    <span class="qtick" onclick="switchTicker('NVDA')">NVDA</span>
+    <span class="qtick" onclick="switchTicker('AAPL')">AAPL</span>
+    <span class="qtick" onclick="switchTicker('AMZN')">AMZN</span>
+    <span class="qtick" onclick="switchTicker('META')">META</span>
+    <span class="qtick" onclick="switchTicker('MSFT')">MSFT</span>
+    <span class="qtick" onclick="switchTicker('SPY')">SPY</span>
+  </div>
+
+  <!-- PRICE -->
   <div style="display:flex;align-items:center;gap:16px;">
     <div>
       <span class="live-dot"></span>
+      <span style="font-size:11px;color:var(--dim);margin-right:4px;" id="topTicker">TSLA</span>
       <span class="topbar-price" id="topPrice">—</span>
       <span class="topbar-change" id="topChange">—</span>
     </div>
@@ -11114,6 +11226,13 @@ body {
       <div class="topbar-time" id="topSession">—</div>
     </div>
   </div>
+</div>
+
+<!-- WATCHLIST BAR -->
+<div id="watchlistBar" style="background:var(--bg2);border-bottom:1px solid var(--border);
+     padding:8px 28px;display:flex;gap:16px;overflow-x:auto;align-items:center;">
+  <span style="font-size:10px;color:var(--dim);letter-spacing:0.1em;white-space:nowrap;">WATCHLIST</span>
+  <div id="watchlistItems" style="display:flex;gap:12px;"></div>
 </div>
 
 <!-- MAIN -->
@@ -11336,6 +11455,16 @@ function updateUI(s) {
   // Top bar
   var price = s.price || 0;
   document.getElementById('topPrice').textContent = price ? '$' + parseFloat(price).toFixed(2) : '—';
+  var tickerEl = document.getElementById('topTicker');
+  if (tickerEl && s.ticker) {
+    tickerEl.textContent = s.ticker;
+  var bt = document.getElementById('brandTicker'); if(bt && s.ticker) bt.textContent = s.ticker;
+    _currentTicker = s.ticker;
+    // Sync quick ticker buttons
+    document.querySelectorAll('.qtick').forEach(function(el) {
+      el.classList.toggle('active', el.textContent === s.ticker);
+    });
+  }
   var chg = s.price_change_pct;
   if (chg != null) {
     var chgEl = document.getElementById('topChange');
@@ -11547,6 +11676,66 @@ function updateUI(s) {
   }
 }
 
+// ── Ticker switching ──
+var _currentTicker = 'TSLA';
+
+async function switchTicker(sym) {
+  sym = (sym || '').trim().toUpperCase();
+  if (!sym || sym.length > 6) return;
+  if (sym === _currentTicker) return;
+
+  // Visual feedback
+  document.getElementById('topTicker').textContent = sym;
+  document.getElementById('topPrice').textContent = '...';
+  document.getElementById('spockAction').textContent = '—';
+  document.getElementById('scoreNum').textContent = '—';
+
+  // Update active quick button
+  document.querySelectorAll('.qtick').forEach(function(el) {
+    el.classList.toggle('active', el.textContent === sym);
+  });
+
+  try {
+    var r = await fetch('/api/switch_ticker?ticker=' + sym);
+    var d = await r.json();
+    _currentTicker = sym;
+    document.getElementById('tickerInput').value = '';
+    // Fetch new state immediately
+    setTimeout(fetchState, 500);
+    setTimeout(fetchState, 2000);
+  } catch(e) {
+    console.error('Switch failed:', e);
+  }
+}
+
+// ── Watchlist update ──
+async function refreshWatchlist() {
+  try {
+    var r = await fetch('/api/watchlist');
+    var d = await r.json();
+    var container = document.getElementById('watchlistItems');
+    if (!container) return;
+    var scores = d.scores || {};
+    var wl = d.watchlist || [];
+    var current = d.current || _currentTicker;
+    container.innerHTML = wl.map(function(sym) {
+      var sc = scores[sym] || {};
+      var chg = sc.change || 0;
+      var chgStr = (chg >= 0 ? '+' : '') + (chg || 0).toFixed(2) + '%';
+      var chgColor = chg >= 0 ? 'var(--buy)' : 'var(--sell)';
+      var dotColor = sc.score > 20 ? 'var(--buy)' : sc.score < -20 ? 'var(--sell)' : 'var(--hold)';
+      var isCurrent = sym === current;
+      return '<div class="wl-item' + (isCurrent ? ' active-ticker' : '') + '" onclick="switchTicker(\'' + sym + '\')">' +
+        '<div class="wl-score-dot" style="background:' + dotColor + '"></div>' +
+        '<span class="wl-sym">' + sym + '</span>' +
+        '<span class="wl-price">' + (sc.price ? '$' + sc.price : '—') + '</span>' +
+        '<span class="wl-chg" style="color:' + chgColor + '">' + chgStr + '</span>' +
+        (sc.rsi ? '<span style="color:var(--dim);font-size:10px">RSI ' + sc.rsi + '</span>' : '') +
+        '</div>';
+    }).join('');
+  } catch(e) {}
+}
+
 // ── Fetch state ──
 async function fetchState() {
   try {
@@ -11574,6 +11763,9 @@ function updateClock() {
 // Immediate load
 fetchState();
 setInterval(fetchState, 5000);
+// Watchlist — refresh every 30s
+refreshWatchlist();
+setInterval(refreshWatchlist, 30000);
 </script>
 </body>
 </html>
@@ -11589,6 +11781,8 @@ def _weekly_retrain_scheduler():
     """Runs forever — triggers ML retrain every Sunday at midnight."""
     import time as _t2
     print("[SCHEDULER] Weekly retrain scheduler active", flush=True)
+    threading.Thread(target=_scan_watchlist, daemon=True).start()
+    print("[SCHEDULER] Watchlist scanner started", flush=True)
     while True:
         try:
             now = datetime.now()
@@ -11608,6 +11802,51 @@ def _weekly_retrain_scheduler():
 
 
 # ── Start background threads with delay so gunicorn can bind port first ──
+def _scan_watchlist():
+    """Background: get quick RSI/score for each watchlist ticker every 5 min."""
+    import time as _t
+    _t.sleep(30)  # give main analysis time to start first
+    while True:
+        try:
+            for sym in list(_WATCHLIST):
+                if sym == TICKER:
+                    continue
+                try:
+                    q = sc.get_quote(sym) if sc.is_configured() else {}
+                    price = float(q.get("price", 0) or 0)
+                    chg   = float(q.get("change_pct", 0) or 0)
+                    if price <= 0:
+                        import yfinance as _yfw
+                        _fi = _yfw.Ticker(sym).fast_info
+                        price = float(getattr(_fi, "last_price", 0) or 0)
+                        prev  = float(getattr(_fi, "previous_close", price) or price)
+                        chg   = round((price - prev) / max(prev, 1) * 100, 2)
+                    _rsi = 50; _wl_score = 0; _wl_action = "HOLD"
+                    try:
+                        import yfinance as _yfw2
+                        _h = _yfw2.Ticker(sym).history(period="30d", interval="1d")
+                        if not _h.empty and len(_h) >= 14:
+                            _c = _h["Close"].astype(float)
+                            _d = _c.diff()
+                            _g = _d.where(_d > 0, 0).rolling(14).mean()
+                            _l = -_d.where(_d < 0, 0).rolling(14).mean()
+                            _rsi = round(float((100 - 100 / (1 + _g / (_l + 1e-9))).iloc[-1]), 1)
+                            _ret5 = round((_c.iloc[-1] / _c.iloc[-5] - 1) * 100, 2) if len(_c) >= 5 else 0
+                            if _rsi < 35:   _wl_score = -40; _wl_action = "OVERSOLD"
+                            elif _rsi < 45: _wl_score = -15; _wl_action = "WEAK"
+                            elif _rsi > 75: _wl_score = +40; _wl_action = "OVERBOUGHT"
+                            elif _rsi > 60: _wl_score = +15; _wl_action = "STRONG"
+                    except Exception: pass
+                    _WATCHLIST_SCORES[sym] = {
+                        "price": round(price, 2), "change": round(chg, 2),
+                        "rsi": _rsi, "score": _wl_score, "action": _wl_action,
+                        "updated": _t.strftime("%H:%M"),
+                    }
+                except Exception: pass
+        except Exception: pass
+        _t.sleep(300)
+
+
 def start_background_threads():
     time.sleep(3)  # short wait for gunicorn to bind port
     print("[STARTUP] Starting background monitor threads...", flush=True)
