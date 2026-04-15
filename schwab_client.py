@@ -360,8 +360,10 @@ def get_option_chain(symbol, current_price=None):
                     theta    = float(opt.get("theta",    0) or 0)
                     vega     = float(opt.get("vega",     0) or 0)
                     iv       = float(opt.get("volatility", 0) or 0) / 100
-                    volume   = int(opt.get("totalVolume", 0) or 0)
-                    oi       = int(opt.get("openInterest", 0) or 0)
+                    _vol_raw = opt.get("totalVolume", 0) or 0
+                    _oi_raw  = opt.get("openInterest", 0) or 0
+                    volume   = 0 if (_vol_raw != _vol_raw) else int(_vol_raw)  # NaN safe
+                    oi       = 0 if (_oi_raw  != _oi_raw)  else int(_oi_raw)   # NaN safe
                     bid      = float(opt.get("bid", 0) or 0)
                     ask      = float(opt.get("ask", 0) or 0)
                     mid      = (bid + ask) / 2 if ask > 0 else float(opt.get("last", 0) or 0)
@@ -399,8 +401,10 @@ def get_option_chain(symbol, current_price=None):
                     theta    = float(opt.get("theta",    0) or 0)
                     vega     = float(opt.get("vega",     0) or 0)
                     iv       = float(opt.get("volatility", 0) or 0) / 100
-                    volume   = int(opt.get("totalVolume", 0) or 0)
-                    oi       = int(opt.get("openInterest", 0) or 0)
+                    _vol_raw = opt.get("totalVolume", 0) or 0
+                    _oi_raw  = opt.get("openInterest", 0) or 0
+                    volume   = 0 if (_vol_raw != _vol_raw) else int(_vol_raw)  # NaN safe
+                    oi       = 0 if (_oi_raw  != _oi_raw)  else int(_oi_raw)   # NaN safe
                     bid      = float(opt.get("bid", 0) or 0)
                     ask      = float(opt.get("ask", 0) or 0)
                     mid      = (bid + ask) / 2 if ask > 0 else float(opt.get("last", 0) or 0)
