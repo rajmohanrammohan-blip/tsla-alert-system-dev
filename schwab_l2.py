@@ -1,4 +1,3 @@
-
 # ══════════════════════════════════════════════════════════════════════════════
 # LEVEL 2 / TAPE — Schwab Streaming WebSocket
 # Real-time bid/ask depth, large print detection, sweep detection
@@ -150,6 +149,10 @@ async def _run_l2_stream(ticker):
     import schwab_client as _sc
     client = _sc.get_client()
     if client is None:
+        _l2_state["error"] = "No Schwab client available"
+        print("  ⚠️ L2: No Schwab client — check credentials", flush=True)
+        return
+    if client is None:
         _l2_state["error"] = "No Schwab client"
         return
 
@@ -218,7 +221,18 @@ def start_l2_stream(ticker="TSLA"):
 
     def _thread_target():
         global _l2_loop
-        import schwab  # ensure imported in thread
+        # Use schwab via schwab_client (which is already installed as schwab-py)
+        try:
+            import schwab
+        except ImportError:
+            try:
+                import schwab_client as _sc_check
+                import importlib, sys
+                # schwab-py is installed as 'schwab' package
+                print("  ⚠️ L2: schwab package not found — L2 requires schwab-py", flush=True)
+                return
+            except Exception:
+                return
         _l2_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(_l2_loop)
         try:
@@ -245,4 +259,3 @@ def get_l2_signal():
         "stale": stale,
         "age_seconds": round(age, 1),
     }
-
