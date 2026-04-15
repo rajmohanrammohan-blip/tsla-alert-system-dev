@@ -3853,6 +3853,23 @@ def calculate_cta_sizing(
             3
         )
         regime_mult = min(max(regime_mult, 0.10), 1.20)  # hard floor/ceiling
+
+        # Earnings proximity reduces position size — binary event risk
+        _earn_ctx2 = state.get("earnings_context", {}) if isinstance(state, dict) else {}
+        if _earn_ctx2.get("earnings_mode"):
+            _days2 = _earn_ctx2.get("days_away", 99)
+            if _days2 <= 3:
+                regime_mult = min(regime_mult, 0.40)
+                print(f"  📅 Earnings in {_days2}d: size capped at 40%", flush=True)
+            elif _days2 <= 7:
+                regime_mult = min(regime_mult, 0.60)
+                print(f"  📅 Earnings in {_days2}d: size capped at 60%", flush=True)
+        # SPY/QQQ MTF overbought → reduce size further
+        if spy_data.get("mtf_both_ob"):
+            regime_mult = min(regime_mult, regime_mult * 0.75)
+            print("  ⚠️ Market MTF overbought: size reduced 25%", flush=True)
+        regime_mult = round(min(max(regime_mult, 0.10), 1.20), 3)
+
         result["regime_multiplier"] = regime_mult
         result["regime_breakdown"]  = reg_components
         result["regime_label"] = (
@@ -4640,6 +4657,10 @@ def send_whatsapp(message, alert_key="default"):
     # Track alert for quality scoring — use freshest price
     _live_p, _price_age = _get_live_price()
     _cur_price = _live_p or state.get("price", 0) or 0
+    # Block alerts during ML retrain (prevents garbage conf=100 signals)
+    if _ml_retraining and alert_key.startswith("signal_"):
+        print(f"  ⚠️ Alert suppressed — ML retrain in progress", flush=True)
+        return
     # Only block if BOTH: price_history empty AND it's outside regular hours
     # Don't block during market hours even if 1-min loop hasn't warmed up yet
     from datetime import datetime as _dt
@@ -5742,14 +5763,20 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
         elif score <= -40 and conviction < min_conv_sell:
             action = "HOLD — LOW CONVICTION"; color = "#ffb300"
 
-    # Risk level
+    # Risk level — includes SPY/QQQ overbought state
     vix = float(spy_data.get("vix", 20) or 20)
     abs_gex = abs(gex)
-    if vix >= 35 or abs_gex >= 500:
+    spy_rsi_4h = float(spy_data.get("spy_rsi_4h", 50) or 50)
+    qqq_rsi_4h = float(spy_data.get("qqq_rsi_4h", 50) or 50)
+    mtf_both_ob = spy_data.get("mtf_both_ob", False)
+    earn_ctx    = state.get("earnings_context", {}) if isinstance(state, dict) else {}
+    near_earn   = earn_ctx.get("earnings_mode", False)
+
+    if vix >= 35 or abs_gex >= 500 or (spy_rsi_4h > 88 and qqq_rsi_4h > 88):
         risk = "EXTREME"
-    elif vix >= 25 or abs_gex >= 200:
+    elif vix >= 25 or abs_gex >= 200 or mtf_both_ob or near_earn:
         risk = "HIGH"
-    elif vix >= 18 or abs_gex >= 100:
+    elif vix >= 18 or abs_gex >= 100 or spy_rsi_4h > 75:
         risk = "MEDIUM"
     else:
         risk = "LOW"
@@ -6795,6 +6822,13 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 state["master_signal"] = {"action":"HOLD","score":0,"conviction":0,
                                           "risk":"MEDIUM","color":"#00e5ff","reasons":[]}
             _regime_str = ml_signal.get('regime', '')
+            _matched    = ml_signal.get('features_matched', 0)
+            _total      = ml_signal.get('features_total', 84)
+            _mismatch   = _matched < _total * 0.9  # more than 10% features missing
+            if _mismatch:
+                print(f"  ⚠️ ML feature mismatch ({_matched}/{_total}) — forcing HOLD", flush=True)
+                ml_signal = {**ml_signal, "signal": "HOLD", "confidence": 0}
+                state["ml_signal"] = ml_signal
             print(f"  [ML] signal={ml_signal.get('signal')} conf={ml_signal.get('confidence')} "
                   f"regime={_regime_str} matched={ml_signal.get('features_matched','?')}/{ml_signal.get('features_total','?')} "
                   f"avail={ml_signal.get('available')} err={ml_signal.get('error','')}", flush=True)
@@ -7435,6 +7469,9 @@ def _run_ml_retrain():
     Feature names MUST match _ml_features keys in run_analysis.
     """
     global _ml_model_cache, _ml_load_errors
+    global _ml_retraining, _ml_ready
+    _ml_retraining = True
+    _ml_ready      = False
     print("[ML-RETRAIN] Starting enhanced retrain (5min bars + ensemble)...", flush=True)
     try:
         import numpy as np, pickle, os
@@ -7927,8 +7964,13 @@ def _run_ml_retrain():
 
         X_df   = _pd_rt.DataFrame(X, columns=feat_cols)
         scaler = StandardScaler()
+        # Fit on DataFrame to preserve feature names (avoids sklearn warning)
         X_s    = scaler.fit_transform(X_df)
         X_s_df = _pd_rt.DataFrame(X_s, columns=feat_cols)
+        # Verify scaler has feature names
+        if hasattr(scaler, 'feature_names_in_') and scaler.feature_names_in_ is None:
+            import numpy as _np_sc
+            scaler.feature_names_in_ = _np_sc.array(feat_cols)
 
         # 9. Train ensemble
         print("[ML-RETRAIN] Training ensemble...", flush=True)
@@ -8010,6 +8052,11 @@ def _run_ml_retrain():
         }
         pkl_path = f"/app/{TICKER.lower()}_model.pkl"
         with open(pkl_path,"wb") as f: pickle.dump(pkg,f)
+        # Also save to /tmp as session backup (survives Railway restarts within session)
+        try:
+            import shutil as _sh
+            _sh.copy2(pkl_path, f"/tmp/{TICKER.lower()}_model_backup.pkl")
+        except Exception: pass
 
         # Also save regime-specific models by splitting training data
         try:
@@ -8017,6 +8064,9 @@ def _run_ml_retrain():
         except Exception as _re: print(f"[ML-RETRAIN] Regime models: {_re}", flush=True)
         _ml_model_cache = pkg
         _ml_load_errors = []
+        _ml_ready       = True
+        _ml_retraining  = False
+        print("[ML-RETRAIN] ✅ Model ready — alerts enabled", flush=True)
         # Remove stale old pkl files so they can't be loaded by mistake
         import os as _os2
         for _old_name in ["tsla_model.pkl", "./tsla_model.pkl"]:
@@ -8084,6 +8134,7 @@ def api_debug_ml():
     _paths = [
         f"{TICKER.lower()}_model.pkl", f"./{TICKER.lower()}_model.pkl",
         f"/app/{TICKER.lower()}_model.pkl",
+        f"/tmp/{TICKER.lower()}_model_backup.pkl",  # session backup
         os.path.join(_script_dir, f"{TICKER.lower()}_model.pkl"),
         os.path.join(os.getcwd(), f"{TICKER.lower()}_model.pkl"),
         # fallback to tsla model for backward compat
@@ -8108,6 +8159,8 @@ def api_debug_ml():
         result["auc"]          = _ml_model_cache.get("auc", 0)
     # 4. Show last ML signal from state
     result["ml_signal"]     = state.get("ml_signal", {})
+    result["ml_ready"]      = _ml_ready
+    result["ml_retraining"] = _ml_retraining
     result["master_signal"] = state.get("master_signal", {})
     result["tsla_4h"]        = state.get("tsla_4h", {})
     result["spock_accuracy"] = state.get("spock_accuracy", {})
@@ -8423,6 +8476,31 @@ def api_alert_scorecard():
         "total_tracked": len(_alert_outcomes),
         "recent": _alert_outcomes[-10:][::-1],
     })
+
+
+
+@app.route("/stream")
+def stream():
+    """Server-Sent Events stream — pushes state to frontend every 5s."""
+    def _event_gen():
+        import json as _json
+        while True:
+            try:
+                payload = _sanitize({**state,
+                    "wa_enabled":    WA_ENABLED,
+                    "wa_phone_tail": GREEN_PHONE[-4:] if GREEN_PHONE else "",
+                    "ml_ready":      _ml_ready,
+                    "ml_retraining": _ml_retraining,
+                })
+                data = _json.dumps(payload)
+                yield f"data: {data}\n\n"
+            except Exception as _se:
+                yield 'data: {"error":"stream_error"}\n\n'
+            time.sleep(5)
+    return app.response_class(_event_gen(),
+                              mimetype="text/event-stream",
+                              headers={"Cache-Control": "no-cache",
+                                       "X-Accel-Buffering": "no"})
 
 
 @app.route("/health")
@@ -8768,6 +8846,8 @@ def detect_algo_activity():
 # ── ML Directional Signal (trained LightGBM model) ───────────────
 _ml_model_cache = None
 _ml_load_errors = []
+_ml_ready       = False   # True only when model matches expected feature count
+_ml_retraining  = False   # True during active retrain — suppress alerts
 
 def _load_ml_model():
     global _ml_model_cache
@@ -12480,6 +12560,18 @@ fetchState();
 // Call immediately on load so metrics populate without waiting
 fetchState();
 setInterval(fetchState,5000);
+
+// Also try SSE stream as backup for real-time updates
+try {
+  var _sse = new EventSource('/stream');
+  _sse.onmessage = function(e) {
+    try {
+      var s = JSON.parse(e.data);
+      if (s && s.price) { updateUI(s); }
+    } catch(_) {}
+  };
+  _sse.onerror = function() { _sse.close(); }; // fall back to polling
+} catch(_) {}
 setTimeout(fetchState, 5000);
 setTimeout(fetchState, 15000);
 setTimeout(function(){ if(chart){ chart.resize(); chart.update(); } }, 300);
