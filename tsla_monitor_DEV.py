@@ -4825,13 +4825,14 @@ def _spock_measure_outcomes(current_price):
 
         pnl = (current_price - entry_price) / entry_price * 100
         action = dec["action"]
-        # Correct = price moved in signal direction > 0.3%
+        # Outcome classifier — lower threshold, no pure NEUTRAL
         def _outcome(pnl_pct, action):
-            threshold = 0.3
+            threshold = 0.15   # 0.15% = meaningful move (was 0.3% — too high for AH)
             if   action in ("BUY","STRONG BUY")   and pnl_pct >  threshold: return "CORRECT"
             elif action in ("SELL","STRONG SELL")  and pnl_pct < -threshold: return "CORRECT"
-            elif abs(pnl_pct) < threshold:                                    return "NEUTRAL"
-            else:                                                              return "WRONG"
+            elif action in ("BUY","STRONG BUY")   and pnl_pct < -threshold: return "WRONG"
+            elif action in ("SELL","STRONG SELL")  and pnl_pct >  threshold: return "WRONG"
+            else: return "NEUTRAL"  # price barely moved — inconclusive
 
         # 1-hour outcome
         if elapsed_h >= 1.0 and dec["outcome_1h"] is None:
@@ -4873,15 +4874,18 @@ def _spock_update_accuracy():
         return
 
     total     = len(measured)
-    corr_1h   = sum(1 for d in measured if d["outcome_1h"]  == "CORRECT")
-    measured_4h = [d for d in measured if d.get("outcome_4h")]
-    measured_1d = [d for d in measured if d.get("outcome_1d")]
-    corr_4h   = sum(1 for d in measured_4h if d["outcome_4h"] == "CORRECT")
-    corr_1d   = sum(1 for d in measured_1d if d["outcome_1d"] == "CORRECT")
+    # Only count CORRECT/WRONG — exclude NEUTRAL from denominator
+    decisive_1h = [d for d in measured if d.get("outcome_1h") in ("CORRECT","WRONG")]
+    corr_1h     = sum(1 for d in decisive_1h if d["outcome_1h"] == "CORRECT")
+    measured_4h = [d for d in measured if d.get("outcome_4h") in ("CORRECT","WRONG")]
+    measured_1d = [d for d in measured if d.get("outcome_1d") in ("CORRECT","WRONG")]
+    corr_4h     = sum(1 for d in measured_4h if d["outcome_4h"] == "CORRECT")
+    corr_1d     = sum(1 for d in measured_1d if d["outcome_1d"] == "CORRECT")
 
     _spock_accuracy["total"]        = total
+    _spock_accuracy["decisive_1h"]  = len(decisive_1h)
     _spock_accuracy["correct_1h"]   = corr_1h
-    _spock_accuracy["win_rate_1h"]  = round(corr_1h / total * 100, 1) if total else None
+    _spock_accuracy["win_rate_1h"]  = round(corr_1h / len(decisive_1h) * 100, 1) if decisive_1h else None
     _spock_accuracy["win_rate_4h"]  = round(corr_4h / len(measured_4h) * 100, 1) if measured_4h else None
     _spock_accuracy["win_rate_1d"]  = round(corr_1d / len(measured_1d) * 100, 1) if measured_1d else None
 
@@ -5630,10 +5634,19 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
     # ── FINAL DECISION ───────────────────────────────────────────────────────
     score = max(-100, min(100, score))
 
-    total_votes = votes["bull"] + votes["bear"] + votes["neutral"]
-    bull_pct    = round(votes["bull"] / max(total_votes, 1) * 100)
-    bear_pct    = round(votes["bear"] / max(total_votes, 1) * 100)
-    conviction  = max(bull_pct, bear_pct)
+    total_votes    = votes["bull"] + votes["bear"] + votes["neutral"]
+    decisive_votes = votes["bull"] + votes["bear"]
+    # Conviction = directional agreement among models that took a stance
+    # Neutral votes show uncertainty but don't dilute the conviction of those that voted
+    if decisive_votes > 0:
+        bull_pct   = round(votes["bull"] / decisive_votes * 100)
+        bear_pct   = round(votes["bear"] / decisive_votes * 100)
+    else:
+        bull_pct = bear_pct = 0
+    # Scale by participation: if only 2/12 models voted, conviction is lower
+    participation = round(decisive_votes / max(total_votes, 1) * 100)
+    raw_conviction = max(bull_pct, bear_pct)
+    conviction = round(raw_conviction * (0.5 + participation / 200))  # blend: 50-100% of raw
 
     # Require BOTH score threshold AND minimum conviction
     min_conv_buy  = 55   # at least 55% of models must agree for BUY
@@ -5829,10 +5842,14 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 try:
                     _schwab_opts = sc.get_option_chain(TICKER, current_price=price)
                     if _schwab_opts.get("calls"):
+                        _prev_gex = state.get("mm_data", {}).get("gex_total", None)
+                        _curr_gex = _schwab_opts.get('gex_total', 0)
+                        _gex_stale = (_prev_gex is not None and _prev_gex == _curr_gex)
                         print(f"  📡 Schwab options: {len(_schwab_opts['calls'])} calls, "
                               f"{len(_schwab_opts['puts'])} puts, "
-                              f"GEX={_schwab_opts.get('gex_total',0):.0f}M "
-                              f"PC={_schwab_opts.get('pc_ratio',0):.2f}", flush=True)
+                              f"GEX={_curr_gex:.0f}M "
+                              f"PC={_schwab_opts.get('pc_ratio',0):.2f}"
+                              f"{' [STALE-AH]' if _gex_stale else ''}", flush=True)
                 except Exception as _soe:
                     print(f"  ⚠️ Schwab options failed: {_soe}", flush=True)
                     _schwab_opts = {}
@@ -6675,6 +6692,9 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                     pass
 
                 # Add accuracy stats to state
+                # Save spy_data to state for WA alerts + dashboard
+                if spy_data and isinstance(spy_data, dict):
+                    state["spy_data"] = spy_data
                 state["spock_accuracy"] = _spock_accuracy
                 state["spock_weights"]  = _spock_weights
                 print(f"  🖖 SPOCK MTF: {mtf['direction']} {mtf['magnitude']} | "
@@ -7049,7 +7069,9 @@ def api_state():
         })
         return jsonify(payload)
     except Exception as e:
-        print(f"  ❌ api_state serialization error: {e}")
+        import traceback
+        print(f"  ❌ api_state serialization error: {e}", flush=True)
+        print(traceback.format_exc()[:500], flush=True)
         # Return state without darthvader as fallback
         safe = {k: v for k, v in state.items() if k != "darthvader"}
         safe["wa_enabled"]    = WA_ENABLED
