@@ -5184,6 +5184,336 @@ def _run_signal_feedback_update(decisions):
             _update_signal_weight(sig_type, was_correct)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# SPOCK SELF-LEARNING ENGINE
+# 4-stage feedback loop that runs after every 10 measured outcomes:
+#
+#  Stage 1 — OUTCOME MEASUREMENT
+#    After 1h/4h/1d: compare signal direction vs actual price move
+#    Classify each decision: CORRECT / WRONG / NEUTRAL
+#
+#  Stage 2 — ROOT CAUSE ANALYSIS  
+#    Which features / conditions were present in wrong calls?
+#    Per-regime accuracy (bull/bear/sideways market)
+#    Per-conviction-band accuracy (low/medium/high conviction)
+#
+#  Stage 3 — WEIGHT ADJUSTMENT
+#    Reduce weight of signals that keep being wrong
+#    Raise conviction threshold if wrong calls had high conviction
+#    Tighten RSI/score thresholds if calls at extremes keep failing
+#
+#  Stage 4 — LABEL-CORRECTED RETRAIN
+#    Inject WRONG decisions as opposite-label training samples
+#    These are the most valuable training examples — real outcomes
+#    Retrain ML on augmented dataset
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Persistent learning state (survives across cycles but not restarts)
+_learning_state = {
+    "total_decisions":    0,
+    "total_correct":      0,
+    "total_wrong":        0,
+    "last_correction_ts": 0,
+    "corrections_made":   0,
+    "weight_history":     [],  # [{ts, changes}]
+    "threshold_history":  [],  # [{ts, old, new, reason}]
+    "regime_accuracy": {
+        "bull":    {"correct": 0, "wrong": 0},
+        "bear":    {"correct": 0, "wrong": 0},
+        "neutral": {"correct": 0, "wrong": 0},
+    },
+    "conviction_accuracy": {
+        "high":   {"correct": 0, "wrong": 0},   # conviction >= 70
+        "medium": {"correct": 0, "wrong": 0},   # conviction 45-69
+        "low":    {"correct": 0, "wrong": 0},   # conviction < 45
+    },
+    "feature_error_rates": {},  # {feature: {high_val_wrong, high_val_right}}
+    "alert_outcomes": [],       # [{alert_key, was_profitable, price_move}]
+}
+
+# Dynamic thresholds — start at defaults, adjusted by learning
+_dynamic_thresholds = {
+    "spock_score_buy":    40,    # min score to send BUY
+    "spock_score_sell":  -40,    # max score to send SELL
+    "conviction_buy":     35,    # min conviction for BUY
+    "conviction_sell":    35,    # min conviction for SELL
+    "ml_conf_bypass":     80,    # ML conf needed for hard bypass
+    "correction_trigger": 0.50,  # retrigger correction if win_rate drops below this
+}
+
+
+def _run_full_learning_cycle(decisions):
+    """
+    Full 4-stage self-learning cycle.
+    Called when we have 10+ newly measured decisions.
+    """
+    measured = [d for d in decisions if d.get("outcome_1h") in ("CORRECT","WRONG")]
+    if len(measured) < 10:
+        return
+
+    correct = [d for d in measured if d["outcome_1h"] == "CORRECT"]
+    wrong   = [d for d in measured if d["outcome_1h"] == "WRONG"]
+    win_rate = len(correct) / max(len(measured), 1)
+
+    print(f"\n[LEARN] ═══ Self-Learning Cycle ═══", flush=True)
+    print(f"[LEARN] Decisions: {len(measured)} | Correct: {len(correct)} | Wrong: {len(wrong)} | Win: {win_rate:.0%}", flush=True)
+
+    # ── Stage 2: Root Cause Analysis ──────────────────────────────────────
+    _stage2_root_cause(correct, wrong)
+
+    # ── Stage 3: Threshold + Weight Adjustment ────────────────────────────
+    if win_rate < _dynamic_thresholds["correction_trigger"]:
+        _stage3_adjust(correct, wrong, win_rate)
+    elif win_rate > 0.70:
+        _stage3_reward(win_rate)
+
+    # ── Stage 4: Label-corrected retrain ─────────────────────────────────
+    if len(wrong) >= 5:
+        _stage4_retrain_with_labels(wrong, correct)
+
+    _learning_state["total_decisions"] += len(measured)
+    _learning_state["total_correct"]   += len(correct)
+    _learning_state["total_wrong"]     += len(wrong)
+
+
+def _stage2_root_cause(correct, wrong):
+    """Analyze which conditions caused wrong calls."""
+    if not wrong:
+        return
+
+    # Per-regime accuracy
+    for d in correct + wrong:
+        regime = d.get("regime", "neutral")
+        outcome = "correct" if d in correct else "wrong"
+        r_key = "bull" if "bull" in regime.lower() else ("bear" if "bear" in regime.lower() else "neutral")
+        _learning_state["regime_accuracy"][r_key][outcome] += 1
+
+    # Per-conviction accuracy
+    for d in correct + wrong:
+        conv = d.get("conviction", 0)
+        bucket = "high" if conv >= 70 else ("medium" if conv >= 45 else "low")
+        outcome = "correct" if d in correct else "wrong"
+        _learning_state["conviction_accuracy"][bucket][outcome] += 1
+
+    # Feature analysis: which features were elevated in wrong calls?
+    all_feats = set()
+    for d in correct + wrong:
+        all_feats.update(d.get("features", {}).keys())
+
+    feat_analysis = {}
+    for feat in all_feats:
+        wrong_vals = [d["features"].get(feat, 0) for d in wrong if feat in d.get("features", {})]
+        right_vals = [d["features"].get(feat, 0) for d in correct if feat in d.get("features", {})]
+        if wrong_vals and right_vals:
+            w_avg = sum(wrong_vals) / len(wrong_vals)
+            r_avg = sum(right_vals) / len(right_vals)
+            if abs(w_avg) > 0.001 and abs(w_avg - r_avg) / (abs(r_avg) + 0.001) > 0.3:
+                feat_analysis[feat] = {"wrong_avg": round(w_avg, 4), "right_avg": round(r_avg, 4)}
+
+    if feat_analysis:
+        top_diff = sorted(feat_analysis.items(),
+                         key=lambda x: abs(x[1]["wrong_avg"] - x[1]["right_avg"]), reverse=True)[:5]
+        print(f"[LEARN] Features most different in wrong calls:", flush=True)
+        for feat, vals in top_diff:
+            print(f"[LEARN]   {feat:25s} wrong={vals['wrong_avg']:+.3f} right={vals['right_avg']:+.3f}", flush=True)
+        _learning_state["feature_error_rates"] = dict(top_diff[:10])
+
+    # Regime report
+    for regime, counts in _learning_state["regime_accuracy"].items():
+        tot = counts["correct"] + counts["wrong"]
+        if tot > 0:
+            wr = counts["correct"] / tot * 100
+            print(f"[LEARN] Regime {regime:7s}: {wr:.0f}% win ({counts['correct']}/{tot})", flush=True)
+
+    # Conviction report
+    for band, counts in _learning_state["conviction_accuracy"].items():
+        tot = counts["correct"] + counts["wrong"]
+        if tot > 0:
+            wr = counts["correct"] / tot * 100
+            print(f"[LEARN] Conviction {band:6s}: {wr:.0f}% win ({counts['correct']}/{tot})", flush=True)
+
+
+def _stage3_adjust(correct, wrong, win_rate):
+    """Adjust thresholds and signal weights when win_rate is too low."""
+    global _dynamic_thresholds
+    changes = []
+
+    # 1. Wrong calls with high conviction → conviction threshold is too low
+    high_conv_wrong = [d for d in wrong if d.get("conviction", 0) >= 70]
+    if len(high_conv_wrong) >= 3:
+        old = _dynamic_thresholds["conviction_buy"]
+        new = min(60, old + 5)
+        _dynamic_thresholds["conviction_buy"]  = new
+        _dynamic_thresholds["conviction_sell"] = new
+        changes.append(f"conviction: {old}%→{new}%")
+
+    # 2. Wrong calls clustered at certain score range → tighten score threshold
+    wrong_scores = [abs(d.get("score", 0)) for d in wrong]
+    if wrong_scores:
+        avg_wrong_score = sum(wrong_scores) / len(wrong_scores)
+        if avg_wrong_score < 50:
+            # Wrong calls were marginal scores — raise the bar
+            old = _dynamic_thresholds["spock_score_buy"]
+            new = min(55, old + 5)
+            _dynamic_thresholds["spock_score_buy"]  = new
+            _dynamic_thresholds["spock_score_sell"] = -new
+            changes.append(f"score_threshold: {old}→{new}")
+
+    # 3. Regime-based adjustments
+    bear_acc = _learning_state["regime_accuracy"]["bear"]
+    bear_tot = bear_acc["correct"] + bear_acc["wrong"]
+    if bear_tot >= 5 and bear_acc["correct"] / max(bear_tot, 1) < 0.40:
+        # System is bad at calling in bear regime — raise bar further
+        old = _dynamic_thresholds["spock_score_buy"]
+        _dynamic_thresholds["spock_score_buy"] = min(65, old + 5)
+        changes.append(f"bear_regime: score_buy→{_dynamic_thresholds['spock_score_buy']}")
+
+    # 4. Signal weights — reduce weight of signals dominant in wrong calls
+    # Compare which sub-signals had highest contribution in WRONG vs CORRECT
+    wrong_ml   = sum(1 for d in wrong   if d.get("features", {}).get("rsi_14", 50) > 70)
+    correct_ml = sum(1 for d in correct if d.get("features", {}).get("rsi_14", 50) > 70)
+    if wrong_ml > correct_ml * 1.5 and wrong_ml >= 3:
+        # RSI > 70 calls were mostly wrong — update signal weight
+        _update_signal_weight("rsi_overbought", False)
+        changes.append("rsi_overbought signal weight reduced")
+
+    if changes:
+        _learning_state["threshold_history"].append({
+            "ts": datetime.now().isoformat(),
+            "win_rate": round(win_rate * 100, 1),
+            "changes": changes,
+        })
+        _learning_state["corrections_made"] += 1
+        print(f"[LEARN] ⚙️ Threshold adjustments: {changes}", flush=True)
+    else:
+        print(f"[LEARN] No threshold changes needed", flush=True)
+
+
+def _stage3_reward(win_rate):
+    """When win_rate is high, gently relax thresholds to catch more signals."""
+    global _dynamic_thresholds
+    changes = []
+    if _dynamic_thresholds["conviction_buy"] > 35:
+        old = _dynamic_thresholds["conviction_buy"]
+        new = max(35, old - 2)
+        _dynamic_thresholds["conviction_buy"]  = new
+        _dynamic_thresholds["conviction_sell"] = new
+        changes.append(f"conviction relaxed: {old}%→{new}%")
+    if _dynamic_thresholds["spock_score_buy"] > 40:
+        old = _dynamic_thresholds["spock_score_buy"]
+        new = max(40, old - 3)
+        _dynamic_thresholds["spock_score_buy"]  = new
+        _dynamic_thresholds["spock_score_sell"] = -new
+        changes.append(f"score threshold relaxed: {old}→{new}")
+    if changes:
+        print(f"[LEARN] ✅ High win rate {win_rate:.0%} — relaxing thresholds: {changes}", flush=True)
+
+
+def _stage4_retrain_with_labels(wrong_decisions, correct_decisions):
+    """
+    The most powerful step: inject real outcomes as training labels.
+
+    For each WRONG decision: the bar features are saved.
+    We add them to the training set with the OPPOSITE label.
+    Example: BUY at $348 → price dropped → add as SELL training sample.
+
+    This teaches the model the exact conditions where it was wrong.
+    Over time, the model learns to avoid repeating the same mistakes.
+    """
+    import json as _json
+    label_file = "/tmp/spock_corrective_labels.json"
+
+    # Load existing corrective labels
+    try:
+        with open(label_file) as f:
+            corrective_labels = _json.load(f)
+    except Exception:
+        corrective_labels = []
+
+    new_labels = 0
+    for d in wrong_decisions:
+        feats = d.get("features", {})
+        if not feats or len(feats) < 20:
+            continue
+        action = d.get("action", "HOLD")
+        # Wrong BUY → label as 0 (price went down). Wrong SELL → label as 1 (price went up)
+        correct_label = 0 if "BUY" in action else 1
+        corrective_labels.append({
+            "features": feats,
+            "label":    correct_label,
+            "price":    d.get("price"),
+            "ts":       d.get("ts", 0),
+            "pnl":      d.get("pnl_1h", 0),
+            "source":   "spock_correction",
+        })
+        new_labels += 1
+
+    # Keep last 500 corrective labels (don't let old mistakes dominate)
+    corrective_labels = corrective_labels[-500:]
+
+    try:
+        with open(label_file, "w") as f:
+            _json.dump(corrective_labels, f)
+        print(f"[LEARN] 📝 Saved {new_labels} corrective labels ({len(corrective_labels)} total)", flush=True)
+    except Exception as _le:
+        print(f"[LEARN] Label save error: {_le}", flush=True)
+        return
+
+    # Trigger ML retrain — it will load corrective labels
+    print(f"[LEARN] 🔄 Triggering corrective retrain with real outcome labels...", flush=True)
+    import threading as _thr3
+    _thr3.Thread(target=_run_ml_retrain_with_corrections, daemon=True).start()
+
+
+def _run_ml_retrain_with_corrections():
+    """Retrain ML model using both historical bars AND corrective outcome labels."""
+    import json as _json, os as _os
+
+    label_file = "/tmp/spock_corrective_labels.json"
+    corrective_labels = []
+    try:
+        with open(label_file) as f:
+            corrective_labels = _json.load(f)
+    except Exception:
+        pass
+
+    if not corrective_labels:
+        _run_ml_retrain()  # fall back to standard retrain
+        return
+
+    print(f"[LEARN-RETRAIN] Starting corrective retrain with {len(corrective_labels)} outcome labels", flush=True)
+
+    # The corrective labels get mixed into the training data
+    # Store them in a global so _run_ml_retrain can pick them up
+    global _ml_corrective_labels
+    _ml_corrective_labels = corrective_labels
+
+    _run_ml_retrain()  # standard retrain — modified to use corrective labels
+
+
+def _apply_dynamic_thresholds_to_spock(score, conviction, action):
+    """
+    Apply dynamically adjusted thresholds to SPOCK decision.
+    Returns (final_action, adjusted) tuple.
+    """
+    min_score_buy  = _dynamic_thresholds["spock_score_buy"]
+    min_score_sell = abs(_dynamic_thresholds["spock_score_sell"])
+    min_conv       = _dynamic_thresholds["conviction_buy"]
+
+    if action in ("BUY", "STRONG BUY"):
+        score_ok = abs(score) >= (min_score_buy + 25 if "STRONG" in action else min_score_buy)
+        conv_ok  = conviction >= min_conv
+        if not (score_ok and conv_ok):
+            return "HOLD — THRESHOLD", True
+    elif action in ("SELL", "STRONG SELL"):
+        score_ok = abs(score) >= (min_score_sell + 25 if "STRONG" in action else min_score_sell)
+        conv_ok  = conviction >= min_conv
+        if not (score_ok and conv_ok):
+            return "HOLD — THRESHOLD", True
+    return action, False
+
+
+
 def _spock_log_decision(action, score, conviction, price, features_snapshot,
                         mtf_dir, mtf_conf, reasons):
     """Log a SPOCK decision for later outcome measurement."""
@@ -5320,6 +5650,14 @@ def _spock_update_accuracy():
           f"n={total} decisions", flush=True)
     # Run signal weight feedback update
     _run_signal_feedback_update(measured)
+
+    # Run full 4-stage learning cycle when we have enough measured decisions
+    _new_measured = [d for d in _spock_decisions if d.get("outcome_1h") in ("CORRECT","WRONG")]
+    if len(_new_measured) >= 10 and len(_new_measured) % 10 == 0:
+        # Every 10 decisions, run a full learning cycle
+        import threading as _thr_lrn
+        _thr_lrn.Thread(target=_run_full_learning_cycle, args=(_new_measured,), daemon=True).start()
+        print(f"[LEARN] Full learning cycle triggered ({len(_new_measured)} total decisions)", flush=True)
 
     # Trigger self-correction if win rate too low
     if total >= 20 and wr1h is not None and wr1h < 55:
@@ -6275,19 +6613,23 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
     min_conv_strong = 35   # strong signal — low bar, score speaks for itself
     min_conv_normal = 45   # moderate signal — need some agreement
 
-    if score >= 65 and conviction >= min_conv_strong:
+    # Use dynamically learned thresholds
+    _dyn_score_buy  = _dynamic_thresholds.get("spock_score_buy", 40)
+    _dyn_conv       = _dynamic_thresholds.get("conviction_buy", 35)
+
+    if score >= (_dyn_score_buy + 25) and conviction >= _dyn_conv:
         action = "STRONG BUY";  color = "#00ff88"
-    elif score >= 40 and conviction >= min_conv_normal:
+    elif score >= _dyn_score_buy and conviction >= _dyn_conv:
         action = "BUY";         color = "#69f0ae"
-    elif score <= -65 and conviction >= min_conv_strong:
+    elif score <= -(_dyn_score_buy + 25) and conviction >= _dyn_conv:
         action = "STRONG SELL"; color = "#ff1744"
-    elif score <= -40 and conviction >= min_conv_normal:
+    elif score <= -_dyn_score_buy and conviction >= _dyn_conv:
         action = "SELL";        color = "#ff6d00"
     else:
         action = "HOLD";        color = "#00e5ff"
-        if score >= 40 and conviction < min_conv_normal:
+        if score >= _dyn_score_buy and conviction < _dyn_conv:
             action = "HOLD — LOW CONVICTION"; color = "#ffb300"
-        elif score <= -40 and conviction < min_conv_normal:
+        elif score <= -_dyn_score_buy and conviction < _dyn_conv:
             action = "HOLD — LOW CONVICTION"; color = "#ffb300"
 
     # Apply hard risk rules to SPOCK as well
@@ -8621,6 +8963,26 @@ def _run_ml_retrain():
             print(f"[ML-RETRAIN] Not enough samples ({len(X_rows)} < {min_samples})", flush=True); return
 
         X  = _pd_rt.DataFrame(X_rows).replace([np.inf,-np.inf],0).fillna(0).values
+
+        # ── Inject corrective labels from self-learning ─────────────────────
+        if _ml_corrective_labels:
+            import numpy as _np_cl
+            n_injected = 0
+            for cl in _ml_corrective_labels:
+                try:
+                    cl_feats = cl.get("features", {})
+                    if len(cl_feats) < len(feat_cols) * 0.7:
+                        continue
+                    cl_row = [float(cl_feats.get(f, 0) or 0) for f in feat_cols]
+                    cl_label = int(cl.get("label", 0))
+                    for _ in range(3):  # weight 3x — real outcomes
+                        X_rows.append(cl_row)
+                        y_rows.append(cl_label)
+                    n_injected += 1
+                except Exception: pass
+            if n_injected:
+                X = _pd_rt.DataFrame(X_rows).replace([np.inf,-np.inf],0).fillna(0).values
+                print(f"[ML-RETRAIN] ✅ Injected {n_injected} corrective labels ({n_injected*3} weighted rows)", flush=True)
         y  = np.array(y_rows)
 
         feat_cols = [
@@ -8860,6 +9222,15 @@ def api_debug_ml():
     result["ml_signal"]     = state.get("ml_signal", {})
     result["ml_ready"]      = _ml_ready
     result["ml_retraining"] = _ml_retraining
+    result["learning"] = {
+        "total_decisions":    _learning_state["total_decisions"],
+        "total_correct":      _learning_state["total_correct"],
+        "total_wrong":        _learning_state["total_wrong"],
+        "corrections_made":   _learning_state["corrections_made"],
+        "corrective_labels":  len(_ml_corrective_labels),
+        "thresholds":         _dynamic_thresholds,
+        "regime_accuracy":    _learning_state["regime_accuracy"],
+    }
     result["master_signal"] = state.get("master_signal", {})
     result["tsla_4h"]        = state.get("tsla_4h", {})
     result["ticker"]          = TICKER  # always include current ticker in state
@@ -9565,8 +9936,9 @@ def detect_algo_activity():
 # ── ML Directional Signal (trained LightGBM model) ───────────────
 _ml_model_cache = None
 _ml_load_errors = []
-_ml_ready       = False   # True only when model matches expected feature count
-_ml_retraining  = False   # True during active retrain — suppress alerts
+_ml_ready         = False
+_ml_retraining    = False
+_ml_corrective_labels = []   # injected by self-learning when outcomes are wrong
 
 def _load_ml_model():
     global _ml_model_cache
