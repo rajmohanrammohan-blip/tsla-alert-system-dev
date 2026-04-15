@@ -1043,13 +1043,20 @@ def calculate_spy_analysis(tsla_closes, tsla_price):
     }
     try:
         print("  🌍 Fetching SPY, QQQ, VIX, TLT...")
-        spy_hist = yf.Ticker("SPY").history(period="6mo", interval="1d")
-        qqq_hist = yf.Ticker("QQQ").history(period="6mo", interval="1d")
+        # SPY — Schwab first (daily bars = 1440min interval)
+        spy_hist, _spy_src = _schwab_or_yf("SPY", period_years=1, freq_minutes=1440,
+                                             yf_period="6mo", yf_interval="1d")
+        # QQQ — Schwab first
+        qqq_hist, _qqq_src = _schwab_or_yf("QQQ", period_years=1, freq_minutes=1440,
+                                             yf_period="6mo", yf_interval="1d")
+        # VIX — yfinance only (Schwab doesn't carry ^VIX)
         vix_hist = yf.Ticker("^VIX").history(period="6mo", interval="1d")
-        tlt_hist = yf.Ticker("TLT").history(period="3mo", interval="1d")
+        # TLT — Schwab first
+        tlt_hist, _tlt_src = _schwab_or_yf("TLT", period_years=0.5, freq_minutes=1440,
+                                             yf_period="3mo", yf_interval="1d")
+        print(f"  🌍 Market data: SPY={_spy_src} QQQ={_qqq_src} TLT={_tlt_src}", flush=True)
         if spy_hist.empty:
             print("  ⚠️ SPY hist empty - using fallback", flush=True)
-            # Don't return - try to populate what we can from other tickers
             spy_closes = None
         else:
             spy_closes = spy_hist["Close"]
@@ -1095,9 +1102,12 @@ def calculate_spy_analysis(tsla_closes, tsla_price):
             result["qqq_mom_5d"] = round((qqq_price / float(qqq_closes.iloc[-6]) - 1)*100, 2) if len(qqq_closes) > 5 else 0
             # QQQ 4h RSI (resample from 1h)
             try:
-                qqq_1h = yf.Ticker("QQQ").history(period="60d", interval="1h")
-                if not qqq_1h.empty and len(qqq_1h) > 14:
-                    _q1c = qqq_1h["Close"].astype(float)
+                # QQQ 1h — Schwab first
+                _qqq_1h_df, _qqq_1h_src = _schwab_or_yf("QQQ", period_years=0.5,
+                    freq_minutes=60, yf_period="60d", yf_interval="1h")
+                qqq_1h_closes = _qqq_1h_df["Close"].astype(float) if not _qqq_1h_df.empty else None
+                if qqq_1h_closes is not None and len(qqq_1h_closes) > 14:
+                    _q1c = qqq_1h_closes
                     try:
                         import pytz as _ptz2
                         _et2 = _ptz2.timezone("America/New_York")
@@ -1206,11 +1216,26 @@ def calculate_spy_analysis(tsla_closes, tsla_price):
         result["spy_ob"]     = spy_rsi > 70
         result["spy_os"]     = spy_rsi < 30
 
-        # SPY 1-hour RSI (from 1h bars)
+        # SPY 4h RSI — use Schwab 1h bars first (more reliable on Railway)
         try:
-            spy_1h = yf.Ticker("SPY").history(period="60d", interval="1h")
-            if not spy_1h.empty and len(spy_1h) > 14:
-                _s1c  = spy_1h["Close"].astype(float)
+            spy_1h_closes = None
+            # Try Schwab 1h bars
+            try:
+                import schwab_client as _sc_ref
+                if _sc_ref.is_configured() and _sc_ref.get_client():
+                    _spy_1h_schwab = _sc_ref.get_price_history("SPY", period_years=1, freq_minutes=60)
+                    if _spy_1h_schwab is not None and not _spy_1h_schwab.empty and len(_spy_1h_schwab) > 50:
+                        spy_1h_closes = _spy_1h_schwab["Close"].astype(float)
+                        print(f"  📡 Schwab SPY 1h: {len(spy_1h_closes)} bars", flush=True)
+            except Exception as _sch_e:
+                pass
+            # Fall back to yfinance
+            if spy_1h_closes is None:
+                spy_1h = yf.Ticker("SPY").history(period="60d", interval="1h")
+                if not spy_1h.empty and len(spy_1h) > 14:
+                    spy_1h_closes = spy_1h["Close"].astype(float)
+            if spy_1h_closes is not None and len(spy_1h_closes) > 14:
+                _s1c  = spy_1h_closes
                 _s1d  = _s1c.diff()
                 _s1g  = _s1d.where(_s1d>0,0).rolling(14).mean()
                 _s1l  = -_s1d.where(_s1d<0,0).rolling(14).mean()
@@ -1246,6 +1271,7 @@ def calculate_spy_analysis(tsla_closes, tsla_price):
                 if result["spy_mtf_ob"]: print("  ⚠️ SPY MULTI-TIMEFRAME OVERBOUGHT", flush=True)
                 if result["spy_mtf_os"]: print("  ✅ SPY MULTI-TIMEFRAME OVERSOLD — bounce potential", flush=True)
         except Exception as _1he:
+            print(f"  ⚠️ SPY 4h RSI failed: {_1he} — using daily RSI as fallback", flush=True)
             result["spy_rsi_1h"] = spy_rsi; result["spy_rsi_4h"] = spy_rsi
             result["spy_ob_1h"] = result["spy_ob"]; result["spy_ob_4h"] = result["spy_ob"]
             result["spy_os_1h"] = result["spy_os"]; result["spy_os_4h"] = result["spy_os"]
@@ -1390,6 +1416,32 @@ def calculate_spy_analysis(tsla_closes, tsla_price):
 # ═══════════════════════════════════════════════════════════════
 
 # ── 1. VWAP + VWAP BANDS (used by every institutional desk) ──
+def _schwab_or_yf(symbol, period_years, freq_minutes, yf_period="6mo", yf_interval="1d"):
+    """
+    Fetch price history — Schwab first, yfinance fallback.
+    Returns a DataFrame with Close/High/Low/Open/Volume columns.
+    """
+    import schwab_client as _sc_h
+    # Try Schwab first
+    try:
+        if _sc_h.is_configured() and _sc_h.get_client():
+            df = _sc_h.get_price_history(symbol, period_years=period_years, freq_minutes=freq_minutes)
+            if df is not None and not df.empty and len(df) > 10:
+                return df, "schwab"
+    except Exception as _se:
+        pass
+    # Fall back to yfinance
+    try:
+        import yfinance as _yf_fb
+        df = _yf_fb.Ticker(symbol).history(period=yf_period, interval=yf_interval)
+        if not df.empty:
+            return df, "yfinance"
+    except Exception:
+        pass
+    import pandas as _pd_fb
+    return _pd_fb.DataFrame(), "failed"
+
+
 def calculate_vwap(high, low, close, volume):
     """
     Volume Weighted Average Price — the primary execution benchmark
@@ -2720,6 +2772,7 @@ def calculate_market_maker_data(ticker_symbol, current_price):
             # Use the options chain front-month ATM IV vs historical range
             try:
                 import yfinance as _yf2
+                # VIX only available via yfinance (Schwab doesn't carry ^VIX)
                 _vix_hist = _yf2.Ticker("^VIX").history(period="1y", interval="1d")
                 if not _vix_hist.empty and len(_vix_hist) > 50:
                     _vix_closes = _vix_hist["Close"].astype(float)
@@ -4587,10 +4640,17 @@ def send_whatsapp(message, alert_key="default"):
     # Track alert for quality scoring — use freshest price
     _live_p, _price_age = _get_live_price()
     _cur_price = _live_p or state.get("price", 0) or 0
-    _price_stale = _price_age is None or _price_age > 300
+    # Only block if BOTH: price_history empty AND it's outside regular hours
+    # Don't block during market hours even if 1-min loop hasn't warmed up yet
+    from datetime import datetime as _dt
+    _now = _dt.now()
+    _in_market = (_now.weekday() < 5 and
+                  (_now.hour > 9 or (_now.hour == 9 and _now.minute >= 30)) and
+                  _now.hour < 20)  # include pre/post market
+    _price_stale = (_price_age is None or _price_age > 600) and not _in_market
     if _price_stale:
-        print(f"  ⚠️ Alert price may be stale (age={_price_age}s) — skipping alert", flush=True)
-        return  # Don't send alert with stale price
+        print(f"  ⚠️ Alert price may be stale (age={_price_age}s, outside market) — skipping alert", flush=True)
+        return  # Don't send alert with stale overnight price
     _cur_signal = state.get("signal", "HOLD")
     _alert_outcomes.append({
         "alert_key":  alert_key,
@@ -5059,13 +5119,27 @@ def calculate_tsla_4h(ticker=None):
         import yfinance as yf
         import numpy as np
 
-        # Fetch 1h bars and resample to 4h
-        hist_1h = yf.Ticker(_ticker).history(period="60d", interval="1h")
-        if hist_1h.empty or len(hist_1h) < 20:
+        # Fetch 1h bars — try Schwab first (more reliable on Railway)
+        closes_1h  = None
+        volumes_1h = None
+        try:
+            import schwab_client as _sc2
+            if _sc2.is_configured() and _sc2.get_client():
+                _t1h = _sc2.get_price_history(_ticker, period_years=1, freq_minutes=60)
+                if _t1h is not None and not _t1h.empty and len(_t1h) > 50:
+                    closes_1h  = _t1h["Close"].astype(float)
+                    volumes_1h = _t1h["Volume"].astype(float) if "Volume" in _t1h else closes_1h * 0
+                    print(f"  📡 Schwab {_ticker} 1h: {len(closes_1h)} bars for 4h analysis", flush=True)
+        except Exception:
+            pass
+        if closes_1h is None:
+            hist_1h = yf.Ticker(_ticker).history(period="60d", interval="1h")
+            if hist_1h.empty or len(hist_1h) < 20:
+                return result
+            closes_1h  = hist_1h["Close"].astype(float)
+            volumes_1h = hist_1h["Volume"].astype(float)
+        if closes_1h is None or len(closes_1h) < 20:
             return result
-
-        closes_1h  = hist_1h["Close"].astype(float)
-        volumes_1h = hist_1h["Volume"].astype(float)
 
         # Resample to 4h — must convert to ET first so bars align to market hours
         # UTC resample("4h") gives wrong boundaries (market opens at 13:30 UTC)
@@ -5720,7 +5794,9 @@ def run_analysis(refresh_4h=True, refresh_news=True):
         if hist is None or (hasattr(hist, 'empty') and hist.empty):
             for _attempt in range(3):
                 try:
-                    hist = yf.Ticker(TICKER).history(period="6mo", interval="1d")
+                    # TSLA daily for institutional models — Schwab first
+                    hist, _inst_src = _schwab_or_yf(TICKER, period_years=0.5, freq_minutes=1440,
+                                                     yf_period="6mo", yf_interval="1d")
                     if not hist.empty:
                         break
                     print(f"  ⚠️ yfinance returned empty data (attempt {_attempt+1}/3)")
@@ -6440,6 +6516,7 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 # Refresh earnings if ticker changed or cache empty
                 if not _earn_dates or _earn_ticker != TICKER:
                     try:
+                        # Earnings dates — yfinance is most reliable source for this
                         _ec = yf.Ticker(TICKER).get_earnings_dates(limit=10)
                         if _ec is not None and not _ec.empty:
                             _earn_dates = [d.date() if hasattr(d,"date") else d
@@ -7432,20 +7509,20 @@ def _run_ml_retrain():
         # 2. Fetch SPY + QQQ daily data for market context features
         print("[ML-RETRAIN] Fetching SPY + QQQ daily for market features...", flush=True)
         # Fetch SPY daily for RSI/MACD/BB features aligned to bar dates
+        # SPY daily — Schwab first for accuracy
         try:
-            spy_daily = yf.download("SPY", period="2y", interval="1d",
-                                    progress=False, auto_adjust=True)
-            if hasattr(spy_daily.columns, "levels"):
-                spy_daily.columns = spy_daily.columns.get_level_values(0)
-            spy_daily_closes = spy_daily["Close"].astype(float) if not spy_daily.empty else _pd_rt.Series()
+            _spy_d, _spy_d_src = _schwab_or_yf("SPY", period_years=2, freq_minutes=1440,
+                                                  yf_period="2y", yf_interval="1d")
+            spy_daily_closes = _spy_d["Close"].astype(float) if not _spy_d.empty else _pd_rt.Series()
+            print(f"[ML-RETRAIN] SPY daily: {len(spy_daily_closes)} bars ({_spy_d_src})", flush=True)
         except Exception: spy_daily_closes = _pd_rt.Series()
 
+        # QQQ daily — Schwab first
         try:
-            qqq_daily = yf.download("QQQ", period="2y", interval="1d",
-                                    progress=False, auto_adjust=True)
-            if hasattr(qqq_daily.columns, "levels"):
-                qqq_daily.columns = qqq_daily.columns.get_level_values(0)
-            qqq_daily_closes = qqq_daily["Close"].astype(float) if not qqq_daily.empty else _pd_rt.Series()
+            _qqq_d, _qqq_d_src = _schwab_or_yf("QQQ", period_years=2, freq_minutes=1440,
+                                                   yf_period="2y", yf_interval="1d")
+            qqq_daily_closes = _qqq_d["Close"].astype(float) if not _qqq_d.empty else _pd_rt.Series()
+            print(f"[ML-RETRAIN] QQQ daily: {len(qqq_daily_closes)} bars ({_qqq_d_src})", flush=True)
         except Exception: qqq_daily_closes = _pd_rt.Series()
 
         # Pre-compute daily SPY/QQQ indicators
@@ -9125,9 +9202,22 @@ def calculate_new_highs_lows():
     def _scan_one(tkr):
         try:
             import yfinance as yf
-            df = yf.Ticker(tkr).history(period="1d", interval="1m")
+            # Quick intraday — try Schwab 1min first
+            try:
+                import schwab_client as _sc_q
+                if _sc_q.is_configured() and _sc_q.get_client():
+                    df = _sc_q.get_price_history(tkr, period_years=0.005, freq_minutes=1)
+                    if df is None or df.empty: raise ValueError("empty")
+                else: raise ValueError("not configured")
+            except Exception:
+                df = yf.Ticker(tkr).history(period="1d", interval="1m")
             if df is None or df.empty or len(df) < 5:
-                df = yf.Ticker(tkr).history(period="1d", interval="5m")
+                # 5-min chart — use cached Schwab data or yfinance fallback
+                _cached = state.get("schwab_hist")
+                if _cached is not None and not _cached.empty:
+                    df = _cached.tail(78)
+                else:
+                    df = yf.Ticker(tkr).history(period="1d", interval="5m")
             if df is None or df.empty or len(df) < 3:
                 return None
 
