@@ -6636,9 +6636,10 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
     _hr_allow_buy, _, _hr_risk, _hr_reasons = check_hard_risk_rules(
         price, spy_data, indicators or {}, mm_data)
     if not _hr_allow_buy and score > 0:
-        score = min(score, 10)   # cap bullish score under hard risk
-        reasons = (_hr_reasons + reasons)[:3]
-        votes["bear"] += 1
+        score = min(score, 20)   # cap bullish score — but don't zero it
+        if _hr_reasons:
+            reasons.insert(0, _hr_reasons[0])
+        votes["neutral"] += 1   # neutral, not bear — risk is elevated not reversed
 
     # Risk level — includes SPY/QQQ overbought state
     vix = float(spy_data.get("vix", 20) or 20)
@@ -7893,7 +7894,13 @@ def run_analysis(refresh_4h=True, refresh_news=True):
 
         # ── Dashboard alert: exit urgency escalation ──
         prev_exit_score = state.get("_prev_exit_score", 0)
-        if exit_score >= 55 and prev_exit_score < 55:  # Raised from 45→55 to reduce noise
+        # Suppress SELL ZONE during confirmed capitulation bounce — system is bullish internally
+        _dv_st  = state.get("darthvader", {}).get("tsla_state", {}).get("state", "")
+        _cap_on = any(x in _dv_st.upper() for x in ["CAPITULATION","MEAN_REVERSION"])
+        _cap_cf = state.get("darthvader", {}).get("tsla_state", {}).get("confidence", 0) or 0
+        if _cap_on and _cap_cf >= 70 and exit_score < 75:
+            print(f"  ⚠️ EXIT SELL suppressed — {_dv_st} active (conf={_cap_cf}%)", flush=True)
+        elif exit_score >= 55 and prev_exit_score < 55:  # Raised from 45→55 to reduce noise
             sell_low  = exit_analysis.get("optimal_sell_low", price)
             sell_high = exit_analysis.get("optimal_sell_high", price * 1.02)
             stop      = exit_analysis.get("stop_loss", price * 0.97)
