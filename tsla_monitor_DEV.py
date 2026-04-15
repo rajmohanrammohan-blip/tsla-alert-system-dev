@@ -51,6 +51,11 @@ load_dotenv()
 # ── Schwab API client (optional — falls back to yfinance if not configured) ──
 try:
     import schwab_client as sc
+    try:
+        import schwab_l2
+        _L2_AVAILABLE = True
+    except ImportError:
+        _L2_AVAILABLE = False
     _SCHWAB_OK = sc.is_configured()
     if _SCHWAB_OK:
         print(f"[SCHWAB] Credentials found — Schwab API enabled", flush=True)
@@ -6001,6 +6006,38 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
     else:
         votes["neutral"] += 1
 
+    # 7b. Level 2 bid/ask imbalance — real institutional order book
+    _l2 = state.get("l2_data", {}) if isinstance(state, dict) else {}
+    if not _l2.get("stale", True) and _l2.get("bid_ask_imb") is not None:
+        _imb      = float(_l2.get("bid_ask_imb", 50))
+        _l2_sig   = _l2.get("l2_signal", "NEUTRAL")
+        _tape_sig = _l2.get("tape_signal", "NEUTRAL")
+        _sweep    = _l2.get("sweep_detected", False)
+        _lp_cnt   = int(_l2.get("large_print_count", 0))
+        if _l2_sig == "STRONG_ABSORPTION":
+            score += 15; reasons.append(f"L2: {_imb:.0f}% bid-side — institutions absorbing at bid")
+            votes["bull"] += 1
+        elif _l2_sig == "BULLISH_IMBALANCE":
+            score += 8; votes["bull"] += 1
+        elif _l2_sig == "OFFER_HEAVY":
+            score -= 15; reasons.append(f"L2: {_imb:.0f}% bid-side — heavy offer, sellers stacked")
+            votes["bear"] += 1
+        elif _l2_sig == "BEARISH_IMBALANCE":
+            score -= 8; votes["bear"] += 1
+        else:
+            votes["neutral"] += 1
+        if _tape_sig == "AGGRESSIVE_BUYING":
+            score += 10; reasons.append("Tape: aggressive buying — bid-side sweeps dominating")
+            votes["bull"] += 1
+        elif _tape_sig == "AGGRESSIVE_SELLING":
+            score -= 10; votes["bear"] += 1
+        if _sweep:
+            score += 12; reasons.append("L2 SWEEP: ask lifted through multiple levels")
+            votes["bull"] += 1
+        if _lp_cnt >= 3:
+            score += 8; reasons.append(f"{_lp_cnt} large prints (5000+ shares) — institutional")
+            votes["bull"] += 1
+
     # 8. SPY/QQQ macro backdrop
     macro_score = float(spy_data.get("macro_score", 0) or 0)
     spy_ob = spy_data.get("spy_ob", False)
@@ -7319,6 +7356,25 @@ def run_analysis(refresh_4h=True, refresh_news=True):
 
             # ── MASTER SIGNAL — synthesize all models ──────────────────────
             try:
+                # Level 2 / Tape signal
+                try:
+                    if _L2_AVAILABLE and not schwab_l2._l2_state.get("stale", True):
+                        _l2 = schwab_l2.get_l2_signal()
+                        state["l2_data"] = _l2
+                        _imb = _l2.get("bid_ask_imb", 50)
+                        _tape = _l2.get("tape_signal", "NEUTRAL")
+                        _sweep = _l2.get("sweep_detected", False)
+                        _lp = len(_l2.get("large_prints", []))
+                        print(f"  📊 L2: Bid/Ask imb={_imb:.0f}% | Tape={_tape} | "
+                              f"LargePrints={_lp} | Sweep={_sweep}", flush=True)
+                        # Large print + sweep = immediate alert candidate
+                        if _sweep or _lp >= 3:
+                            print(f"  🚨 INSTITUTIONAL ACTIVITY: sweep={_sweep} large_prints={_lp}", flush=True)
+                    else:
+                        state["l2_data"] = {"stale": True}
+                except Exception as _l2e:
+                    state["l2_data"] = {}
+
                 # Swing context
                 try:
                     _swing = calculate_swing_context(closes, highs, lows, price, mm_data)
@@ -8762,6 +8818,19 @@ def api_debug_ml():
     result["master_signal"] = state.get("master_signal", {})
     result["tsla_4h"]        = state.get("tsla_4h", {})
     result["vwap_bands"]     = state.get("vwap_bands", {})
+    # L2 — sanitize large_prints list for JSON
+    _l2_raw = state.get("l2_data", {})
+    result["l2_data"] = {
+        "bid_ask_imb":   _l2_raw.get("bid_ask_imb"),
+        "top5_bid_size": _l2_raw.get("top5_bid_size"),
+        "top5_ask_size": _l2_raw.get("top5_ask_size"),
+        "l2_signal":     _l2_raw.get("l2_signal"),
+        "tape_signal":   _l2_raw.get("tape_signal"),
+        "sweep_detected":_l2_raw.get("sweep_detected"),
+        "large_print_count": len(_l2_raw.get("large_prints", [])),
+        "stale":         _l2_raw.get("stale", True),
+        "running":       schwab_l2._l2_state.get("running", False) if _L2_AVAILABLE else False,
+    }
     result["swing_context"]  = state.get("swing_context", {})
     result["breadth"]        = state.get("breadth", {})
     result["hard_risk"]      = state.get("hard_risk", {})
@@ -11542,6 +11611,12 @@ def _weekly_retrain_scheduler():
 def start_background_threads():
     time.sleep(3)  # short wait for gunicorn to bind port
     print("[STARTUP] Starting background monitor threads...", flush=True)
+    # Start Level 2 streaming
+    if _L2_AVAILABLE and sc.is_configured():
+        try:
+            schwab_l2.start_l2_stream(TICKER)
+        except Exception as _l2e:
+            print(f"  ⚠️ L2 stream failed to start: {_l2e}", flush=True)
     # Pre-load ML model — check feature compatibility and retrain if needed
     _EXPECTED_ML_FEATURES = [
             "ret_1b","ret_3b","ret_6b","ret_12b","ret_48b",
