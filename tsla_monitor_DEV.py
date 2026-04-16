@@ -49,20 +49,16 @@ except ImportError:
 load_dotenv()
 
 # ── Schwab API client (optional — falls back to yfinance if not configured) ──
+# ── Import schwab_client (fully before schwab_l2 to avoid circular imports) ──
 try:
     import schwab_client as sc
-    try:
-        import schwab_l2
-        _L2_AVAILABLE = True
-    except ImportError:
-        _L2_AVAILABLE = False
     _SCHWAB_OK = sc.is_configured()
     if _SCHWAB_OK:
-        print(f"[SCHWAB] Credentials found — Schwab API enabled", flush=True)
+        print("[SCHWAB] Credentials found — Schwab API enabled", flush=True)
     else:
-        print("[SCHWAB] No credentials — using yfinance (set SCHWAB_APP_KEY + SCHWAB_APP_SECRET)", flush=True)
-except ImportError:
-    print("[SCHWAB] schwab_client.py not found — using yfinance", flush=True)
+        print("[SCHWAB] No credentials — using yfinance fallback", flush=True)
+except (ImportError, Exception) as _sc_err:
+    print(f"[SCHWAB] schwab_client not available: {_sc_err}", flush=True)
     class sc:
         @staticmethod
         def is_configured(): return False
@@ -80,10 +76,17 @@ except ImportError:
         @staticmethod
         def get_account_summary(): return {}
         @staticmethod
-        def get_auth_url(): return None, "schwab_client.py not installed"
+        def get_auth_url(): return None, "schwab_client not installed"
         @staticmethod
         def complete_auth_from_url(u): return False, "not installed", ""
     _SCHWAB_OK = False
+
+# Import schwab_l2 AFTER schwab_client is fully loaded (prevents circular import)
+try:
+    import schwab_l2
+    _L2_AVAILABLE = True
+except Exception as _l2_err:
+    _L2_AVAILABLE = False
 
 # ─────────────────────────────────────────────
 #  CONFIG
@@ -8168,7 +8171,9 @@ def _sanitize(obj, _depth=0):
     if isinstance(obj, dict):
         return {k: _sanitize(v, _depth+1) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
-        return [_sanitize(x, _depth+1) for x in obj]
+        # Cap large lists to avoid massive JSON responses
+        lst = list(obj)[:200] if len(obj) > 200 else list(obj)
+        return [_sanitize(x, _depth+1) for x in lst]
     try:
         import math
         if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
@@ -9602,6 +9607,22 @@ def stream():
 
 @app.route("/health")
 def health(): return jsonify({"status": "ok"}), 200
+
+@app.route("/api/status")
+def api_status():
+    """Lightweight status — just price, signal, ticker. Fast to load."""
+    ms = state.get("master_signal", {})
+    return jsonify({
+        "ticker":     TICKER,
+        "price":      state.get("price"),
+        "signal":     ms.get("action", "—"),
+        "score":      ms.get("score", 0),
+        "conviction": ms.get("conviction", 0),
+        "risk":       ms.get("risk", "—"),
+        "updated":    state.get("last_updated"),
+        "ml_ready":   _ml_ready,
+        "ml_retrain": _ml_retraining,
+    })
 
 # ═══════════════════════════════════════════════════════════════
 #  SPOCK 2.0 — AI TRADING CO-PILOT (Claude-powered, server-side)
@@ -11668,7 +11689,10 @@ body {
     <div>
       <div class="spock-label" style="margin-bottom:10px">WHY</div>
       <div class="reasons-list" id="reasonsList">
-        <div class="reason-item">Waiting for data...</div>
+        <div class="reason-item" style="color:var(--dim)">
+          Analysis running — data loads every 5 minutes.<br>
+          If blank after 60s, check Railway logs for errors.
+        </div>
       </div>
     </div>
 
@@ -11831,9 +11855,27 @@ function fmt(v, decimals=2) {
 function updateUI(s) {
   if (!s) return;
 
-  // Top bar
+  // Debug: log first response to help diagnose loading issues
+  if (!window._firstLoad) {
+    window._firstLoad = true;
+    console.log('[SPOCK] First state received:', {
+      ticker: s.ticker, price: s.price,
+      signal: s.master_signal?.action,
+      updated: s.last_updated,
+      keys: Object.keys(s).length + ' keys'
+    });
+  }
+
+  // Top bar — show loading state if no price yet
   var price = s.price || 0;
-  document.getElementById('topPrice').textContent = price ? '$' + parseFloat(price).toFixed(2) : '—';
+  var priceEl = document.getElementById('topPrice');
+  if (price) {
+    priceEl.textContent = '$' + parseFloat(price).toFixed(2);
+    priceEl.style.color = '#fff';
+  } else {
+    priceEl.textContent = 'Loading...';
+    priceEl.style.color = 'var(--dim)';
+  }
   var tickerEl = document.getElementById('topTicker');
   if (tickerEl && s.ticker) {
     tickerEl.textContent = s.ticker;
@@ -11866,7 +11908,13 @@ function updateUI(s) {
   var risk   = ms.risk || 'MEDIUM';
 
   var actionEl = document.getElementById('spockAction');
-  actionEl.textContent = action;
+  // Show loading if analysis hasn't run yet
+  if (!s.last_updated && !action) {
+    actionEl.textContent = 'LOADING';
+    actionEl.style.color = 'var(--dim)';
+    // Don't return — keep rendering other available data
+  }
+  actionEl.textContent = action || '—';
   actionEl.className   = 'spock-action fade-in';
   var baseAction = action.replace('STRONG ','').replace(' — LOW CONVICTION','');
   actionEl.classList.add(baseAction);
@@ -12119,17 +12167,27 @@ async function refreshWatchlist() {
 async function fetchState() {
   try {
     var r = await fetch('/api/state');
-    if (!r.ok) return;
+    if (!r.ok) {
+      console.warn('fetchState HTTP ' + r.status);
+      return;
+    }
     var d = await r.json();
-    if (d && (d.price || d.master_signal)) updateUI(d);
-  } catch(e) {}
+    if (d && typeof d === 'object') {
+      updateUI(d);  // always call updateUI — let it handle missing fields gracefully
+    }
+  } catch(e) {
+    console.error('fetchState error:', e);
+  }
 }
 
 // ── SSE stream ──
 try {
   var _sse = new EventSource('/stream');
   _sse.onmessage = function(e) {
-    try { var d = JSON.parse(e.data); if (d.price) updateUI(d); } catch(_) {}
+    try {
+      var d = JSON.parse(e.data);
+      if (d && typeof d === 'object' && !d.error) updateUI(d);
+    } catch(_) {}
   };
   _sse.onerror = function() { _sse.close(); };
 } catch(_) {}
