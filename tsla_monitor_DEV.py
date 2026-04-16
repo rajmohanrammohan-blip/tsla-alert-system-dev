@@ -11482,6 +11482,7 @@ body {
 /* ── TAB CONTENT ── */
 .tab-content { display: none; padding: 24px; flex: 1; }
 .tab-content.active { display: grid; }
+.tab-content.active#tab-chart { display: flex; flex-direction: column; }
 
 /* Options tab */
 #tab-options { grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
@@ -11842,6 +11843,22 @@ body {
       </div>
     </div>
 
+    <!-- MINI PRICE CHART — spans all 3 columns, fills empty space -->
+    <div style="grid-column:1/-1;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:14px 16px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+        <span style="font-size:10px;color:var(--dim);letter-spacing:0.08em;">PRICE HISTORY — 90 DAYS</span>
+        <span id="miniChartInfo" style="font-size:10px;color:var(--dim);">—</span>
+      </div>
+      <canvas id="miniPriceChart" style="width:100%;height:150px;display:block;border-radius:4px;"></canvas>
+      <div style="display:flex;gap:16px;margin-top:8px;flex-wrap:wrap;">
+        <span style="font-size:10px;color:var(--dim);">Current: <span id="miniCurP" style="color:#fff;font-weight:700;">—</span></span>
+        <span style="font-size:10px;color:var(--dim);">90D High: <span id="miniHiP" style="color:var(--buy);font-weight:700;">—</span></span>
+        <span style="font-size:10px;color:var(--dim);">90D Low: <span id="miniLoP" style="color:var(--sell);font-weight:700;">—</span></span>
+        <span style="font-size:10px;color:var(--dim);">VWAP: <span id="miniVwap" style="color:var(--hold);font-weight:700;">—</span></span>
+        <span style="font-size:10px;color:var(--dim);">Max Pain: <span id="miniMp" style="color:#ff5252;font-weight:700;">—</span></span>
+      </div>
+    </div>
+
     <!-- MARKET TAB -->
     <div class="tab-content" id="tab-market">
       <div class="data-card">
@@ -11939,12 +11956,11 @@ function switchTab(name) {
   event.target.classList.add('active');
   var panel = document.getElementById('tab-' + name);
   panel.classList.add('active');
-  // Chart tab needs flex display + canvas redraw after becoming visible
+  // Trigger chart redraw when chart tab becomes visible
   if (name === 'chart') {
-    panel.style.display = 'flex';
     setTimeout(function() {
       try { if (window._lastState) _renderPriceChart(window._lastState); } catch(_) {}
-    }, 50);
+    }, 60);
   }
 }
 
@@ -12244,8 +12260,91 @@ function _updateUI_inner(s) {
     }).join('');
   }
 
+  // Mini chart on Options tab (always visible)
+  try { _renderMiniChart(s); } catch(_me) {}
   // Chart tab — render price history
   try { _renderPriceChart(s); } catch(_ce) {}
+}
+
+function _renderMiniChart(s) {
+  var canvas = document.getElementById('miniPriceChart');
+  if (!canvas) return;
+  var ph = s.price_history || [];
+  if (!ph.length) return;
+  var rp = document.querySelector('.right-panel');
+  var W = rp ? Math.floor(rp.offsetWidth - 64) : 700;
+  var H = 150;
+  canvas.width = W; canvas.height = H;
+  var ctx = canvas.getContext('2d');
+  var prices = ph.map(function(p){return p.price;});
+  var labels = ph.map(function(p){return p.date;});
+  var n = prices.length;
+  var minP = Math.min.apply(null,prices), maxP = Math.max.apply(null,prices);
+  var pad = (maxP-minP)*0.1||5; minP-=pad; maxP+=pad;
+  var vwap = s.vwap_bands&&s.vwap_bands.vwap ? parseFloat(s.vwap_bands.vwap) : null;
+  var mp   = s.mm_data&&s.mm_data.max_pain   ? parseFloat(s.mm_data.max_pain)  : null;
+  var curP = parseFloat(s.price||prices[n-1]||0);
+  var PL=42,PR=8,PT=8,PB=22;
+  var cW=W-PL-PR, cH=H-PT-PB;
+  function xOf(i){return PL+(i/(n-1))*cW;}
+  function yOf(v){return PT+(1-(v-minP)/(maxP-minP))*cH;}
+  // Background
+  ctx.fillStyle='#0d1117'; ctx.fillRect(0,0,W,H);
+  // Subtle grid
+  ctx.strokeStyle='rgba(255,255,255,0.04)'; ctx.lineWidth=1;
+  [0,0.25,0.5,0.75,1].forEach(function(f){
+    var gy=PT+f*cH;
+    ctx.beginPath();ctx.moveTo(PL,gy);ctx.lineTo(W-PR,gy);ctx.stroke();
+    var gv=maxP-f*(maxP-minP);
+    ctx.fillStyle='rgba(255,255,255,0.25)';ctx.font='9px monospace';
+    ctx.fillText('$'+gv.toFixed(0),2,gy+3);
+  });
+  // Max Pain
+  if(mp&&mp>=minP&&mp<=maxP){
+    var mpy=yOf(mp);
+    ctx.strokeStyle='rgba(255,82,82,0.6)';ctx.lineWidth=1;ctx.setLineDash([3,3]);
+    ctx.beginPath();ctx.moveTo(PL,mpy);ctx.lineTo(W-PR,mpy);ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle='#ff5252';ctx.font='9px monospace';
+    ctx.fillText('MP $'+mp.toFixed(0),W-PR-52,mpy-2);
+  }
+  // VWAP
+  if(vwap&&vwap>=minP&&vwap<=maxP){
+    var vy=yOf(vwap);
+    ctx.strokeStyle='rgba(255,179,0,0.6)';ctx.lineWidth=1;ctx.setLineDash([5,3]);
+    ctx.beginPath();ctx.moveTo(PL,vy);ctx.lineTo(W-PR,vy);ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle='#ffb300';ctx.font='9px monospace';
+    ctx.fillText('VWAP',W-PR-34,vy-2);
+  }
+  // Area fill
+  var g=ctx.createLinearGradient(0,PT,0,H-PB);
+  g.addColorStop(0,'rgba(0,229,255,0.15)');g.addColorStop(1,'rgba(0,229,255,0.01)');
+  ctx.beginPath();ctx.moveTo(xOf(0),H-PB);
+  for(var i=0;i<n;i++)ctx.lineTo(xOf(i),yOf(prices[i]));
+  ctx.lineTo(xOf(n-1),H-PB);ctx.closePath();ctx.fillStyle=g;ctx.fill();
+  // Price line
+  ctx.strokeStyle='#00e5ff';ctx.lineWidth=1.5;ctx.lineJoin='round';
+  ctx.beginPath();
+  for(var i=0;i<n;i++){if(i===0)ctx.moveTo(xOf(i),yOf(prices[i]));else ctx.lineTo(xOf(i),yOf(prices[i]));}
+  ctx.stroke();
+  // Current dot
+  ctx.beginPath();ctx.arc(xOf(n-1),yOf(curP),3,0,Math.PI*2);
+  ctx.fillStyle='#fff';ctx.fill();
+  // Date labels
+  ctx.fillStyle='rgba(255,255,255,0.25)';ctx.font='8px monospace';
+  var step=Math.max(1,Math.floor(n/5));
+  for(var i=0;i<n;i+=step){
+    ctx.fillText(labels[i]?labels[i].slice(5):'',xOf(i)-12,H-6);
+  }
+  // Stats
+  var hi=Math.max.apply(null,prices),lo=Math.min.apply(null,prices);
+  document.getElementById('miniCurP').textContent='$'+curP.toFixed(2);
+  document.getElementById('miniHiP').textContent='$'+hi.toFixed(2);
+  document.getElementById('miniLoP').textContent='$'+lo.toFixed(2);
+  document.getElementById('miniVwap').textContent=vwap?'$'+vwap.toFixed(2):'—';
+  document.getElementById('miniMp').textContent=mp?'$'+mp.toFixed(0):'—';
+  document.getElementById('miniChartInfo').textContent=n+' days · '+(labels[0]||'')+' → '+(labels[n-1]||'');
 }
 
 function _renderPriceChart(s) {
@@ -12254,9 +12353,18 @@ function _renderPriceChart(s) {
   var ph = s.price_history || [];
   if (!ph.length) return;
 
-  // Set canvas pixel dimensions
-  var rect = canvas.parentElement.getBoundingClientRect();
-  var W = rect.width > 100 ? Math.floor(rect.width) : 800;
+  // Set canvas pixel dimensions — measure right panel width as fallback
+  var W = 800;
+  try {
+    var rect = canvas.getBoundingClientRect();
+    if (rect.width > 100) {
+      W = Math.floor(rect.width);
+    } else {
+      // Tab not fully visible yet — use right panel width
+      var rp = document.querySelector('.right-panel');
+      if (rp) W = Math.floor(rp.offsetWidth - 32);
+    }
+  } catch(_) {}
   var H = 320;
   canvas.width  = W;
   canvas.height = H;
