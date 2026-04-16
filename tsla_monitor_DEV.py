@@ -7564,6 +7564,7 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                     "near_5d":        bool(_earn_near_5d),
                     "near_10d":       bool(_earn_near_10d),
                     "next_date":      str(_future[0]) if _earn_dates and _future else "Unknown",
+                    "next_earnings":  str(_future[0]) if _earn_dates and _future else "Unknown",
                 }
             except Exception: pass
 
@@ -8211,21 +8212,49 @@ def api_state():
         import traceback
         print(f"  ❌ api_state serialization error: {e}", flush=True)
         print(traceback.format_exc()[:500], flush=True)
-        # Return state without darthvader as fallback
-        safe = {k: v for k, v in state.items() if k != "darthvader"}
-        safe["wa_enabled"]    = WA_ENABLED
-        safe["wa_phone_tail"] = GREEN_PHONE[-4:] if GREEN_PHONE else ""
-        safe["ticker"]        = TICKER  # always inject so frontend never gets undefined
-        # Include darthvader features for algo radar gauges (strip heavy data)
-        dv_full = state.get("darthvader", {})
-        safe["darthvader"]    = {
-            "features":           dv_full.get("features", {}),
-            "tsla_state":         dv_full.get("tsla_state", {}),
-            "risk_mode":          dv_full.get("risk_mode", "NORMAL"),
-            "probabilistic_signals": dv_full.get("probabilistic_signals", {}),
-            "market_intent":      dv_full.get("market_intent", ""),
-        }
-        return jsonify(safe)
+        try:
+            # Fallback: strip heavy/problematic keys and sanitize
+            dv_full = state.get("darthvader", {})
+            safe = {
+                "ticker":        TICKER,
+                "price":         state.get("price"),
+                "price_change_pct": state.get("price_change_pct"),
+                "session_type":  state.get("session_type", "UNKNOWN"),
+                "last_updated":  state.get("last_updated"),
+                "signal":        state.get("signal", "HOLD"),
+                "master_signal": state.get("master_signal", {}),
+                "ml_signal":     state.get("ml_signal", {}),
+                "spy_data":      state.get("spy_data", {}),
+                "mm_data":       state.get("mm_data", {}),
+                "uoa_data":      state.get("uoa_data", {}),
+                "poc_data":      state.get("poc_data", {}),
+                "vwap_bands":    state.get("vwap_bands", {}),
+                "tsla_4h":       state.get("tsla_4h", {}),
+                "sizing":        state.get("sizing", {}),
+                "earnings_context": state.get("earnings_context", {}),
+                "breadth":       state.get("breadth", {}),
+                "vix_flip":      state.get("vix_flip", {}),
+                "swing_context": state.get("swing_context", {}),
+                "alerts_log":    state.get("alerts_log", [])[:20],
+                "spock_accuracy":state.get("spock_accuracy", {}),
+                "ml_ready":      _ml_ready,
+                "ml_retraining": _ml_retraining,
+                "wa_enabled":    WA_ENABLED,
+                "wa_phone_tail": GREEN_PHONE[-4:] if GREEN_PHONE else "",
+                "darthvader": {
+                    "features":    dv_full.get("features", {}),
+                    "tsla_state":  dv_full.get("tsla_state", {}),
+                    "risk_mode":   dv_full.get("risk_mode", "NORMAL"),
+                },
+            }
+            return jsonify(_sanitize(safe))
+        except Exception as e2:
+            print(f"  ❌ api_state fallback also failed: {e2}", flush=True)
+            return jsonify({"ticker": TICKER, "price": state.get("price"),
+                            "last_updated": state.get("last_updated"),
+                            "master_signal": {"action":"HOLD","score":0,"conviction":0,
+                                              "risk":"UNKNOWN","reasons":[]},
+                            "_error": "serialization_failed"})
 
 @app.route("/api/switch_ticker")
 def api_switch_ticker():
@@ -11889,6 +11918,11 @@ function fmt(v, decimals=2) {
 // ── Main update ──
 function updateUI(s) {
   if (!s) return;
+  // Global safety net — catch any crash and log it
+  try { _updateUI_inner(s); } catch(e) { console.error('[SPOCK] updateUI crash:', e, e.stack); }
+}
+function _updateUI_inner(s) {
+  if (!s) return;
 
   // Debug: log first response to help diagnose loading issues
   if (!window._firstLoad) {
@@ -12008,21 +12042,21 @@ function updateUI(s) {
   // CTA size
   var sz = s.sizing || {};
   setText('ctaSize', sz.final_exposure ? '$' + Math.round(sz.final_exposure).toLocaleString() : '—');
-  setText('ctaShares', sz.shares ? sz.shares + ' shares · ' + (sz.size_label || '') : '—');
+  setText('ctaShares', sz.share_count ? sz.share_count + ' shares · ' + (sz.sizing_signal || '') : '—');
 
   // Max Pain + GEX
   var mm = s.mm_data || {};
   setText('maxPain', mm.max_pain ? '$' + mm.max_pain : '—');
   var gex = mm.gex_total;
   setText('gexVal', gex != null ? 'GEX ' + (gex >= 0 ? '+' : '') + Math.round(gex) + 'M' : 'GEX —');
-  document.getElementById('gexVal').style.color = gex > 0 ? 'var(--buy)' : gex < 0 ? 'var(--sell)' : 'var(--dim)';
+  try { document.getElementById('gexVal').style.color = gex > 0 ? 'var(--buy)' : gex < 0 ? 'var(--sell)' : 'var(--dim)'; } catch(_){}
 
   // VWAP
   var vb = s.vwap_bands || {};
   setText('vwapVal', vb.vwap ? '$' + vb.vwap : '—');
   setText('vwapSig', vb.vwap_signal || '—');
-  document.getElementById('vwapSig').style.color =
-    (vb.vwap_signal||'').includes('ABOVE') ? 'var(--buy)' : 'var(--sell)';
+  try { document.getElementById('vwapSig').style.color =
+    (vb.vwap_signal||'').includes('ABOVE') ? 'var(--buy)' : 'var(--sell)'; } catch(_){}
 
   // SPOCK accuracy
   var acc = s.spock_accuracy || {};
@@ -12072,12 +12106,15 @@ function updateUI(s) {
   var uoa = s.uoa_data || {};
   var flow = (uoa.net_flow || '').includes('BULL') ? 'bull' : (uoa.net_flow||'').includes('BEAR') ? 'bear' : '';
   setText('uoa-flow', uoa.net_flow || '—', flow);
-  setText('uoa-whales', uoa.whale_count != null ? uoa.whale_count + ' trades' : '—');
-  setText('uoa-unusual', uoa.unusual_count != null ? uoa.unusual_count : '—');
-  setText('uoa-calls', uoa.call_premium ? '$' + (uoa.call_premium/1e6).toFixed(1) + 'M calls' : '—', 'bull');
-  setText('uoa-puts',  uoa.put_premium  ? '$' + (uoa.put_premium /1e6).toFixed(1) + 'M puts'  : '—', 'bear');
+  var _wc = uoa.whale_alerts ? uoa.whale_alerts.length : (uoa.whale_count || 0);
+  setText('uoa-whales', _wc ? _wc + ' trades' : '—');
+  setText('uoa-unusual', uoa.total_unusual != null ? uoa.total_unusual : (uoa.unusual_count != null ? uoa.unusual_count : '—'));
+  var _cp = uoa.total_call_premium || uoa.call_premium || 0;
+  setText('uoa-calls', _cp ? '$' + (_cp/1e6).toFixed(1) + 'M calls' : '—', 'bull');
+  var _pp = uoa.total_put_premium || uoa.put_premium || 0;
+  setText('uoa-puts', _pp ? '$' + (_pp/1e6).toFixed(1) + 'M puts' : '—', 'bear');
 
-  setText('earn-next', earn.next_earnings || '—');
+  setText('earn-next', earn.next_earnings || earn.next_date || '—');
   setText('earn-days', earn.days_away != null ? earn.days_away + ' days' : '—',
     earn.days_away <= 7 ? 'warn' : '');
   setText('earn-mode', earn.earnings_mode ? 'YES ⚠️' : 'No', earn.earnings_mode ? 'warn' : '');
@@ -12225,10 +12262,20 @@ async function fetchState() {
     }
     var d = await r.json();
     if (d && typeof d === 'object') {
-      updateUI(d);  // always call updateUI — let it handle missing fields gracefully
+      // Debug: log what we received
+      if (!window._gotData && d.last_updated) {
+        window._gotData = true;
+        console.log('[SPOCK] Full state received:', {
+          ticker: d.ticker, price: d.price, updated: d.last_updated,
+          action: d.master_signal && d.master_signal.action,
+          score:  d.master_signal && d.master_signal.score,
+          keys: Object.keys(d).length
+        });
+      }
+      updateUI(d);
     }
   } catch(e) {
-    console.error('fetchState error:', e);
+    console.error('[SPOCK] fetchState error:', e);
   }
 }
 
