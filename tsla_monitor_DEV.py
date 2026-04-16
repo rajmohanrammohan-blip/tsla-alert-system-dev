@@ -5178,15 +5178,15 @@ def get_signal_weight(signal_type):
 
 def _run_signal_feedback_update(decisions):
     """
-    Called after outcomes are measured. Updates signal type weights
-    based on which signals were actually correct.
+    Called after outcomes are measured. Updates signal type weights.
+    One update per signal type per measured decision — no redundant passes.
     """
-    for dec in decisions:
-        if dec.get("outcome_1h") not in ("CORRECT", "WRONG"):
-            continue
+    measured = [d for d in decisions
+                if d.get("outcome_1h") in ("CORRECT", "WRONG")]
+    if not measured:
+        return
+    for dec in measured:
         was_correct = dec["outcome_1h"] == "CORRECT"
-        # Map decision to signal types that contributed
-        action = dec.get("action", "HOLD")
         for sig_type in ["ml_ensemble", "uoa_flow", "darthvader", "spock_master"]:
             _update_signal_weight(sig_type, was_correct)
 
@@ -7789,6 +7789,15 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 except Exception as _be:
                     master["breakout"] = {}
 
+                # Hard risk override on master signal —
+                # if hard risk blocks BUY, SPOCK master must respect it
+                _hr = state.get("hard_risk", {})
+                if _hr.get("override") == "EXTREME" and "BUY" in master.get("action", ""):
+                    _hr_note = _hr.get("reasons", ["hard risk override"])[0]
+                    master["action"]  = "HOLD"
+                    master["color"]   = "#ffb300"
+                    if _hr_note not in master.get("reasons", []):
+                        master["reasons"].insert(0, f"⛔ {_hr_note}")
                 state["master_signal"] = master
 
                 # Log decision for self-learning
@@ -12241,7 +12250,7 @@ async function refreshWatchlist() {
       var chgColor = chg >= 0 ? 'var(--buy)' : 'var(--sell)';
       var dotColor = sc.score > 20 ? 'var(--buy)' : sc.score < -20 ? 'var(--sell)' : 'var(--hold)';
       var isCurrent = sym === current;
-      return '<div class="wl-item' + (isCurrent ? ' active-ticker' : '') + '" onclick="switchTicker(\'' + sym + '\')">' +
+      return '<div class="wl-item' + (isCurrent ? ' active-ticker' : '') + '" data-sym="' + sym + '" onclick="switchTicker(this.dataset.sym)">' +
         '<div class="wl-score-dot" style="background:' + dotColor + '"></div>' +
         '<span class="wl-sym">' + sym + '</span>' +
         '<span class="wl-price">' + (sc.price ? '$' + sc.price : '—') + '</span>' +
