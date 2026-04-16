@@ -223,16 +223,11 @@ def start_l2_stream(ticker="TSLA"):
         global _l2_loop
         # Use schwab via schwab_client (which is already installed as schwab-py)
         try:
-            import schwab
+            import schwab  # noqa — confirms schwab-py package is importable
         except ImportError:
-            try:
-                import schwab_client as _sc_check
-                import importlib, sys
-                # schwab-py is installed as 'schwab' package
-                print("  ⚠️ L2: schwab package not found — L2 requires schwab-py", flush=True)
-                return
-            except Exception:
-                return
+            print("  ⚠️ L2: schwab package not found — L2 requires schwab-py", flush=True)
+            _l2_state["error"] = "schwab-py not installed"
+            return
         _l2_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(_l2_loop)
         try:
