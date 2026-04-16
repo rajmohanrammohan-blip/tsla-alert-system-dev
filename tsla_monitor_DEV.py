@@ -7448,7 +7448,10 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 f"\n"
                 f"📌 {top3_uoa}"
             )
-            log_alert(wa_msg, alert_key="uoa_whale")
+            if _ml_retraining:
+                print("  ⚠️ Whale alert suppressed — ML retrain in progress", flush=True)
+            else:
+                log_alert(wa_msg, alert_key="uoa_whale")
         state["_prev_uoa_whales"] = curr_uoa_whales
         # Track UOA flow delta (change since last cycle)
         _prev_call_prem = state.get("_prev_call_prem", 0)
@@ -9180,11 +9183,22 @@ def _run_ml_retrain():
         }
         pkl_path = f"/app/{TICKER.lower()}_model.pkl"
         with open(pkl_path,"wb") as f: pickle.dump(pkg,f)
-        # Also save to /tmp as session backup (survives Railway restarts within session)
-        try:
-            import shutil as _sh
-            _sh.copy2(pkl_path, f"/tmp/{TICKER.lower()}_model_backup.pkl")
-        except Exception: pass
+        print(f"[ML-RETRAIN] Saved to {pkl_path}", flush=True)
+        # Persist to all available locations so restarts don't lose the model
+        _extra_paths = [
+            f"/tmp/{TICKER.lower()}_model_backup.pkl",   # survives within session
+            f"/data/{TICKER.lower()}_model.pkl",          # Railway volume (if mounted)
+            f"/mnt/{TICKER.lower()}_model.pkl",           # alternative volume path
+        ]
+        import shutil as _sh
+        for _ep in _extra_paths:
+            try:
+                import os as _os3
+                _os3.makedirs(_os3.path.dirname(_ep), exist_ok=True) if _os3.path.dirname(_ep) else None
+                _sh.copy2(pkl_path, _ep)
+                print(f"[ML-RETRAIN] Also saved to {_ep}", flush=True)
+            except Exception as _pe:
+                pass  # silently skip unavailable paths
 
         # Also save regime-specific models by splitting training data
         try:
@@ -10076,8 +10090,10 @@ def _load_ml_model():
     # shadowed by the stale tsla_model.pkl bundled in the repo working dir
     _script_dir = os.path.dirname(os.path.abspath(__file__))
     _paths = [
-        f"/app/{TICKER.lower()}_model.pkl",
-        f"/tmp/{TICKER.lower()}_model_backup.pkl",
+        f"/data/{TICKER.lower()}_model.pkl",       # Railway volume (persists across restarts)
+        f"/mnt/{TICKER.lower()}_model.pkl",         # alternative volume
+        f"/app/{TICKER.lower()}_model.pkl",         # container /app
+        f"/tmp/{TICKER.lower()}_model_backup.pkl",  # session backup
         os.path.join(_script_dir, f"{TICKER.lower()}_model.pkl"),
         os.path.join(os.getcwd(), f"{TICKER.lower()}_model.pkl"),
         f"{TICKER.lower()}_model.pkl",
@@ -12005,20 +12021,38 @@ function _updateUI_inner(s) {
     });
   }
 
-  // If analysis hasn't run yet, show spinner in SPOCK panel and return
-  // (ticker button + top bar still update so the UI feels alive)
+  // Show loading state while analysis hasn't run yet
   if (s._loading && !s.last_updated) {
     var tEl = document.getElementById('topTicker');
     if (tEl && s.ticker) { tEl.textContent = s.ticker; _currentTicker = s.ticker; }
     var bt = document.getElementById('brandTicker'); if(bt && s.ticker) bt.textContent = s.ticker;
     var aEl = document.getElementById('spockAction');
-    if (aEl) { aEl.textContent = 'LOADING…'; aEl.style.color = 'var(--dim)'; }
+    if (aEl) {
+      aEl.textContent = s.ml_retraining ? 'TRAINING' : 'LOADING…';
+      aEl.style.color = 'var(--dim)';
+    }
+    // Show retrain progress in WHY box
+    var rl = document.getElementById('reasonsList');
+    if (rl) {
+      rl.innerHTML = s.ml_retraining
+        ? '<div class="reason-item" style="color:var(--hold)">⚙️ ML model retraining — live signals in ~2 min</div>'
+        : '<div class="reason-item" style="color:var(--dim)">🔄 Fetching market data — first analysis in ~60s</div>';
+    }
     document.querySelectorAll('.qtick').forEach(function(el) {
       el.classList.toggle('active', el.textContent === s.ticker);
     });
     var banner = document.getElementById('retrainBanner');
     if (s.ml_retraining && banner) banner.classList.add('active');
     return;
+  }
+  // Also update WHY box with retrain notice if retraining mid-session
+  if (s.ml_retraining) {
+    var rl2 = document.getElementById('reasonsList');
+    var rbn = document.getElementById('retrainBanner');
+    if (rbn) rbn.classList.add('active');
+    if (rl2 && (!s.master_signal || !s.master_signal.reasons || !s.master_signal.reasons.length)) {
+      rl2.innerHTML = '<div class="reason-item" style="color:var(--hold)">⚙️ ML retraining — signals suppressed ~2 min</div>';
+    }
   }
 
   // Top bar — show loading state if no price yet
@@ -12047,7 +12081,20 @@ function _updateUI_inner(s) {
     chgEl.textContent = (chg >= 0 ? '+' : '') + parseFloat(chg).toFixed(2) + '%';
     chgEl.style.color = chg >= 0 ? 'var(--buy)' : 'var(--sell)';
   }
-  document.getElementById('topTime').textContent = s.last_updated || '—';
+  var lu = s.last_updated;
+  var topTimeEl = document.getElementById('topTime');
+  if (topTimeEl) {
+    topTimeEl.textContent = lu || '—';
+    // Staleness check — warn if data > 10 min old
+    if (lu) {
+      try {
+        var luDate = new Date(lu.replace(' ', 'T'));
+        var ageMin = (Date.now() - luDate.getTime()) / 60000;
+        topTimeEl.style.color = ageMin > 10 ? 'var(--sell)' : ageMin > 6 ? 'var(--hold)' : 'var(--dim)';
+        if (ageMin > 10) topTimeEl.textContent = lu + ' ⚠️';
+      } catch(_) {}
+    }
+  }
   document.getElementById('topSession').textContent = s.session_type || '';
 
   // ML retrain banner
