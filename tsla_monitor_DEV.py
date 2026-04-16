@@ -6608,10 +6608,14 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
         bear_pct   = round(votes["bear"] / decisive_votes * 100)
     else:
         bull_pct = bear_pct = 0
-    # Scale by participation: if only 2/12 models voted, conviction is lower
+    # Scale by participation: neutrals reduce conviction but less aggressively
+    # Neutral = signal unclear (not wrong), so only mild penalty
     participation = round(decisive_votes / max(total_votes, 1) * 100)
     raw_conviction = max(bull_pct, bear_pct)
-    conviction = round(raw_conviction * (0.5 + participation / 200))  # blend: 50-100% of raw
+    # Old formula: (0.5 + participation/200) was too punishing on neutrals
+    # New formula: floor at 0.65 so even 50% participation gives 65% weight
+    part_weight = max(0.65, 0.5 + participation / 200)
+    conviction = round(raw_conviction * part_weight)
 
     # Score is primary gate. Conviction is secondary — don't let broken
     # conviction scorer silence a high-confidence score.
@@ -8563,7 +8567,7 @@ def _save_regime_models(X_df, y, feat_cols, scaler, models_trained, base_pkg):
             if not regime_models: continue
             pkg = {**base_pkg, "models": regime_models, "model": regime_models[0],
                    "n_samples": int(n), "regime": regime_name}
-            path = f"/app/{TICKER.lower()}_model_{regime_name}.pkl"
+            path = f"/data/{TICKER.lower()}_model_{regime_name}.pkl"
             with open(path, "wb") as f: pickle.dump(pkg, f)
             print(f"[REGIME] Saved {regime_name} model ({n} samples)", flush=True)
         except Exception as e:
@@ -9095,13 +9099,12 @@ def _run_ml_retrain():
 
         X_df   = _pd_rt.DataFrame(X, columns=feat_cols)
         scaler = StandardScaler()
-        # Fit on DataFrame to preserve feature names (avoids sklearn warning)
-        X_s    = scaler.fit_transform(X_df)
+        # Fit on numpy array then manually set feature_names_in_ — avoids sklearn warning
+        # when transform is called with a named DataFrame at inference time
+        import numpy as _np_sc
+        X_s    = scaler.fit_transform(X_df.values)
+        scaler.feature_names_in_ = _np_sc.array(feat_cols, dtype=object)
         X_s_df = _pd_rt.DataFrame(X_s, columns=feat_cols)
-        # Verify scaler has feature names
-        if hasattr(scaler, 'feature_names_in_') and scaler.feature_names_in_ is None:
-            import numpy as _np_sc
-            scaler.feature_names_in_ = _np_sc.array(feat_cols)
 
         # 9. Train ensemble
         print("[ML-RETRAIN] Training ensemble...", flush=True)
@@ -9181,7 +9184,7 @@ def _run_ml_retrain():
             "iv_back_ref":  back_iv,
             "pc_ratio_ref": pc_ratio_now,
         }
-        pkl_path = f"/app/{TICKER.lower()}_model.pkl"
+        pkl_path = f"/data/{TICKER.lower()}_model.pkl"  # Railway volume — persists across restarts
         with open(pkl_path,"wb") as f: pickle.dump(pkg,f)
         print(f"[ML-RETRAIN] Saved to {pkl_path}", flush=True)
         # Persist to all available locations so restarts don't lose the model
@@ -9274,6 +9277,7 @@ def api_debug_ml():
     # 1. Check all candidate paths
     _script_dir = os.path.dirname(os.path.abspath(__file__))
     _paths = [
+        f"/data/{TICKER.lower()}_model.pkl",
         f"/app/{TICKER.lower()}_model.pkl",
         f"{TICKER.lower()}_model.pkl", f"./{TICKER.lower()}_model.pkl",
         f"/tmp/{TICKER.lower()}_model_backup.pkl",  # session backup
@@ -10086,8 +10090,8 @@ def _load_ml_model():
             print("  [ML] Could not install lightgbm: " + str(_ie), flush=True)
 
     # Railway deploys to /app by default; also check cwd and script dir
-    # IMPORTANT: /app paths come FIRST — retrain saves there and must not be
-    # shadowed by the stale tsla_model.pkl bundled in the repo working dir
+    # IMPORTANT: /data/ (Railway volume) comes FIRST — retrain saves there and persists
+    # across container restarts. Falls back to /app/, /tmp/, then repo pkl.
     _script_dir = os.path.dirname(os.path.abspath(__file__))
     _paths = [
         f"/data/{TICKER.lower()}_model.pkl",       # Railway volume (persists across restarts)
@@ -10176,7 +10180,8 @@ def _get_ml_signal(features_dict):
         row_data = {c: float(features_dict.get(c, 0) or 0) for c in cols}
         _is_stale = len(cols) != 84
         X_df   = pd.DataFrame([row_data], columns=cols)
-        X_s    = pkg["scaler"].transform(X_df)
+        # Transform via numpy array to avoid feature_names mismatch warning
+        X_s    = pkg["scaler"].transform(X_df.values)
         X_s_df = pd.DataFrame(X_s, columns=cols)
 
         # Ensemble: average probabilities from all models
