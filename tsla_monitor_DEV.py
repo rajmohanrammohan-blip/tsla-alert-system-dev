@@ -4713,9 +4713,10 @@ def send_whatsapp(message, alert_key="default"):
     # Track alert for quality scoring — use freshest price
     _live_p, _price_age = _get_live_price()
     _cur_price = _live_p or state.get("price", 0) or 0
-    # Block alerts during ML retrain (prevents garbage conf=100 signals)
-    if _ml_retraining and alert_key.startswith("signal_"):
-        print(f"  ⚠️ Alert suppressed — ML retrain in progress", flush=True)
+    # Block signal-quality alerts during ML retrain (prevents garbage conf=100 signals)
+    _RETRAIN_BLOCKED_KEYS = {"signal_BUY", "signal_SELL", "exit_alert", "entry_signal", "peak_top", "cap_bounce"}
+    if _ml_retraining and (alert_key.startswith("signal_") or alert_key in _RETRAIN_BLOCKED_KEYS):
+        print(f"  ⚠️ Alert suppressed — ML retrain in progress ({alert_key})", flush=True)
         return
     # Only block if BOTH: price_history empty AND it's outside regular hours
     # Don't block during market hours even if 1-min loop hasn't warmed up yet
@@ -7177,8 +7178,20 @@ def run_analysis(refresh_4h=True, refresh_news=True):
         except Exception:
             macd_history = []
 
+        # Compute price_change_pct from daily open reference
+        try:
+            _prev_close = float(closes.iloc[-2]) if len(closes) > 1 else price
+            _price_chg_pct = round((price - _prev_close) / max(_prev_close, 0.01) * 100, 2)
+        except Exception:
+            _price_chg_pct = 0.0
+
         state.update({
-            "price": price, "signal": signal, "signal_strength": strength,
+            "ticker":             TICKER,
+            "price":              price,
+            "price_change_pct":   _price_chg_pct,
+            "session_type":       ext_data.get("session", "UNKNOWN"),
+            "signal":             signal,
+            "signal_strength":    strength,
             "indicators":         indicators,
             "ichimoku":           ichi,
             "hmm":                hmm_result,
@@ -7193,7 +7206,6 @@ def run_analysis(refresh_4h=True, refresh_news=True):
             "mm_data":            mm_data,
             "uoa_data":           uoa_data,
             "dark_pool":          dark_pool,
-            "spy_data":           spy_data,
             "vol_history":        vol_history,
             "vol_profile":        vol_profile,
             "poc_data":           poc_data,
@@ -8075,9 +8087,9 @@ def _fast_price_loop():
                     while len(_price_history) > 5:
                         _price_history.pop(0)
 
-                    # Update state price immediately
-                    if state.get("price"):
-                        state["price"] = price
+                    # Update state price immediately (always — even on first startup)
+                    state["price"]  = price
+                    state["ticker"] = TICKER
 
                     # Flash move detection
                     flash, pct, direction = _check_flash_move(price)
@@ -8523,8 +8535,9 @@ def _run_ml_retrain():
     """
     global _ml_model_cache, _ml_load_errors
     global _ml_retraining, _ml_ready
-    _ml_retraining = True
-    _ml_ready      = False
+    _ml_retraining  = True
+    _ml_ready       = False
+    _ml_model_cache = None  # clear stale cache so old feature set isn't served during retrain
     print("[ML-RETRAIN] Starting enhanced retrain (5min bars + ensemble)...", flush=True)
     try:
         import numpy as np, pickle, os
@@ -10065,9 +10078,15 @@ def _load_regime_model(regime):
         try:
             with open(regime_path, "rb") as f:
                 pkg = pickle.load(f)
-            return pkg, regime
+            # Only use regime model if it has same feature count as current base model
+            base = _ml_model_cache if _ml_model_cache is not None else _load_ml_model()
+            if base and len(pkg.get("feature_cols", [])) == len(base.get("feature_cols", [])):
+                return pkg, regime
         except Exception:
             pass
+    # Fall back to in-memory cache first (most current after retrain)
+    if _ml_model_cache is not None:
+        return _ml_model_cache, "base"
     return _load_ml_model(), "base"
 
 
