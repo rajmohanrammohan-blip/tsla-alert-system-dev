@@ -11812,6 +11812,7 @@ body {
       <div class="tab" onclick="switchTab('market')">Market</div>
       <div class="tab" onclick="switchTab('data')">Data</div>
       <div class="tab" onclick="switchTab('alerts')">Alerts</div>
+      <div class="tab" onclick="switchTab('chart')">Chart</div>
     </div>
 
     <!-- OPTIONS TAB -->
@@ -11896,13 +11897,55 @@ body {
   </div>
 </div>
 
+    <!-- CHART TAB -->
+    <div class="tab-content" id="tab-chart" style="padding:16px;display:none;flex-direction:column;gap:12px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
+        <span style="font-size:11px;color:var(--dim);letter-spacing:0.08em;">PRICE CHART — 90 DAYS</span>
+        <span id="chartSubtitle" style="font-size:11px;color:var(--dim);">Loading...</span>
+      </div>
+      <canvas id="priceChart" style="width:100%;height:320px;display:block;border-radius:6px;background:var(--bg2);"></canvas>
+      <div style="display:flex;gap:20px;flex-wrap:wrap;margin-top:4px;">
+        <span style="font-size:10px;color:var(--accent);">── Price</span>
+        <span style="font-size:10px;color:var(--hold);">── VWAP</span>
+        <span style="font-size:10px;color:#ff5252;">── Max Pain</span>
+        <span style="font-size:10px;color:var(--buy);">▲ BUY signal</span>
+        <span style="font-size:10px;color:var(--sell);">▼ SELL signal</span>
+      </div>
+      <div style="display:flex;gap:12px;flex-wrap:wrap;">
+        <div style="background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:10px 14px;flex:1;min-width:100px;">
+          <div style="font-size:10px;color:var(--dim);margin-bottom:4px;">CURRENT</div>
+          <div id="chartPrice" style="font-size:16px;font-weight:700;color:#fff;">—</div>
+        </div>
+        <div style="background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:10px 14px;flex:1;min-width:100px;">
+          <div style="font-size:10px;color:var(--dim);margin-bottom:4px;">90D HIGH</div>
+          <div id="chartHigh" style="font-size:16px;font-weight:700;color:var(--buy);">—</div>
+        </div>
+        <div style="background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:10px 14px;flex:1;min-width:100px;">
+          <div style="font-size:10px;color:var(--dim);margin-bottom:4px;">90D LOW</div>
+          <div id="chartLow" style="font-size:16px;font-weight:700;color:var(--sell);">—</div>
+        </div>
+        <div style="background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:10px 14px;flex:1;min-width:100px;">
+          <div style="font-size:10px;color:var(--dim);margin-bottom:4px;">VWAP</div>
+          <div id="chartVwap" style="font-size:16px;font-weight:700;color:var(--hold);">—</div>
+        </div>
+      </div>
+    </div>
+
 <script>
 // ── Tab switching ──
 function switchTab(name) {
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
   event.target.classList.add('active');
-  document.getElementById('tab-' + name).classList.add('active');
+  var panel = document.getElementById('tab-' + name);
+  panel.classList.add('active');
+  // Chart tab needs flex display + canvas redraw after becoming visible
+  if (name === 'chart') {
+    panel.style.display = 'flex';
+    setTimeout(function() {
+      try { if (window._lastState) _renderPriceChart(window._lastState); } catch(_) {}
+    }, 50);
+  }
 }
 
 // ── Helpers ──
@@ -11932,6 +11975,7 @@ function updateUI(s) {
 }
 function _updateUI_inner(s) {
   if (!s) return;
+  window._lastState = s; // cache for chart redraw on tab switch
 
   // Debug: log first response to help diagnose loading issues
   if (!window._firstLoad) {
@@ -12199,6 +12243,154 @@ function _updateUI_inner(s) {
       '</div>';
     }).join('');
   }
+
+  // Chart tab — render price history
+  try { _renderPriceChart(s); } catch(_ce) {}
+}
+
+function _renderPriceChart(s) {
+  var canvas = document.getElementById('priceChart');
+  if (!canvas) return;
+  var ph = s.price_history || [];
+  if (!ph.length) return;
+
+  // Set canvas pixel dimensions
+  var rect = canvas.parentElement.getBoundingClientRect();
+  var W = rect.width > 100 ? Math.floor(rect.width) : 800;
+  var H = 320;
+  canvas.width  = W;
+  canvas.height = H;
+  var ctx = canvas.getContext('2d');
+
+  // Data
+  var prices = ph.map(function(p) { return p.price; });
+  var labels = ph.map(function(p) { return p.date; });
+  var n = prices.length;
+  var minP = Math.min.apply(null, prices);
+  var maxP = Math.max.apply(null, prices);
+  var pad  = (maxP - minP) * 0.08 || 5;
+  minP -= pad; maxP += pad;
+
+  var vwap    = s.vwap_bands && s.vwap_bands.vwap    ? parseFloat(s.vwap_bands.vwap)    : null;
+  var maxPain = s.mm_data    && s.mm_data.max_pain    ? parseFloat(s.mm_data.max_pain)   : null;
+  var curP    = parseFloat(s.price || prices[prices.length-1] || 0);
+
+  // Coordinate helpers
+  var PAD_L = 50, PAD_R = 12, PAD_T = 16, PAD_B = 30;
+  var cW = W - PAD_L - PAD_R;
+  var cH = H - PAD_T - PAD_B;
+  function xOf(i) { return PAD_L + (i / (n - 1)) * cW; }
+  function yOf(v) { return PAD_T + (1 - (v - minP) / (maxP - minP)) * cH; }
+
+  // Background
+  ctx.fillStyle = '#0d1117';
+  ctx.fillRect(0, 0, W, H);
+
+  // Grid lines
+  ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+  ctx.lineWidth = 1;
+  for (var gi = 0; gi <= 4; gi++) {
+    var gy = PAD_T + (gi / 4) * cH;
+    ctx.beginPath(); ctx.moveTo(PAD_L, gy); ctx.lineTo(W - PAD_R, gy); ctx.stroke();
+    var gv = maxP - (gi / 4) * (maxP - minP);
+    ctx.fillStyle = 'rgba(255,255,255,0.3)';
+    ctx.font = '10px monospace';
+    ctx.fillText('$' + gv.toFixed(0), 2, gy + 4);
+  }
+
+  // Max Pain line
+  if (maxPain && maxPain >= minP && maxPain <= maxP) {
+    var mpy = yOf(maxPain);
+    ctx.strokeStyle = 'rgba(255,82,82,0.7)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(PAD_L, mpy); ctx.lineTo(W - PAD_R, mpy); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#ff5252';
+    ctx.font = '10px monospace';
+    ctx.fillText('MP $' + maxPain.toFixed(0), W - PAD_R - 60, mpy - 3);
+  }
+
+  // VWAP line
+  if (vwap && vwap >= minP && vwap <= maxP) {
+    var vy = yOf(vwap);
+    ctx.strokeStyle = 'rgba(255,179,0,0.7)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([6, 3]);
+    ctx.beginPath(); ctx.moveTo(PAD_L, vy); ctx.lineTo(W - PAD_R, vy); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#ffb300';
+    ctx.font = '10px monospace';
+    ctx.fillText('VWAP $' + vwap.toFixed(2), W - PAD_R - 80, vy - 3);
+  }
+
+  // Price area fill (gradient)
+  var grad = ctx.createLinearGradient(0, PAD_T, 0, H - PAD_B);
+  grad.addColorStop(0, 'rgba(0,229,255,0.18)');
+  grad.addColorStop(1, 'rgba(0,229,255,0.01)');
+  ctx.beginPath();
+  ctx.moveTo(xOf(0), H - PAD_B);
+  for (var i = 0; i < n; i++) { ctx.lineTo(xOf(i), yOf(prices[i])); }
+  ctx.lineTo(xOf(n-1), H - PAD_B);
+  ctx.closePath();
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // Price line
+  ctx.strokeStyle = '#00e5ff';
+  ctx.lineWidth = 2;
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  for (var i = 0; i < n; i++) {
+    if (i === 0) ctx.moveTo(xOf(i), yOf(prices[i]));
+    else ctx.lineTo(xOf(i), yOf(prices[i]));
+  }
+  ctx.stroke();
+
+  // Signal markers from alerts_log
+  var alerts = s.alerts_log || [];
+  alerts.slice(0, 30).forEach(function(a) {
+    if (!a.price || !a.time) return;
+    var ap = parseFloat(a.price);
+    if (ap < minP || ap > maxP) return;
+    var isBuy  = a.signal && (a.signal.includes('BUY') || a.signal.includes('ENTRY'));
+    var isSell = a.signal && (a.signal.includes('SELL') || a.signal.includes('EXIT'));
+    if (!isBuy && !isSell) return;
+    // Place at rightmost position (recent)
+    var ax = xOf(n - 1) - (alerts.indexOf(a) * 6);
+    if (ax < PAD_L) return;
+    var ay = yOf(ap);
+    ctx.beginPath();
+    ctx.arc(ax, ay, 4, 0, Math.PI * 2);
+    ctx.fillStyle = isBuy ? '#00e676' : '#ff5252';
+    ctx.fill();
+  });
+
+  // Current price dot + label
+  var cx = xOf(n - 1);
+  var cy = yOf(curP);
+  ctx.beginPath(); ctx.arc(cx, cy, 5, 0, Math.PI * 2);
+  ctx.fillStyle = '#fff'; ctx.fill();
+  ctx.strokeStyle = '#00e5ff'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(cx, cy, 5, 0, Math.PI * 2); ctx.stroke();
+
+  // X-axis date labels (every ~15 bars)
+  ctx.fillStyle = 'rgba(255,255,255,0.3)';
+  ctx.font = '9px monospace';
+  var step = Math.max(1, Math.floor(n / 6));
+  for (var i = 0; i < n; i += step) {
+    var lx = xOf(i);
+    var lbl = labels[i] ? labels[i].slice(5) : ''; // MM-DD
+    ctx.fillText(lbl, lx - 14, H - 8);
+  }
+
+  // Update stat cards
+  document.getElementById('chartPrice').textContent = '$' + curP.toFixed(2);
+  document.getElementById('chartHigh').textContent  = '$' + Math.max.apply(null, prices).toFixed(2);
+  document.getElementById('chartLow').textContent   = '$' + Math.min.apply(null, prices).toFixed(2);
+  document.getElementById('chartVwap').textContent  = vwap ? '$' + vwap.toFixed(2) : '—';
+  document.getElementById('chartSubtitle').textContent =
+    n + ' days · ' + (labels[0]||'') + ' → ' + (labels[n-1]||'');
 }
 
 // ── Ticker switching ──
