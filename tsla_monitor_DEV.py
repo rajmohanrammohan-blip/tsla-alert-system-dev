@@ -132,7 +132,10 @@ app = Flask(__name__)
 _alert_outcomes = []   # [{alert_key, signal, price_at_alert, price_after_1h, price_after_1d, profitable}]
 
 state = {
+    "ticker": "TSLA",          # always populated — never undefined in JS
     "price": None,
+    "price_change_pct": None,
+    "session_type": "UNKNOWN",
     "signal": "HOLD",
     "signal_strength": 0,
     "indicators": {},
@@ -8212,6 +8215,7 @@ def api_state():
         safe = {k: v for k, v in state.items() if k != "darthvader"}
         safe["wa_enabled"]    = WA_ENABLED
         safe["wa_phone_tail"] = GREEN_PHONE[-4:] if GREEN_PHONE else ""
+        safe["ticker"]        = TICKER  # always inject so frontend never gets undefined
         # Include darthvader features for algo radar gauges (strip heavy data)
         dv_full = state.get("darthvader", {})
         safe["darthvader"]    = {
@@ -9218,8 +9222,8 @@ def api_debug_ml():
     # 1. Check all candidate paths
     _script_dir = os.path.dirname(os.path.abspath(__file__))
     _paths = [
-        f"{TICKER.lower()}_model.pkl", f"./{TICKER.lower()}_model.pkl",
         f"/app/{TICKER.lower()}_model.pkl",
+        f"{TICKER.lower()}_model.pkl", f"./{TICKER.lower()}_model.pkl",
         f"/tmp/{TICKER.lower()}_model_backup.pkl",  # session backup
         os.path.join(_script_dir, f"{TICKER.lower()}_model.pkl"),
         os.path.join(os.getcwd(), f"{TICKER.lower()}_model.pkl"),
@@ -9601,12 +9605,20 @@ def stream():
         import json as _json
         while True:
             try:
-                payload = _sanitize({**state,
+                # Always inject ticker + status so frontend never gets undefined
+                _base = {**state,
+                    "ticker":        TICKER,
                     "wa_enabled":    WA_ENABLED,
                     "wa_phone_tail": GREEN_PHONE[-4:] if GREEN_PHONE else "",
                     "ml_ready":      _ml_ready,
                     "ml_retraining": _ml_retraining,
-                })
+                }
+                # If analysis hasn't run yet, send a loading heartbeat
+                # so the frontend knows the server is alive and populates
+                # ticker/session even before first full cycle completes
+                if not _base.get("last_updated"):
+                    _base["_loading"] = True
+                payload = _sanitize(_base)
                 data = _json.dumps(payload)
                 yield f"data: {data}\n\n"
             except Exception as _se:
@@ -10022,14 +10034,18 @@ def _load_ml_model():
             print("  [ML] Could not install lightgbm: " + str(_ie), flush=True)
 
     # Railway deploys to /app by default; also check cwd and script dir
+    # IMPORTANT: /app paths come FIRST — retrain saves there and must not be
+    # shadowed by the stale tsla_model.pkl bundled in the repo working dir
     _script_dir = os.path.dirname(os.path.abspath(__file__))
     _paths = [
-        f"{TICKER.lower()}_model.pkl",
-        f"./{TICKER.lower()}_model.pkl",
         f"/app/{TICKER.lower()}_model.pkl",
+        f"/tmp/{TICKER.lower()}_model_backup.pkl",
         os.path.join(_script_dir, f"{TICKER.lower()}_model.pkl"),
         os.path.join(os.getcwd(), f"{TICKER.lower()}_model.pkl"),
-        "tsla_model.pkl", "./tsla_model.pkl", "/app/tsla_model.pkl",
+        f"{TICKER.lower()}_model.pkl",
+        f"./{TICKER.lower()}_model.pkl",
+        "/app/tsla_model.pkl",
+        "tsla_model.pkl", "./tsla_model.pkl",
     ]
     _load_errors = []
     for path in _paths:
@@ -11881,8 +11897,25 @@ function updateUI(s) {
       ticker: s.ticker, price: s.price,
       signal: s.master_signal?.action,
       updated: s.last_updated,
+      loading: s._loading,
       keys: Object.keys(s).length + ' keys'
     });
+  }
+
+  // If analysis hasn't run yet, show spinner in SPOCK panel and return
+  // (ticker button + top bar still update so the UI feels alive)
+  if (s._loading && !s.last_updated) {
+    var tEl = document.getElementById('topTicker');
+    if (tEl && s.ticker) { tEl.textContent = s.ticker; _currentTicker = s.ticker; }
+    var bt = document.getElementById('brandTicker'); if(bt && s.ticker) bt.textContent = s.ticker;
+    var aEl = document.getElementById('spockAction');
+    if (aEl) { aEl.textContent = 'LOADING…'; aEl.style.color = 'var(--dim)'; }
+    document.querySelectorAll('.qtick').forEach(function(el) {
+      el.classList.toggle('active', el.textContent === s.ticker);
+    });
+    var banner = document.getElementById('retrainBanner');
+    if (s.ml_retraining && banner) banner.classList.add('active');
+    return;
   }
 
   // Top bar — show loading state if no price yet
