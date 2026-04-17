@@ -5655,8 +5655,12 @@ def _spock_update_accuracy():
     wr4h = _spock_accuracy["win_rate_4h"]
     print(f"[SPOCK-BRAIN] Accuracy: 1h={wr1h}% | 4h={wr4h}% | "
           f"n={total} decisions", flush=True)
-    # Run signal weight feedback update
-    _run_signal_feedback_update(measured)
+    # Run signal weight feedback update — only on NEWLY measured decisions
+    _newly_measured = [d for d in measured if not d.get("_weight_updated")]
+    if _newly_measured:
+        _run_signal_feedback_update(_newly_measured)
+        for d in _newly_measured:
+            d["_weight_updated"] = True
 
     # Run full 4-stage learning cycle when we have enough measured decisions
     _new_measured = [d for d in _spock_decisions if d.get("outcome_1h") in ("CORRECT","WRONG")]
@@ -12038,8 +12042,7 @@ function updateUI(s) {
       var ae = document.getElementById('spockAction');
       if (ae && ms.action) {
         ae.textContent = ms.action;
-        ae.style.color = ms.action.includes('BUY') ? 'var(--buy)' :
-                         ms.action.includes('SELL') ? 'var(--sell)' : 'var(--hold)';
+        ae.style.color = ms.action.indexOf('BUY')>=0 ? 'var(--buy)' : ms.action.indexOf('SELL')>=0 ? 'var(--sell)' : 'var(--hold)';
       }
       var sn = document.getElementById('scoreNum');
       if (sn && ms.score != null) sn.textContent = (ms.score >= 0 ? '+' : '') + ms.score;
@@ -12205,8 +12208,7 @@ function _updateUI_inner(s) {
   var rl = document.getElementById('reasonsList');
   if (reasons.length) {
     rl.innerHTML = reasons.slice(0,4).map(function(r) {
-      var cls = r.toLowerCase().indexOf('buy') >= 0 || r.indexOf('↑') >= 0 ? 'bull' :
-                r.toLowerCase().indexOf('sell') >= 0 || r.indexOf('↓') >= 0 ? 'bear' : '';
+      var cls = (r.toLowerCase().indexOf('buy')>=0||r.indexOf('↑')>=0) ? 'bull' : (r.toLowerCase().indexOf('sell')>=0||r.indexOf('↓')>=0) ? 'bear' : '';
       return '<div class="reason-item ' + cls + '">' + r + '</div>';
     }).join('');
   }
@@ -12298,9 +12300,7 @@ function _updateUI_inner(s) {
   setText('vix-val', spy.vix ? fmt(spy.vix, 2) : '—',
     spy.vix > 30 ? 'extreme' : spy.vix > 20 ? 'warn' : 'bull');
   setText('vix-regime', spy.vix_regime || '—');
-  setText('macro-sig', spy.macro_signal || '—',
-    (spy.macro_signal||'').includes('BULL') || (spy.macro_signal||'').includes('TAIL') ? 'bull' :
-    (spy.macro_signal||'').includes('BEAR') || (spy.macro_signal||'').includes('HEAD') ? 'bear' : '');
+  var _ms = spy.macro_signal || ''; setText('macro-sig', _ms || '—', (_ms.indexOf('BULL')>=0||_ms.indexOf('TAIL')>=0) ? 'bull' : (_ms.indexOf('BEAR')>=0||_ms.indexOf('HEAD')>=0) ? 'bear' : '');
   setText('spy-mtf', spy.mtf_both_ob ? '⚠️ YES — overbought' : 'No', spy.mtf_both_ob ? 'extreme' : 'bull');
 
   var breadth = s.breadth || {};
@@ -12337,9 +12337,7 @@ function _updateUI_inner(s) {
 
   var t4h = s.tsla_4h || {};
   setText('tsla-4h-rsi', t4h.rsi_4h ? fmt(t4h.rsi_4h, 1) : '—', rsiClass(t4h.rsi_4h));
-  setText('tsla-4h-trend', t4h.trend_4h || '—',
-    (t4h.trend_4h||'').includes('BULL') ? 'bull' :
-    (t4h.trend_4h||'').includes('BEAR') ? 'bear' : '');
+  var _tt = t4h.trend_4h || ''; setText('tsla-4h-trend', _tt || '—', _tt.indexOf('BULL')>=0 ? 'bull' : _tt.indexOf('BEAR')>=0 ? 'bear' : '');
 
   var sw = s.swing_context || {};
   setText('swing-pattern', sw.daily_pattern || 'None',
