@@ -7798,13 +7798,35 @@ def run_analysis(refresh_4h=True, refresh_news=True):
 
                 # Hard risk override on master signal —
                 # if hard risk blocks BUY, SPOCK master must respect it
+                # EXCEPTION: confirmed high-volume breakout + strong institutional flow
+                # overrides the SPY/QQQ RSI block (RSI=100 is a momentum artifact,
+                # not a reversal signal during a confirmed breakout)
                 _hr = state.get("hard_risk", {})
                 if _hr.get("override") == "EXTREME" and "BUY" in master.get("action", ""):
-                    _hr_note = _hr.get("reasons", ["hard risk override"])[0]
-                    master["action"]  = "HOLD"
-                    master["color"]   = "#ffb300"
-                    if _hr_note not in master.get("reasons", []):
-                        master["reasons"].insert(0, f"⛔ {_hr_note}")
+                    _bk = master.get("breakout", {})
+                    _bk_confirmed  = _bk.get("breakout", False) and _bk.get("vol_ratio", 0) >= 2.0
+                    _uoa_net       = uoa_data.get("total_call_premium", 0) - uoa_data.get("total_put_premium", 0)
+                    _flow_strong   = _uoa_net >= 200_000_000  # $200M+ net call flow
+                    _cap_bounce    = cap_result.get("detected", False) if cap_result else False
+
+                    if _bk_confirmed and _flow_strong:
+                        # Breakout exception — let the signal through with reduced score
+                        print(f"  ✅ Hard risk BYPASSED — breakout {_bk.get('vol_ratio',0):.1f}x vol + ${_uoa_net/1e6:.0f}M call flow", flush=True)
+                        master["score"]  = min(master["score"], 35)   # cap at moderate
+                        master["risk"]   = "HIGH"                     # keep risk visible
+                        master["reasons"].insert(0, f"⚡ Breakout exception: {_bk.get('reason','confirmed')} + ${_uoa_net/1e6:.0f}M calls")
+                    elif _cap_bounce and _flow_strong:
+                        # Capitulation bounce + strong flow also gets exception
+                        print(f"  ✅ Hard risk BYPASSED — cap bounce + ${_uoa_net/1e6:.0f}M call flow", flush=True)
+                        master["score"]  = min(master["score"], 25)
+                        master["risk"]   = "HIGH"
+                    else:
+                        # Standard hard risk block
+                        _hr_note = _hr.get("reasons", ["hard risk override"])[0]
+                        master["action"]  = "HOLD"
+                        master["color"]   = "#ffb300"
+                        if _hr_note not in master.get("reasons", []):
+                            master["reasons"].insert(0, f"⛔ {_hr_note}")
                 state["master_signal"] = master
 
                 # Log decision for self-learning
@@ -9099,11 +9121,9 @@ def _run_ml_retrain():
 
         X_df   = _pd_rt.DataFrame(X, columns=feat_cols)
         scaler = StandardScaler()
-        # Fit on numpy array then manually set feature_names_in_ — avoids sklearn warning
-        # when transform is called with a named DataFrame at inference time
-        import numpy as _np_sc
-        X_s    = scaler.fit_transform(X_df.values)
-        scaler.feature_names_in_ = _np_sc.array(feat_cols, dtype=object)
+        # Fit on DataFrame so sklearn stores feature_names_in_ automatically
+        # Inference must also pass a DataFrame with the same column names
+        X_s    = scaler.fit_transform(X_df)
         X_s_df = _pd_rt.DataFrame(X_s, columns=feat_cols)
 
         # 9. Train ensemble
@@ -10180,8 +10200,8 @@ def _get_ml_signal(features_dict):
         row_data = {c: float(features_dict.get(c, 0) or 0) for c in cols}
         _is_stale = len(cols) != 84
         X_df   = pd.DataFrame([row_data], columns=cols)
-        # Transform via numpy array to avoid feature_names mismatch warning
-        X_s    = pkg["scaler"].transform(X_df.values)
+        # Pass DataFrame so feature names match what scaler was fitted with
+        X_s    = pkg["scaler"].transform(X_df)
         X_s_df = pd.DataFrame(X_s, columns=cols)
 
         # Ensemble: average probabilities from all models
@@ -12008,7 +12028,34 @@ function fmt(v, decimals=2) {
 function updateUI(s) {
   if (!s) return;
   // Global safety net — catch any crash and log it
-  try { _updateUI_inner(s); } catch(e) { console.error('[SPOCK] updateUI crash:', e, e.stack); }
+  try {
+    _updateUI_inner(s);
+  } catch(e) {
+    console.error('[SPOCK] updateUI crash at:', e.message, '\nStack:', e.stack);
+    // Emergency render — show at least the SPOCK decision even if tabs fail
+    try {
+      var ms = s.master_signal || {};
+      var ae = document.getElementById('spockAction');
+      if (ae && ms.action) {
+        ae.textContent = ms.action;
+        ae.style.color = ms.action.includes('BUY') ? 'var(--buy)' :
+                         ms.action.includes('SELL') ? 'var(--sell)' : 'var(--hold)';
+      }
+      var sn = document.getElementById('scoreNum');
+      if (sn && ms.score != null) sn.textContent = (ms.score >= 0 ? '+' : '') + ms.score;
+      var cp = document.getElementById('convPct');
+      if (cp && ms.conviction != null) cp.textContent = ms.conviction + '%';
+      var rb = document.getElementById('riskBadge');
+      if (rb && ms.risk) { rb.textContent = ms.risk; rb.className = 'risk-badge risk-' + ms.risk.replace(' ','_'); }
+      var tp = document.getElementById('topPrice');
+      if (tp && s.price) tp.textContent = '$' + parseFloat(s.price).toFixed(2);
+      var tt = document.getElementById('topTime');
+      if (tt && s.last_updated) tt.textContent = s.last_updated;
+      // Show crash notice in WHY box
+      var rl = document.getElementById('reasonsList');
+      if (rl) rl.innerHTML = '<div class="reason-item" style="color:var(--sell)">⚠️ Render error: ' + e.message.slice(0,80) + '</div>';
+    } catch(_) {}
+  }
 }
 function _updateUI_inner(s) {
   if (!s) return;
