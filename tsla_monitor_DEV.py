@@ -12147,12 +12147,14 @@ function _updateUI_inner(s) {
       } catch(_) {}
     }
   }
-  document.getElementById('topSession').textContent = s.session_type || '';
+  var tsEl = document.getElementById('topSession'); if(tsEl) tsEl.textContent = s.session_type || '';
 
   // ML retrain banner
   var banner = document.getElementById('retrainBanner');
-  if (s.ml_retraining) banner.classList.add('active');
-  else banner.classList.remove('active');
+  if (banner) {
+    if (s.ml_retraining) banner.classList.add('active');
+    else banner.classList.remove('active');
+  }
 
   // ── SPOCK ──
   var ms = s.master_signal || {};
@@ -12176,15 +12178,17 @@ function _updateUI_inner(s) {
 
   // Score bar
   var scoreNum = document.getElementById('scoreNum');
-  scoreNum.textContent = (score >= 0 ? '+' : '') + score;
+  if (scoreNum) scoreNum.textContent = (score >= 0 ? '+' : '') + score;
   var fill = document.getElementById('scoreBarFill');
   var pct  = Math.abs(score) / 2; // score -100..100 → 0..50% of bar from center
-  fill.style.width = pct + '%';
-  fill.className = 'score-bar-fill ' +
-    (score > 10 ? 'bar-buy' : score < -10 ? 'bar-sell' : 'bar-hold');
+  if (fill) {
+    fill.style.width = pct + '%';
+    fill.className = 'score-bar-fill ' +
+      (score > 10 ? 'bar-buy' : score < -10 ? 'bar-sell' : 'bar-hold');
+  }
 
   // Conviction
-  document.getElementById('convPct').textContent = conv + '%';
+  var convEl = document.getElementById('convPct'); if(convEl) convEl.textContent = conv + '%';
 
   // Risk badge
   var rb = document.getElementById('riskBadge');
@@ -12237,15 +12241,13 @@ function _updateUI_inner(s) {
   var macroEl = document.getElementById('macroAlert');
   if (flip.flip === 'FEAR_TO_RELIEF') {
     macroEl.classList.add('active');
-    document.getElementById('macroAlertTitle').textContent = '🚨 VIX REGIME FLIP — MACRO BUY';
-    document.getElementById('macroAlertBody').textContent =
-      'VIX ' + flip.vix_prev + ' → ' + flip.vix_today + ' (' + flip.vix_change_pct + '%) · Fear-to-relief · High-beta surge likely';
+    var mat = document.getElementById('macroAlertTitle'); if(mat) mat.textContent = '🚨 VIX REGIME FLIP — MACRO BUY';
+    var mab = document.getElementById('macroAlertBody'); if(mab) mab.textContent = 'VIX ' + flip.vix_prev + ' → ' + flip.vix_today + ' (' + flip.vix_change_pct + '%) · Fear-to-relief · High-beta surge likely';
   } else if (flip.flip === 'PANIC_SPIKE') {
     macroEl.classList.add('active');
     macroEl.style.borderColor = 'var(--sell)';
-    document.getElementById('macroAlertTitle').textContent = '🚨 VIX PANIC SPIKE — EXIT LONGS';
-    document.getElementById('macroAlertBody').textContent =
-      'VIX ' + flip.vix_prev + ' → ' + flip.vix_today + ' (' + flip.vix_change_pct + '%)';
+    var mat2 = document.getElementById('macroAlertTitle'); if(mat2) mat2.textContent = '🚨 VIX PANIC SPIKE — EXIT LONGS';
+    var mab2 = document.getElementById('macroAlertBody'); if(mab2) mab2.textContent = 'VIX ' + flip.vix_prev + ' → ' + flip.vix_today + ' (' + flip.vix_change_pct + '%)';
   } else {
     macroEl.classList.remove('active');
   }
@@ -12255,8 +12257,7 @@ function _updateUI_inner(s) {
   var ew = document.getElementById('earnWarn');
   if (earn.earnings_mode) {
     ew.classList.add('active');
-    document.getElementById('earnWarnText').textContent =
-      '⚠️ EARNINGS IN ' + (earn.days_away || '?') + ' DAYS — size reduced';
+    var ewt = document.getElementById('earnWarnText'); if(ewt) ewt.textContent = '⚠️ EARNINGS IN ' + (earn.days_away || '?') + ' DAYS — size reduced';
   } else {
     ew.classList.remove('active');
   }
