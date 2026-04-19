@@ -2445,13 +2445,16 @@ def calculate_unusual_options_activity(ticker_symbol, current_price):
 
                 # ── CALLS — scan for unusual volume ──
                 for _, row in calls.iterrows():
-                    strike   = float(row["strike"])
-                    volume   = float(0 if (row["volume"] != row["volume"]) else (row["volume"] or 0))
-                    oi       = float(row["openInterest"]  or 1)
-                    iv       = float(row["impliedVolatility"] or 0.3) * 100
-                    last     = float(0 if (row["lastPrice"] != row["lastPrice"]) else (row["lastPrice"] or 0))
-                    bid      = float(row.get("bid", last) or last)
-                    ask      = float(row.get("ask", last) or last)
+                    try:
+                      _oi_v = row["openInterest"]; _iv_v = row["impliedVolatility"]
+                      strike   = float(row["strike"])
+                      volume   = float(0 if (row["volume"] != row["volume"]) else (row["volume"] or 0))
+                      oi       = float(1 if (_oi_v != _oi_v or _oi_v is None) else (_oi_v or 1))
+                      iv       = float(0.3 if (_iv_v != _iv_v or _iv_v is None) else (_iv_v or 0.3)) * 100
+                      last     = float(0 if (row["lastPrice"] != row["lastPrice"]) else (row["lastPrice"] or 0))
+                      bid      = float(row.get("bid", last) or last)
+                      ask      = float(row.get("ask", last) or last)
+                    except Exception: continue
                     mid      = (bid + ask) / 2 if ask > 0 else last
                     moneyness = "ITM" if strike < current_price else "ATM" if abs(strike - current_price)/current_price < 0.02 else "OTM"
 
@@ -2512,13 +2515,16 @@ def calculate_unusual_options_activity(ticker_symbol, current_price):
 
                 # ── PUTS — scan for unusual volume ──
                 for _, row in puts.iterrows():
-                    strike   = float(row["strike"])
-                    volume   = float(0 if (row["volume"] != row["volume"]) else (row["volume"] or 0))
-                    oi       = float(row["openInterest"]  or 1)
-                    iv       = float(row["impliedVolatility"] or 0.3) * 100
-                    last     = float(0 if (row["lastPrice"] != row["lastPrice"]) else (row["lastPrice"] or 0))
-                    bid      = float(row.get("bid", last) or last)
-                    ask      = float(row.get("ask", last) or last)
+                    try:
+                      _oi_v = row["openInterest"]; _iv_v = row["impliedVolatility"]
+                      strike   = float(row["strike"])
+                      volume   = float(0 if (row["volume"] != row["volume"]) else (row["volume"] or 0))
+                      oi       = float(1 if (_oi_v != _oi_v or _oi_v is None) else (_oi_v or 1))
+                      iv       = float(0.3 if (_iv_v != _iv_v or _iv_v is None) else (_iv_v or 0.3)) * 100
+                      last     = float(0 if (row["lastPrice"] != row["lastPrice"]) else (row["lastPrice"] or 0))
+                      bid      = float(row.get("bid", last) or last)
+                      ask      = float(row.get("ask", last) or last)
+                    except Exception: continue
                     mid      = (bid + ask) / 2 if ask > 0 else last
                     moneyness = "ITM" if strike > current_price else "ATM" if abs(strike - current_price)/current_price < 0.02 else "OTM"
 
@@ -2752,9 +2758,19 @@ def calculate_market_maker_data(ticker_symbol, current_price):
 
         for exp in expiries[:3]:
             try:
-                chain  = tkr.option_chain(exp)
-                calls  = chain.calls
-                puts   = chain.puts
+                _raw_chain = tkr.option_chain(exp)
+                # Guard: option_chain returns a namedtuple (calls, puts)
+                # calls/puts are DataFrames — verify before using
+                if hasattr(_raw_chain, 'calls'):
+                    calls = _raw_chain.calls
+                    puts  = _raw_chain.puts
+                elif isinstance(_raw_chain, (tuple, list)) and len(_raw_chain) >= 2:
+                    calls, puts = _raw_chain[0], _raw_chain[1]
+                else:
+                    continue
+                if not hasattr(calls, 'iterrows') or not hasattr(puts, 'iterrows'):
+                    continue  # not DataFrames — skip this expiry
+                chain = _raw_chain
 
                 # Filter to strikes within 20% of current price (relevant range)
                 lo, hi = current_price * 0.80, current_price * 1.20
@@ -7328,8 +7344,32 @@ def run_analysis(refresh_4h=True, refresh_news=True):
         lows   = hist["Low"]
         ichi   = calculate_ichimoku(highs, lows, closes)
 
-        # ── Hidden Markov Model ──
-        hmm_result = calculate_hmm(closes)
+        # ── Hidden Markov Model with dwell time ──────────────────────────────
+        # Require 3 consecutive cycles in the same regime before reporting change.
+        # Prevents BULLISH/BEARISH oscillation when HMM is near a regime boundary.
+        _raw_hmm = calculate_hmm(closes)
+        _raw_regime = _raw_hmm.get("regime", "NEUTRAL") if _raw_hmm else "NEUTRAL"
+        _hmm_history = state.get("_hmm_regime_history", [])
+        _hmm_history.append(_raw_regime)
+        _hmm_history = _hmm_history[-5:]   # keep last 5
+        state["_hmm_regime_history"] = _hmm_history
+        # Stable regime = last 3 agree; if oscillating, use NEUTRAL
+        if len(_hmm_history) >= 3 and len(set(_hmm_history[-3:])) == 1:
+            _stable_regime = _hmm_history[-1]   # all 3 agree
+        elif len(_hmm_history) >= 3:
+            _stable_regime = "NEUTRAL"           # oscillating — report uncertain
+        else:
+            _stable_regime = _raw_regime         # not enough history yet
+        # Build stabilized hmm_result
+        hmm_result = dict(_raw_hmm) if _raw_hmm else {}
+        if _raw_regime != _stable_regime:
+            hmm_result["regime"] = _stable_regime
+            hmm_result["regime_raw"] = _raw_regime
+            hmm_result["regime_stabilized"] = True
+            print(f"  🧠 HMM: raw={_raw_regime} → stabilized={_stable_regime} "
+                  f"(history: {_hmm_history[-3:]})", flush=True)
+        else:
+            hmm_result["regime_stabilized"] = False
 
         # ══ INSTITUTIONAL / WALL STREET MODELS ══
         opens_s  = hist["Open"]
@@ -13011,19 +13051,21 @@ function _updateUI_inner(s) {
     var rbn = document.getElementById('retrainBanner');
     if (rbn) rbn.classList.add('active');
     if (rl2 && (!s.master_signal || !s.master_signal.reasons || !s.master_signal.reasons.length)) {
-      rl2.innerHTML = '<div class="reason-item" style="color:var(--hold)">⚙️ ML retraining — signals suppressed ~2 min</div>';
+      rl2.innerHTML = '<div class="reason-item" style="color:var(--hold)">ML retraining in progress...</div>';
     }
   }
 
   // Top bar — show loading state if no price yet
   var price = s.price || 0;
   var priceEl = document.getElementById('topPrice');
-  if (price) {
-    priceEl.textContent = '$' + parseFloat(price).toFixed(2);
-    priceEl.style.color = '#fff';
-  } else {
-    priceEl.textContent = 'Loading...';
-    priceEl.style.color = 'var(--dim)';
+  if (priceEl) {
+    if (price) {
+      priceEl.textContent = '$' + parseFloat(price).toFixed(2);
+      priceEl.style.color = '#fff';
+    } else {
+      priceEl.textContent = 'Loading...';
+      priceEl.style.color = 'var(--dim)';
+    }
   }
   var tickerEl = document.getElementById('topTicker');
   if (tickerEl && s.ticker) {
@@ -13038,8 +13080,10 @@ function _updateUI_inner(s) {
   var chg = s.price_change_pct;
   if (chg != null) {
     var chgEl = document.getElementById('topChange');
-    chgEl.textContent = (chg >= 0 ? '+' : '') + parseFloat(chg).toFixed(2) + '%';
-    chgEl.style.color = chg >= 0 ? 'var(--buy)' : 'var(--sell)';
+    if (chgEl) {
+      chgEl.textContent = (chg >= 0 ? '+' : '') + parseFloat(chg).toFixed(2) + '%';
+      chgEl.style.color = chg >= 0 ? 'var(--buy)' : 'var(--sell)';
+    }
   }
   var lu = s.last_updated;
   var topTimeEl = document.getElementById('topTime');
@@ -13072,17 +13116,18 @@ function _updateUI_inner(s) {
   var risk   = ms.risk || 'MEDIUM';
 
   var actionEl = document.getElementById('spockAction');
-  // Show loading if analysis hasn't run yet
-  if (!s.last_updated && !action) {
-    actionEl.textContent = 'LOADING';
-    actionEl.style.color = 'var(--dim)';
-    // Don't return — keep rendering other available data
+  if (actionEl) {
+    if (!s.last_updated && !action) {
+      actionEl.textContent = 'LOADING';
+      actionEl.style.color = 'var(--dim)';
+    } else {
+      actionEl.textContent = action || '—';
+      actionEl.className   = 'spock-action fade-in';
+      var baseAction = action.replace('STRONG ','').replace(' — LOW CONVICTION','');
+      actionEl.classList.add(baseAction);
+      actionEl.setAttribute('data-action', action);
+    }
   }
-  actionEl.textContent = action || '—';
-  actionEl.className   = 'spock-action fade-in';
-  var baseAction = action.replace('STRONG ','').replace(' — LOW CONVICTION','');
-  actionEl.classList.add(baseAction);
-  actionEl.setAttribute('data-action', action);
 
   // Score bar
   var scoreNum = document.getElementById('scoreNum');
@@ -13091,8 +13136,7 @@ function _updateUI_inner(s) {
   var pct  = Math.abs(score) / 2; // score -100..100 → 0..50% of bar from center
   if (fill) {
     fill.style.width = pct + '%';
-    fill.className = 'score-bar-fill ' +
-      (score > 10 ? 'bar-buy' : score < -10 ? 'bar-sell' : 'bar-hold');
+    fill.className = 'score-bar-fill ' + (score > 10 ? 'bar-buy' : score < -10 ? 'bar-sell' : 'bar-hold');
   }
 
   // Conviction
@@ -13100,8 +13144,7 @@ function _updateUI_inner(s) {
 
   // Risk badge
   var rb = document.getElementById('riskBadge');
-  rb.textContent = risk;
-  rb.className = 'risk-badge risk-' + risk.replace(' ','_');
+  if (rb) { rb.textContent = risk; rb.className = 'risk-badge risk-' + risk.replace(' ','_'); }
 
   // Votes
   setText('voteBull', (ms.bull_votes || 0) + ' BULL');
@@ -13111,7 +13154,7 @@ function _updateUI_inner(s) {
   // Reasons
   var reasons = ms.reasons || [];
   var rl = document.getElementById('reasonsList');
-  if (reasons.length) {
+  if (rl && reasons.length) {
     rl.innerHTML = reasons.slice(0,4).map(function(r) {
       var cls = (r.toLowerCase().indexOf('buy')>=0||r.indexOf('↑')>=0) ? 'bull' : (r.toLowerCase().indexOf('sell')>=0||r.indexOf('↓')>=0) ? 'bear' : '';
       return '<div class="reason-item ' + cls + '">' + r + '</div>';
@@ -13146,17 +13189,19 @@ function _updateUI_inner(s) {
   // Macro / VIX flip alert
   var flip = s.vix_flip || {};
   var macroEl = document.getElementById('macroAlert');
-  if (flip.flip === 'FEAR_TO_RELIEF') {
-    macroEl.classList.add('active');
-    var mat = document.getElementById('macroAlertTitle'); if(mat) mat.textContent = '🚨 VIX REGIME FLIP — MACRO BUY';
-    var mab = document.getElementById('macroAlertBody'); if(mab) mab.textContent = 'VIX ' + flip.vix_prev + ' → ' + flip.vix_today + ' (' + flip.vix_change_pct + '%) · Fear-to-relief · High-beta surge likely';
-  } else if (flip.flip === 'PANIC_SPIKE') {
-    macroEl.classList.add('active');
-    macroEl.style.borderColor = 'var(--sell)';
-    var mat2 = document.getElementById('macroAlertTitle'); if(mat2) mat2.textContent = '🚨 VIX PANIC SPIKE — EXIT LONGS';
-    var mab2 = document.getElementById('macroAlertBody'); if(mab2) mab2.textContent = 'VIX ' + flip.vix_prev + ' → ' + flip.vix_today + ' (' + flip.vix_change_pct + '%)';
-  } else {
-    macroEl.classList.remove('active');
+  if (macroEl) {
+    if (flip.flip === 'FEAR_TO_RELIEF') {
+      macroEl.classList.add('active');
+      var mat = document.getElementById('macroAlertTitle'); if(mat) mat.textContent = 'VIX REGIME FLIP — MACRO BUY';
+      var mab = document.getElementById('macroAlertBody'); if(mab) mab.textContent = 'VIX ' + flip.vix_prev + ' → ' + flip.vix_today + ' (' + flip.vix_change_pct + '%) · Fear-to-relief · High-beta surge likely';
+    } else if (flip.flip === 'PANIC_SPIKE') {
+      macroEl.classList.add('active');
+      macroEl.style.borderColor = 'var(--sell)';
+      var mat2 = document.getElementById('macroAlertTitle'); if(mat2) mat2.textContent = 'VIX PANIC SPIKE — EXIT LONGS';
+      var mab2 = document.getElementById('macroAlertBody'); if(mab2) mab2.textContent = 'VIX ' + flip.vix_prev + ' → ' + flip.vix_today + ' (' + flip.vix_change_pct + '%)';
+    } else {
+      macroEl.classList.remove('active');
+    }
   }
 
   // Earnings warning
