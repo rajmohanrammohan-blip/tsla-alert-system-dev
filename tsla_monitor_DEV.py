@@ -7582,7 +7582,9 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                     if _schwab_opts.get("calls"):
                         _prev_gex = state.get("mm_data", {}).get("gex_total", None)
                         _curr_gex = _schwab_opts.get('gex_total', 0)
-                        _gex_stale = (_prev_gex is not None and _prev_gex == _curr_gex)
+                        _session_type = state.get("session_type", "UNKNOWN")
+                        _gex_stale = (_prev_gex is not None and _prev_gex == _curr_gex) or                                      _session_type in ("WEEKEND", "HOLIDAY")
+                        _schwab_opts["_stale"] = _gex_stale
                         print(f"  📡 Schwab options: {len(_schwab_opts['calls'])} calls, "
                               f"{len(_schwab_opts['puts'])} puts, "
                               f"GEX={_curr_gex:.0f}M "
@@ -7610,6 +7612,32 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 mm_data["iv_back"]      = _schwab_opts.get("back_iv", _schwab_opts["front_iv"])
                 mm_data["iv_term_spread"] = _schwab_opts.get("iv_term_spread", 0)
 
+            # ── Weekend / Stale Data Guard ──────────────────────────────────────
+            # Don't compute dealer walls from stale weekend chain — use cached values
+            _is_stale_chain = _schwab_opts.get("_stale", False) or                               state.get("session_type", "") in ("WEEKEND", "HOLIDAY")
+            if _is_stale_chain:
+                # Preserve last-known-good dealer levels from previous live session
+                _prev_mm = state.get("mm_data", {})
+                _cached_flip  = _prev_mm.get("gex_flip_level")
+                _cached_cwall = _prev_mm.get("call_wall")
+                _cached_pwall = _prev_mm.get("put_wall")
+                _cached_cwdist = _prev_mm.get("call_wall_dist_pct")
+                _cached_pwdist = _prev_mm.get("put_wall_dist_pct")
+                # Only restore if they were real (non-None) values from a live session
+                if _cached_flip and _prev_mm.get("data_quality") != "STALE_WEEKEND":
+                    mm_data["gex_flip_level"]     = _cached_flip
+                    mm_data["call_wall"]          = _cached_cwall
+                    mm_data["put_wall"]           = _cached_pwall
+                    mm_data["call_wall_dist_pct"] = _cached_cwdist
+                    mm_data["put_wall_dist_pct"]  = _cached_pwdist
+                    mm_data["_walls_from_cache"]  = True
+                mm_data["data_quality"] = "STALE_WEEKEND"
+                mm_data["data_note"]    = "Weekend/AH — dealer walls refresh Mon 9:30 ET"
+            else:
+                mm_data["data_quality"] = "LIVE"
+                mm_data["data_note"]    = ""
+                mm_data["_walls_from_cache"] = False
+
             # Rebuild summary string with Schwab-corrected values
             _gex_s  = mm_data.get("gex_total", 0)
             _pc_s   = mm_data.get("pc_ratio", "?")
@@ -7633,13 +7661,20 @@ def run_analysis(refresh_4h=True, refresh_news=True):
             _gfd = mm_data.get("gex_flip_dist_pct",  0) or 0
             _van = (mm_data.get("vanna_signal","") or "")[:20]
             _chm = mm_data.get("charm_urgency", "LOW")
+            _dq = mm_data.get("data_quality", "LIVE")
+            _dn = mm_data.get("data_note", "")
+            _cached_tag = " [CACHED]" if mm_data.get("_walls_from_cache") else ""
             if _gfl:
-                print(f"  🏦 Dealer: GEX Flip=${_gfl} ({_gfd:+.1f}% away) | "
+                print(f"  🏦 Dealer: GEX Flip=${_gfl}{_cached_tag} ({_gfd:+.1f}% away) | "
                       f"Call Wall=${_cw} (+{_cwd:.1f}%) | "
                       f"Put Wall=${_pw} (-{_pwd:.1f}%) | "
-                      f"Charm:{_chm}", flush=True)
-                if price <= _gfl * 1.03:
+                      f"Charm:{_chm} | {_dq}", flush=True)
+                if _dn:
+                    print(f"  📅 {_dn}", flush=True)
+                if price <= _gfl * 1.03 and _dq == "LIVE":
                     print(f"  🚨 GEX FLIP APPROACHING — within 3% of ${_gfl} — regime change risk!", flush=True)
+            elif _dq == "STALE_WEEKEND":
+                print(f"  🏦 Dealer: Weekend data — levels refresh Mon 9:30 ET", flush=True)
 
         except Exception as _e:
             print(f"  ⚠️ Market maker error: {_e}")
@@ -13436,13 +13471,15 @@ function _updateUI_inner(s) {
   var dhVannaS = mm.vanna_signal || '';
   var dhCharm = mm.charm_urgency || 'LOW';
   var dhMode = mm.hedging_pressure || '—';
-  setText('dh-gex-flip', dhFlip ? '$' + dhFlip : '—',
-    dhFlipDist != null && dhFlipDist <= 3 ? 'extreme' : dhFlipDist != null && dhFlipDist <= 6 ? 'warn' : '');
-  setText('dh-flip-dist', dhFlipDist != null ? dhFlipDist.toFixed(1) + '% away' : '—',
+  var dhStale = mm.data_quality === 'STALE_WEEKEND';
+  var dhStaleLabel = dhStale ? ' (Fri close)' : '';
+  setText('dh-gex-flip', dhFlip ? '$' + dhFlip + dhStaleLabel : '—',
+    dhFlipDist != null && dhFlipDist <= 3 ? 'extreme' : dhFlipDist != null && dhFlipDist <= 6 ? 'warn' : dhStale ? 'warn' : '');
+  setText('dh-flip-dist', dhFlipDist != null ? dhFlipDist.toFixed(1) + '% away' + (dhStale ? ' ⏰' : '') : '—',
     dhFlipDist != null && dhFlipDist <= 3 ? 'extreme' : '');
-  setText('dh-call-wall', dhCW && dhCWD != null ? '$' + dhCW + ' (+' + dhCWD.toFixed(1) + '%)' : '—',
+  setText('dh-call-wall', dhCW && dhCWD != null ? '$' + dhCW + ' (+' + dhCWD.toFixed(1) + '%)' + dhStaleLabel : (dhStale ? '— (refreshes Mon 9:30)' : '—'),
     dhCWD != null && dhCWD <= 1 ? 'bear' : dhCWD != null && dhCWD <= 2.5 ? 'warn' : '');
-  setText('dh-put-wall', dhPW && dhPWD != null ? '$' + dhPW + ' (-' + dhPWD.toFixed(1) + '%)' : '—',
+  setText('dh-put-wall', dhPW && dhPWD != null ? '$' + dhPW + ' (-' + dhPWD.toFixed(1) + '%)' + dhStaleLabel : (dhStale ? '— (refreshes Mon 9:30)' : '—'),
     dhPWD != null && dhPWD <= 1 ? 'bull' : '');
   setText('dh-vanna', dhVanna != null ? (dhVanna >= 0 ? '+' : '') + dhVanna + 'M' : '—',
     dhVanna > 50 ? 'bull' : dhVanna < -50 ? 'bear' : '');
