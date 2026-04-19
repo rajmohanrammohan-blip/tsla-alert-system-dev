@@ -2759,17 +2759,21 @@ def calculate_market_maker_data(ticker_symbol, current_price):
         for exp in expiries[:3]:
             try:
                 _raw_chain = tkr.option_chain(exp)
-                # Guard: option_chain returns a namedtuple (calls, puts)
-                # calls/puts are DataFrames — verify before using
-                if hasattr(_raw_chain, 'calls'):
+                # Guard: option_chain may return namedtuple, tuple, or object
+                if hasattr(_raw_chain, 'calls') and hasattr(_raw_chain, 'puts'):
                     calls = _raw_chain.calls
                     puts  = _raw_chain.puts
                 elif isinstance(_raw_chain, (tuple, list)) and len(_raw_chain) >= 2:
                     calls, puts = _raw_chain[0], _raw_chain[1]
                 else:
+                    print(f"  ⚠️ MM chain unexpected type {type(_raw_chain)} for {exp}", flush=True)
                     continue
-                if not hasattr(calls, 'iterrows') or not hasattr(puts, 'iterrows'):
-                    continue  # not DataFrames — skip this expiry
+                # Ensure they are DataFrames with expected columns
+                import pandas as _pd_mm
+                if not isinstance(calls, _pd_mm.DataFrame) or not isinstance(puts, _pd_mm.DataFrame):
+                    continue
+                if "strike" not in calls.columns or "openInterest" not in calls.columns:
+                    continue
                 chain = _raw_chain
 
                 # Filter to strikes within 20% of current price (relevant range)
@@ -2927,37 +2931,87 @@ def calculate_market_maker_data(ticker_symbol, current_price):
         result["call_walls"] = [{"strike": s, "oi": int(oi)} for s, oi in call_walls]
         result["put_walls"]  = [{"strike": s, "oi": int(oi)} for s, oi in put_walls]
 
-        # ── GEX Flip Level ─────────────────────────────────────────────────────
-        # Find the price level where net GEX (all strikes above that level summed)
-        # flips from positive to negative. This is where dealer hedging changes
-        # from stabilizing (mean-reverting) to amplifying (trend-following).
-        # Method: compute total GEX above each candidate strike level.
-        _sorted_strikes_asc = sorted(gex_map.keys())
-        _total_gex = sum(gex_map.values())
-        _gex_flip_level    = None
-        _gex_flip_strength = 0
-        _cum_from_top = 0
-        # Walk from highest strike DOWN to find where cumulative-from-top flips sign
-        for _s in reversed(_sorted_strikes_asc):
-            _cum_from_top += gex_map.get(_s, 0)
-            if _cum_from_top < 0 and _s < current_price:
-                # All strikes above _s sum to negative GEX — this is the flip
-                _gex_flip_level = _s
-                _gex_flip_strength = abs(_cum_from_top)
-                break
-        # Fallback: use put-heavy zone (largest put OI concentration below price)
-        if _gex_flip_level is None and oi_map:
-            _put_heavy = sorted(
-                [(s, oi_map[s].get("put_oi",0) - oi_map[s].get("call_oi",0))
-                 for s in oi_map if s < current_price],
-                key=lambda x: -x[1]
-            )
-            if _put_heavy:
-                _gex_flip_level    = _put_heavy[0][0]
-                _gex_flip_strength = abs(_total_gex * 0.1)  # estimated
+        # ── GEX Flip Level — Dynamic Black-Scholes Recalculation ──────────────
+        # Static OI-based scan is wrong (gives $330 when real flip is ~$365).
+        # Correct method: recalculate gamma at each hypothetical spot price,
+        # find where net dealer GEX crosses zero from positive to negative.
+        # Uses Black-Scholes gamma formula across full strike range.
+        try:
+            import math as _math_gex
+            from datetime import date as _dt_gex
+
+            def _bs_gamma(S, K, T, sigma):
+                """Black-Scholes gamma at hypothetical spot S."""
+                if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+                    return 0.0
+                try:
+                    d1 = (_math_gex.log(S / K) + (0.05 + 0.5 * sigma**2) * T) / (sigma * _math_gex.sqrt(T))
+                    # Gaussian PDF approximation
+                    return _math_gex.exp(-0.5 * d1**2) / (_math_gex.sqrt(2 * _math_gex.pi) * S * sigma * _math_gex.sqrt(T))
+                except Exception:
+                    return 0.0
+
+            # Build options table from oi_map + iv data
+            # We have: oi_map[strike] = {call_oi, put_oi}
+            # We need IV per strike — use average IV from iv_list or per-strike approximation
+            _avg_iv = (sum(iv_list) / len(iv_list)) if iv_list else 0.30
+            _today  = _dt_gex.today()
+            _exp_dt = datetime.strptime(expiries[0], "%Y-%m-%d").date() if expiries else _today
+            _dte    = max((_exp_dt - _today).days, 1)
+            _T      = _dte / 365.0
+
+            # Scan hypothetical spot prices ±20% from current in $2 steps
+            _lo = current_price * 0.80
+            _hi = current_price * 1.20
+            _scan_prices = [_lo + i * 2.0 for i in range(int((_hi - _lo) / 2.0) + 1)]
+
+            _gex_profile = []  # (hypo_price, net_gex)
+            for _hypo in _scan_prices:
+                _net = 0.0
+                for _k, _oi_data in oi_map.items():
+                    _c_oi = _oi_data.get("call_oi", 0)
+                    _p_oi = _oi_data.get("put_oi",  0)
+                    _g = _bs_gamma(_hypo, _k, _T, _avg_iv)
+                    # Calls: dealers short → positive GEX; Puts: dealers long → negative GEX
+                    _net += (_c_oi - _p_oi) * _g * 100 * (_hypo ** 2) / 1e9
+                _gex_profile.append((_hypo, _net))
+
+            # Find zero-crossing from positive to negative (walking down from current price)
+            _gex_flip_level    = None
+            _gex_flip_strength = 0.0
+            _profile_below = [(p, g) for p, g in _gex_profile if p < current_price]
+            _profile_below.sort(key=lambda x: -x[0])  # descending: closest to price first
+            _prev_gex = None
+            for _hypo, _net in _profile_below:
+                if _prev_gex is None:
+                    _prev_gex = _net
+                    continue
+                # Zero crossing: prev positive, now negative
+                if _prev_gex >= 0 and _net < 0:
+                    # Interpolate exact crossing
+                    _prev_p = _hypo + 2.0  # the price step above
+                    _flip_interp = _prev_p + (0 - _prev_gex) * ((_hypo - _prev_p) / (_net - _prev_gex + 1e-9))
+                    _gex_flip_level = round(_flip_interp, 1)
+                    _gex_flip_strength = abs(_net)
+                    break
+                _prev_gex = _net
+
+        except Exception as _gfx_err:
+            # Fallback: OI-weighted estimate — put-heavy zone ±8–12% below price
+            _gex_flip_level = None
+            _gex_flip_strength = 0.0
+            if oi_map:
+                _put_heavy = sorted(
+                    [(s, oi_map[s].get("put_oi",0) - oi_map[s].get("call_oi",0))
+                     for s in oi_map if current_price * 0.82 < s < current_price * 0.96],
+                    key=lambda x: -x[1]
+                )
+                if _put_heavy:
+                    _gex_flip_level    = _put_heavy[0][0]
+                    _gex_flip_strength = abs(sum(gex_map.values()) * 0.1)
 
         result["gex_flip_level"]    = _gex_flip_level
-        result["gex_flip_strength"] = round(_gex_flip_strength, 1)
+        result["gex_flip_strength"] = round(float(_gex_flip_strength), 1)
         result["gex_flip_dist_pct"] = round((current_price - _gex_flip_level) / current_price * 100, 2) if _gex_flip_level else None
 
         # ── Call Wall / Put Wall (highest OI concentration) ────────────────────
@@ -10577,8 +10631,10 @@ def stream():
                 # If analysis hasn't run yet, send a loading heartbeat
                 # so the frontend knows the server is alive and populates
                 # ticker/session even before first full cycle completes
-                if not _base.get("last_updated"):
+                if not _base.get("last_updated") and not _base.get("price"):
                     _base["_loading"] = True
+                else:
+                    _base["_loading"] = False  # explicitly clear loading when we have data
                 payload = _sanitize(_base)
                 data = _json.dumps(payload)
                 yield f"data: {data}\n\n"
@@ -13022,7 +13078,8 @@ function _updateUI_inner(s) {
   }
 
   // Show loading state while analysis hasn't run yet
-  if (s._loading && !s.last_updated) {
+  // Only show if BOTH _loading flag is set AND no price data yet
+  if (s._loading && !s.last_updated && !s.price) {
     var tEl = document.getElementById('topTicker');
     if (tEl && s.ticker) { tEl.textContent = s.ticker; _currentTicker = s.ticker; }
     var bt = document.getElementById('brandTicker'); if(bt && s.ticker) bt.textContent = s.ticker;
