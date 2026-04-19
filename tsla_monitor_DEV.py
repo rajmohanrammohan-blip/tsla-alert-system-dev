@@ -2902,6 +2902,101 @@ def calculate_market_maker_data(ticker_symbol, current_price):
         result["call_walls"] = [{"strike": s, "oi": int(oi)} for s, oi in call_walls]
         result["put_walls"]  = [{"strike": s, "oi": int(oi)} for s, oi in put_walls]
 
+        # ── GEX Flip Level ─────────────────────────────────────────────────────
+        # The strike where cumulative GEX (summed from ATM downward) turns negative.
+        # Below this level dealers flip from stabilizing → destabilizing (amplifying moves).
+        _sorted_strikes_asc = sorted(gex_map.keys())
+        _cumulative_gex     = 0
+        _gex_flip_level     = None
+        _gex_flip_strength  = 0
+        for _s in reversed(_sorted_strikes_asc):   # walk down from ATM
+            _cumulative_gex += gex_map.get(_s, 0)
+            if _cumulative_gex < 0 and _gex_flip_level is None:
+                _gex_flip_level = _s
+                _gex_flip_strength = abs(_cumulative_gex)
+        # If no flip found below ATM, look above (rare in strong bull market)
+        if _gex_flip_level is None:
+            _cumulative_gex = 0
+            for _s in _sorted_strikes_asc:
+                _cumulative_gex += gex_map.get(_s, 0)
+                if _cumulative_gex < 0:
+                    _gex_flip_level = _s
+                    _gex_flip_strength = abs(_cumulative_gex)
+                    break
+
+        result["gex_flip_level"]    = _gex_flip_level
+        result["gex_flip_strength"] = round(_gex_flip_strength, 1)
+        result["gex_flip_dist_pct"] = round((current_price - _gex_flip_level) / current_price * 100, 2) if _gex_flip_level else None
+
+        # ── Call Wall / Put Wall (highest OI concentration) ────────────────────
+        # These are the true dealer-defended levels, more reliable than Max Pain
+        _cw_top = call_walls[0] if call_walls else None
+        _pw_top = put_walls[0]  if put_walls  else None
+        result["call_wall"]     = _cw_top["strike"] if _cw_top else None
+        result["call_wall_oi"]  = _cw_top["oi"]     if _cw_top else 0
+        result["put_wall"]      = _pw_top["strike"]  if _pw_top else None
+        result["put_wall_oi"]   = _pw_top["oi"]      if _pw_top else 0
+        # Distance from current price
+        result["call_wall_dist_pct"] = round((_cw_top["strike"] - current_price) / current_price * 100, 2) if _cw_top else None
+        result["put_wall_dist_pct"]  = round((current_price - _pw_top["strike"])  / current_price * 100, 2) if _pw_top else None
+
+        # ── Vanna Sensitivity (VIX-delta interaction) ──────────────────────────
+        # Approximation: sum of (call_delta * call_oi - put_delta * put_oi) * vega_proxy
+        # We don't have per-strike IV so use aggregate IV rank as vanna proxy
+        iv_rank_val = result.get("iv_rank", 30) or 30
+        _vanna_bias = 0
+        for _s in sorted(oi_map.keys()):
+            _c_oi = oi_map[_s].get("call_oi", 0)
+            _p_oi = oi_map[_s].get("put_oi", 0)
+            _moneyness = (_s - current_price) / max(current_price, 1)
+            # Rough delta approximation: ATM~0.5, OTM calls decay
+            import math as _math
+            _call_delta = max(0.05, 0.5 - _moneyness * 2)  # simplified
+            _put_delta  = max(0.05, 0.5 + _moneyness * 2)
+            _vanna_bias += (_call_delta * _c_oi - _put_delta * _p_oi) * (1 - iv_rank_val/200)
+        result["vanna_bias"]   = round(_vanna_bias / 1e6, 1)  # in millions
+        result["vanna_signal"] = (
+            "BULLISH — VIX drop fuels buying" if _vanna_bias > 0 else
+            "BEARISH — VIX rise forces selling"
+        )
+
+        # ── Charm Exposure (expiration proximity) ──────────────────────────────
+        # Charm intensifies as options approach expiry → mechanical dealer flows
+        from datetime import date as _date_cls, timedelta as _td
+        _today     = _date_cls.today()
+        _nearest_expiry = None
+        _charm_urgency  = "LOW"
+        _days_to_exp    = 99
+        # Find nearest expiry from oi_map context — use Friday of this week as proxy
+        _days_to_friday = (4 - _today.weekday()) % 7  # 0=Mon, 4=Fri
+        if _days_to_friday == 0: _days_to_friday = 7  # if today is Friday, next Friday
+        _nearest_expiry = _today + _td(days=_days_to_friday)
+        _days_to_exp    = _days_to_friday
+
+        if _days_to_exp <= 1:
+            _charm_urgency = "EXTREME"   # expiration day — pure mechanics
+        elif _days_to_exp <= 2:
+            _charm_urgency = "HIGH"      # day before expiry
+        elif _days_to_exp <= 4:
+            _charm_urgency = "ELEVATED"  # within week of expiry
+        else:
+            _charm_urgency = "LOW"
+
+        # Earnings proximity adds to charm/vanna uncertainty
+        _earn_ctx = {}
+        try:
+            from tsla_monitor_DEV import state as _st
+            _earn_ctx = _st.get("earnings_context", {}) if isinstance(_st, dict) else {}
+        except Exception:
+            pass
+        _earn_days = _earn_ctx.get("days_away", 99) if _earn_ctx else 99
+        if isinstance(_earn_days, (int, float)) and _earn_days <= 3:
+            _charm_urgency = "EXTREME"  # earnings + expiry = maximum uncertainty
+
+        result["charm_urgency"]     = _charm_urgency
+        result["charm_days_to_exp"] = _days_to_exp
+        result["charm_expiry_date"] = _nearest_expiry.strftime("%Y-%m-%d")
+
         # ── GEX by Strike (for chart) ──
         result["gex_by_strike"] = [
             {"strike": s, "gex": round(g, 2),
@@ -6634,6 +6729,53 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
     elif pain_pull < -3:
         votes["neutral"] += 1  # slightly above max pain — fine, no penalty
 
+    # 3b. Dealer hedge structure — GEX flip, call/put wall, vanna, charm
+    _gex_flip    = float(mm_data.get("gex_flip_level", 0) or 0)
+    _call_wall   = float(mm_data.get("call_wall", 0) or 0)
+    _put_wall    = float(mm_data.get("put_wall", 0) or 0)
+    _cw_dist     = float(mm_data.get("call_wall_dist_pct", 99) or 99)
+    _pw_dist     = float(mm_data.get("put_wall_dist_pct", 99) or 99)
+    _gf_dist     = float(mm_data.get("gex_flip_dist_pct", 99) or 99)
+    _charm_urg   = mm_data.get("charm_urgency", "LOW")
+    _vanna_bias  = float(mm_data.get("vanna_bias", 0) or 0)
+
+    # Call wall proximity — price near call wall = strong resistance
+    if _call_wall > 0 and _cw_dist <= 1.0:
+        score -= 8; reasons.append(f"At call wall ${_call_wall:.0f} — dealer supply zone")
+        votes["bear"] += 1
+    elif _call_wall > 0 and _cw_dist <= 2.5:
+        score -= 4; votes["neutral"] += 1
+        reasons.append(f"Approaching call wall ${_call_wall:.0f} (+{_cw_dist:.1f}%)")
+
+    # Put wall proximity — price near put wall = strong support
+    if _put_wall > 0 and _pw_dist <= 1.0:
+        score += 6; reasons.append(f"At put wall ${_put_wall:.0f} — dealer support zone")
+        votes["bull"] += 1
+    elif _put_wall > 0 and _pw_dist <= 2.5:
+        score += 3; votes["bull"] += 1
+
+    # GEX flip proximity — approaching flip level = regime change risk
+    if _gex_flip > 0 and _gf_dist <= 3.0:
+        score -= 12; reasons.append(f"Near GEX flip ${_gex_flip:.0f} — dealer regime change risk")
+        votes["bear"] += 1
+    elif _gex_flip > 0 and _gf_dist <= 6.0:
+        score -= 5; votes["neutral"] += 1
+
+    # Vanna — bullish when positive (VIX dropping fuels call buying)
+    if _vanna_bias > 50:
+        score += 5; votes["bull"] += 1
+        reasons.append(f"Vanna flow bullish ({_vanna_bias:+.0f}M) — low VIX fueling call demand")
+    elif _vanna_bias < -50:
+        score -= 5; votes["bear"] += 1
+
+    # Charm — near expiry dampens signal weight (mechanical flows dominate)
+    if _charm_urg == "EXTREME":
+        # Don't change score, but flag — signal unreliable
+        reasons.append("⚠️ Charm EXTREME — expiry/earnings mechanical flows, reduce size 20%")
+        votes["neutral"] += 1
+    elif _charm_urg == "HIGH":
+        votes["neutral"] += 1  # add uncertainty
+
     # 4. DarthVader institutional intelligence
     dv_state = dv_result.get("tsla_state", {}).get("state", "") if dv_result else ""
     dv_risk  = dv_result.get("risk_mode", "NORMAL") if dv_result else "NORMAL"
@@ -7365,6 +7507,22 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 f"Hedging: {_hed_s}"
             )
             print(f"  🎰 MM: {mm_data['summary'][:90]}", flush=True)
+            # Dealer hedge structure
+            _gfl = mm_data.get("gex_flip_level")
+            _cw  = mm_data.get("call_wall")
+            _pw  = mm_data.get("put_wall")
+            _cwd = mm_data.get("call_wall_dist_pct", 0) or 0
+            _pwd = mm_data.get("put_wall_dist_pct",  0) or 0
+            _gfd = mm_data.get("gex_flip_dist_pct",  0) or 0
+            _van = (mm_data.get("vanna_signal","") or "")[:20]
+            _chm = mm_data.get("charm_urgency", "LOW")
+            if _gfl:
+                print(f"  🏦 Dealer: GEX Flip=${_gfl} ({_gfd:+.1f}% away) | "
+                      f"Call Wall=${_cw} (+{_cwd:.1f}%) | "
+                      f"Put Wall=${_pw} (-{_pwd:.1f}%) | "
+                      f"Charm:{_chm}", flush=True)
+                if price <= _gfl * 1.03:
+                    print(f"  🚨 GEX FLIP APPROACHING — within 3% of ${_gfl} — regime change risk!", flush=True)
 
         except Exception as _e:
             print(f"  ⚠️ Market maker error: {_e}")
@@ -7729,6 +7887,27 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                     )
             except Exception as _vh_err:
                 state["vol_hawk"] = {}
+
+            # ── GEX Flip Regime Change Alert ──────────────────────────────────
+            try:
+                _gfl2    = mm_data.get("gex_flip_level")
+                _gfd2    = mm_data.get("gex_flip_dist_pct", 99) or 99
+                _cw2     = mm_data.get("call_wall")
+                _pw2     = mm_data.get("put_wall")
+                _chm2    = mm_data.get("charm_urgency", "LOW")
+                if _gfl2 and _gfd2 <= 3.0:
+                    _nl = "\n"
+                    log_alert(
+                        f"🚨 {TICKER} *GEX FLIP WARNING*{_nl}"
+                        f"━━━━━━━━━━━━━━━━━━━━━━{_nl}"
+                        f"Price *${price}* approaching GEX flip at *${_gfl2}*{_nl}"
+                        f"Distance: *{_gfd2:.1f}%* — dealer regime change imminent{_nl}"
+                        f"⚠️ Below ${_gfl2}: dealers AMPLIFY moves (not stabilize){_nl}"
+                        f"Call Wall: ${_cw2} | Put Wall: ${_pw2} | Charm: {_chm2}",
+                        alert_key="gex_flip_warning"
+                    )
+            except Exception:
+                pass
 
         except Exception as _vwap_err:
             state["vwap_bands"] = {}
@@ -12589,6 +12768,16 @@ body {
         <div class="data-row"><span class="data-row-label">Sweep Velocity</span><span class="data-row-val" id="ll-sweep">—</span></div>
         <div class="data-row"><span class="data-row-label">Time Window</span><span class="data-row-val" id="ll-tod">—</span></div>
       </div>
+      <div class="data-card">
+        <h3>🏦 Dealer Hedge Structure</h3>
+        <div class="data-row"><span class="data-row-label">GEX Flip Level</span><span class="data-row-val" id="dh-gex-flip">—</span></div>
+        <div class="data-row"><span class="data-row-label">Flip Distance</span><span class="data-row-val" id="dh-flip-dist">—</span></div>
+        <div class="data-row"><span class="data-row-label">Call Wall</span><span class="data-row-val" id="dh-call-wall">—</span></div>
+        <div class="data-row"><span class="data-row-label">Put Wall</span><span class="data-row-val" id="dh-put-wall">—</span></div>
+        <div class="data-row"><span class="data-row-label">Vanna Flow</span><span class="data-row-val" id="dh-vanna">—</span></div>
+        <div class="data-row"><span class="data-row-label">Charm Urgency</span><span class="data-row-val" id="dh-charm">—</span></div>
+        <div class="data-row"><span class="data-row-label">Dealer Mode</span><span class="data-row-val" id="dh-mode">—</span></div>
+      </div>
       <div class="data-card" style="grid-column:1/-1">
         <h3>🇺🇸 Trump Monitor</h3>
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:12px;margin-bottom:10px;">
@@ -13070,6 +13259,33 @@ function _updateUI_inner(s) {
   var todLabel = todW >= 1.4 ? 'Institutional (1°)' : todW >= 1.2 ? 'Institutional (2°)' : todW <= 0.6 ? 'Noise (discount)' : 'Normal';
   setText('ll-tod', todW ? todLabel + ' ×' + todW : '—',
     todW >= 1.3 ? 'bull' : todW <= 0.6 ? 'bear' : '');
+
+  // Dealer Hedge Structure
+  var mm = s.mm_data || {};
+  var dhFlip = mm.gex_flip_level;
+  var dhFlipDist = mm.gex_flip_dist_pct;
+  var dhCW = mm.call_wall;
+  var dhPW = mm.put_wall;
+  var dhCWD = mm.call_wall_dist_pct;
+  var dhPWD = mm.put_wall_dist_pct;
+  var dhVanna = mm.vanna_bias;
+  var dhVannaS = mm.vanna_signal || '';
+  var dhCharm = mm.charm_urgency || 'LOW';
+  var dhMode = mm.hedging_pressure || '—';
+  setText('dh-gex-flip', dhFlip ? '$' + dhFlip : '—',
+    dhFlipDist != null && dhFlipDist <= 3 ? 'extreme' : dhFlipDist != null && dhFlipDist <= 6 ? 'warn' : '');
+  setText('dh-flip-dist', dhFlipDist != null ? dhFlipDist.toFixed(1) + '% away' : '—',
+    dhFlipDist != null && dhFlipDist <= 3 ? 'extreme' : '');
+  setText('dh-call-wall', dhCW && dhCWD != null ? '$' + dhCW + ' (+' + dhCWD.toFixed(1) + '%)' : '—',
+    dhCWD != null && dhCWD <= 1 ? 'bear' : dhCWD != null && dhCWD <= 2.5 ? 'warn' : '');
+  setText('dh-put-wall', dhPW && dhPWD != null ? '$' + dhPW + ' (-' + dhPWD.toFixed(1) + '%)' : '—',
+    dhPWD != null && dhPWD <= 1 ? 'bull' : '');
+  setText('dh-vanna', dhVanna != null ? (dhVanna >= 0 ? '+' : '') + dhVanna + 'M' : '—',
+    dhVanna > 50 ? 'bull' : dhVanna < -50 ? 'bear' : '');
+  setText('dh-charm', dhCharm,
+    dhCharm === 'EXTREME' ? 'extreme' : dhCharm === 'HIGH' ? 'warn' : dhCharm === 'ELEVATED' ? 'warn' : '');
+  setText('dh-mode', dhMode.split(' — ')[0] || '—',
+    dhMode.indexOf('SELL') >= 0 ? 'bear' : dhMode.indexOf('BUY') >= 0 ? 'bull' : dhMode.indexOf('CHAS') >= 0 ? 'extreme' : '');
 
   // Alerts tab
   var alerts = s.alerts_log || [];
