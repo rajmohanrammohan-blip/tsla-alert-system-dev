@@ -2774,25 +2774,34 @@ def calculate_market_maker_data(ticker_symbol, current_price):
                 # Puts:  dealer is LONG puts   → SHORT gamma → negative GEX
                 # (Assumes dealer sold calls and bought puts — typical retail flow)
                 for _, row in calls.iterrows():
-                    s   = round(float(row["strike"]), 0)
-                    oi  = float(0 if (row["openInterest"] != row["openInterest"]) else (row["openInterest"] or 0))
-                    # Approximate gamma from IV + moneyness (Black-Scholes approximation)
-                    iv  = float(row["impliedVolatility"] or 0.5)
-                    gamma_approx = _approx_gamma(current_price, s, iv, max(days_to_exp, 1) / 365)
-                    gex = oi * gamma_approx * 100 * (current_price ** 2) / 1e9  # scale to millions
-                    gex_map[s] = gex_map.get(s, 0) + gex
-                    oi_map.setdefault(s, {"call_oi": 0, "put_oi": 0})
-                    oi_map[s]["call_oi"] += oi
+                    try:
+                        s   = round(float(row["strike"]), 0)
+                        _oi_raw = row.get("openInterest", 0) if hasattr(row, "get") else row["openInterest"]
+                        oi  = float(0 if (_oi_raw != _oi_raw or _oi_raw is None) else (_oi_raw or 0))
+                        _iv_raw = row.get("impliedVolatility", 0.5) if hasattr(row, "get") else row["impliedVolatility"]
+                        iv  = float(_iv_raw or 0.5) if (_iv_raw == _iv_raw) else 0.5
+                        gamma_approx = _approx_gamma(current_price, s, iv, max(days_to_exp, 1) / 365)
+                        gex = oi * gamma_approx * 100 * (current_price ** 2) / 1e9  # scale to millions
+                        gex_map[s] = gex_map.get(s, 0) + gex
+                        oi_map.setdefault(s, {"call_oi": 0, "put_oi": 0})
+                        oi_map[s]["call_oi"] += oi
+                    except Exception:
+                        pass
 
                 for _, row in puts.iterrows():
-                    s   = round(float(row["strike"]), 0)
-                    oi  = float(0 if (row["openInterest"] != row["openInterest"]) else (row["openInterest"] or 0))
-                    iv  = float(row["impliedVolatility"] or 0.5)
-                    gamma_approx = _approx_gamma(current_price, s, iv, max(days_to_exp, 1) / 365)
-                    gex = -(oi * gamma_approx * 100 * (current_price ** 2) / 1e9)
-                    gex_map[s] = gex_map.get(s, 0) + gex
-                    oi_map.setdefault(s, {"call_oi": 0, "put_oi": 0})
-                    oi_map[s]["put_oi"] += oi
+                    try:
+                        s   = round(float(row["strike"]), 0)
+                        _oi_raw = row.get("openInterest", 0) if hasattr(row, "get") else row["openInterest"]
+                        oi  = float(0 if (_oi_raw != _oi_raw or _oi_raw is None) else (_oi_raw or 0))
+                        _iv_raw = row.get("impliedVolatility", 0.5) if hasattr(row, "get") else row["impliedVolatility"]
+                        iv  = float(_iv_raw or 0.5) if (_iv_raw == _iv_raw) else 0.5
+                        gamma_approx = _approx_gamma(current_price, s, iv, max(days_to_exp, 1) / 365)
+                        gex = -(oi * gamma_approx * 100 * (current_price ** 2) / 1e9)
+                        gex_map[s] = gex_map.get(s, 0) + gex
+                        oi_map.setdefault(s, {"call_oi": 0, "put_oi": 0})
+                        oi_map[s]["put_oi"] += oi
+                    except Exception:
+                        pass
 
                 # Max Pain: for each strike, sum total OI loss for all options
                 all_strikes = sorted(set(
@@ -2903,26 +2912,33 @@ def calculate_market_maker_data(ticker_symbol, current_price):
         result["put_walls"]  = [{"strike": s, "oi": int(oi)} for s, oi in put_walls]
 
         # ── GEX Flip Level ─────────────────────────────────────────────────────
-        # The strike where cumulative GEX (summed from ATM downward) turns negative.
-        # Below this level dealers flip from stabilizing → destabilizing (amplifying moves).
+        # Find the price level where net GEX (all strikes above that level summed)
+        # flips from positive to negative. This is where dealer hedging changes
+        # from stabilizing (mean-reverting) to amplifying (trend-following).
+        # Method: compute total GEX above each candidate strike level.
         _sorted_strikes_asc = sorted(gex_map.keys())
-        _cumulative_gex     = 0
-        _gex_flip_level     = None
-        _gex_flip_strength  = 0
-        for _s in reversed(_sorted_strikes_asc):   # walk down from ATM
-            _cumulative_gex += gex_map.get(_s, 0)
-            if _cumulative_gex < 0 and _gex_flip_level is None:
+        _total_gex = sum(gex_map.values())
+        _gex_flip_level    = None
+        _gex_flip_strength = 0
+        _cum_from_top = 0
+        # Walk from highest strike DOWN to find where cumulative-from-top flips sign
+        for _s in reversed(_sorted_strikes_asc):
+            _cum_from_top += gex_map.get(_s, 0)
+            if _cum_from_top < 0 and _s < current_price:
+                # All strikes above _s sum to negative GEX — this is the flip
                 _gex_flip_level = _s
-                _gex_flip_strength = abs(_cumulative_gex)
-        # If no flip found below ATM, look above (rare in strong bull market)
-        if _gex_flip_level is None:
-            _cumulative_gex = 0
-            for _s in _sorted_strikes_asc:
-                _cumulative_gex += gex_map.get(_s, 0)
-                if _cumulative_gex < 0:
-                    _gex_flip_level = _s
-                    _gex_flip_strength = abs(_cumulative_gex)
-                    break
+                _gex_flip_strength = abs(_cum_from_top)
+                break
+        # Fallback: use put-heavy zone (largest put OI concentration below price)
+        if _gex_flip_level is None and oi_map:
+            _put_heavy = sorted(
+                [(s, oi_map[s].get("put_oi",0) - oi_map[s].get("call_oi",0))
+                 for s in oi_map if s < current_price],
+                key=lambda x: -x[1]
+            )
+            if _put_heavy:
+                _gex_flip_level    = _put_heavy[0][0]
+                _gex_flip_strength = abs(_total_gex * 0.1)  # estimated
 
         result["gex_flip_level"]    = _gex_flip_level
         result["gex_flip_strength"] = round(_gex_flip_strength, 1)
@@ -7146,21 +7162,28 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
 
     total_votes    = votes["bull"] + votes["bear"] + votes["neutral"]
     decisive_votes = votes["bull"] + votes["bear"]
-    # Conviction = directional agreement among models that took a stance
-    # Neutral votes show uncertainty but don't dilute the conviction of those that voted
+    # Conviction formula (fixed per audit):
+    # Step 1: directional ratio ignores neutrals — 5 bull 2 bear = 71% bull
+    # Step 2: participation weight — neutrals only mildly reduce (floor 0.75)
+    # Step 3: final conviction = directional % × participation weight
+    # Rationale: neutral = uncertain, not wrong. A 5:2 bull:bear with 9 neutrals
+    # should show ~65% conviction, not 51% (the old formula was too punishing).
     if decisive_votes > 0:
-        bull_pct   = round(votes["bull"] / decisive_votes * 100)
-        bear_pct   = round(votes["bear"] / decisive_votes * 100)
+        bull_pct = round(votes["bull"] / decisive_votes * 100)
+        bear_pct = round(votes["bear"] / decisive_votes * 100)
     else:
         bull_pct = bear_pct = 0
-    # Scale by participation: neutrals reduce conviction but less aggressively
-    # Neutral = signal unclear (not wrong), so only mild penalty
-    participation = round(decisive_votes / max(total_votes, 1) * 100)
+    # Participation: fraction of total votes that were directional (not neutral)
+    _participation_ratio = decisive_votes / max(total_votes, 1)
+    # Conviction: directional agreement (ignores neutrals) weighted by participation
+    # Neutrals = uncertain, not wrong → only mildly reduce conviction
+    # Formula: bull% (of decisive) × participation_weight
+    # Weight: min 0.80 even at low participation, scales up to ~0.97 at high participation
+    part_weight = max(0.80, 0.65 + _participation_ratio * 0.5)
     raw_conviction = max(bull_pct, bear_pct)
-    # Old formula: (0.5 + participation/200) was too punishing on neutrals
-    # New formula: floor at 0.65 so even 50% participation gives 65% weight
-    part_weight = max(0.65, 0.5 + participation / 200)
     conviction = round(raw_conviction * part_weight)
+    # Example: 5B 2Br 9N → bull_pct=71% × weight=0.87 → conv=62%
+    # Previously: same setup → 51% (too punishing on neutrals)
 
     # Score is primary gate. Conviction is secondary — don't let broken
     # conviction scorer silence a high-confidence score.
@@ -8372,15 +8395,18 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 if _schwab_opts.get('calls'):
                     _calls = _schwab_opts['calls']
                     _puts  = _schwab_opts['puts']
-                    _atm_calls = sorted(_calls, key=lambda x: abs(x['strike']-price))[:5]
-                    _atm_puts  = sorted(_puts,  key=lambda x: abs(x['strike']-price))[:5]
+                    # Guard: ensure calls/puts are dicts not tuples
+                    _calls_d = [c for c in _calls if isinstance(c, dict)]
+                    _puts_d  = [p for p in _puts  if isinstance(p, dict)]
+                    _atm_calls = sorted(_calls_d, key=lambda x: abs(x.get('strike',0)-price))[:5]
+                    _atm_puts  = sorted(_puts_d,  key=lambda x: abs(x.get('strike',0)-price))[:5]
                     if _atm_calls:
-                        _delta_atm = float(sum(c['delta'] for c in _atm_calls) / len(_atm_calls))
-                        _theta_atm = float(sum(c['theta'] for c in _atm_calls) / len(_atm_calls))
-                        _vega_atm  = float(sum(c['vega']  for c in _atm_calls) / len(_atm_calls))
+                        _delta_atm = float(sum(c.get('delta',0.5) for c in _atm_calls) / len(_atm_calls))
+                        _theta_atm = float(sum(c.get('theta',0)   for c in _atm_calls) / len(_atm_calls))
+                        _vega_atm  = float(sum(c.get('vega',0)    for c in _atm_calls) / len(_atm_calls))
                     _gamma_exp = float(_schwab_opts.get('gex_total', 0)) / (price + 1e-9)
-                    _call_iv = float(sum(c['iv'] for c in _atm_calls) / max(len(_atm_calls),1)) if _atm_calls else 0.3
-                    _put_iv  = float(sum(p['iv'] for p in _atm_puts)  / max(len(_atm_puts), 1)) if _atm_puts  else 0.3
+                    _call_iv = float(sum(c.get('iv',0.3) for c in _atm_calls) / max(len(_atm_calls),1)) if _atm_calls else 0.3
+                    _put_iv  = float(sum(p.get('iv',0.3) for p in _atm_puts)  / max(len(_atm_puts), 1)) if _atm_puts  else 0.3
                     _iv_skew = _put_iv - _call_iv
             except Exception: pass
 
@@ -9843,9 +9869,32 @@ def _run_ml_retrain():
                 1 if _spy_os_r and _qqq_os_r else 0,
                 ]
                 X_rows.append(row)
-                future = float(closes.iloc[min(i+FORWARD, n-1)])
-                threshold = 1.0005 if FORWARD <= 2 else 1.001
-                y_rows.append(1 if future > price*threshold else 0)
+                # Risk-adjusted label (Gemini audit fix):
+                # Simple binary "future > price*threshold" causes AUC ~0.537
+                # because it labels marginal moves (0.1%) the same as strong moves (2%)
+                # Better: only label BUY if the risk-reward was at least 1.5:1
+                # i.e., max potential gain / max potential drawdown > 1.5
+                _look = min(i + FORWARD, n-1)
+                _window_end = min(i + FORWARD * 3, n-1)  # wider window for full excursion
+                future = float(closes.iloc[_look])
+                # Max gain and max drawdown over the forward window
+                _fwd_highs = [float(highs.iloc[j]) for j in range(i+1, _window_end+1)]
+                _fwd_lows  = [float(lows.iloc[j])  for j in range(i+1, _window_end+1)]
+                if _fwd_highs and _fwd_lows:
+                    _max_gain     = (max(_fwd_highs) - price) / max(price, 1)
+                    _max_drawdown = (price - min(_fwd_lows))  / max(price, 1)
+                    # Label 1 (BUY) only if: gain was at least 0.15% AND risk/reward ≥ 1.5
+                    if _max_gain >= 0.0015 and _max_drawdown > 0:
+                        _rr_ratio = _max_gain / max(_max_drawdown, 0.0001)
+                        y_rows.append(1 if _rr_ratio >= 1.5 else 0)
+                    elif _max_gain >= 0.0015 and _max_drawdown == 0:
+                        y_rows.append(1)  # pure gain, no drawdown
+                    else:
+                        y_rows.append(0)  # insufficient gain
+                else:
+                    # Fallback to simple label if window is too small
+                    threshold = 1.0005 if FORWARD <= 2 else 1.001
+                    y_rows.append(1 if future > price*threshold else 0)
             except Exception as _le:
                 skipped_errors += 1
                 if skipped_errors <= 3: print(f"[ML-RETRAIN] bar {i} err: {_le}", flush=True)
@@ -10504,6 +10553,52 @@ def stream():
 
 @app.route("/health")
 def health(): return jsonify({"status": "ok"}), 200
+
+@app.route("/api/debug")
+def api_debug():
+    """Minimal safe state for frontend debugging — guaranteed to not crash JS."""
+    ms = state.get("master_signal", {})
+    mm = state.get("mm_data", {})
+    try:
+        return jsonify({
+            "ticker":      TICKER,
+            "price":       state.get("price"),
+            "price_change_pct": state.get("price_change_pct"),
+            "last_updated": state.get("last_updated"),
+            "session_type": state.get("session_type", "UNKNOWN"),
+            "_loading":    not bool(state.get("last_updated")),
+            "master_signal": {
+                "action":     ms.get("action", "HOLD"),
+                "score":      int(ms.get("score", 0) or 0),
+                "conviction": int(ms.get("conviction", 0) or 0),
+                "risk":       ms.get("risk", "UNKNOWN"),
+                "reasons":    (ms.get("reasons", []) or [])[:3],
+                "color":      ms.get("color", "#ffb300"),
+            },
+            "mm_data": {
+                "gex_total":     float(mm.get("gex_total", 0) or 0),
+                "max_pain":      mm.get("max_pain"),
+                "pc_ratio":      mm.get("pc_ratio"),
+                "call_wall":     mm.get("call_wall"),
+                "put_wall":      mm.get("put_wall"),
+                "gex_flip_level":mm.get("gex_flip_level"),
+                "charm_urgency": mm.get("charm_urgency", "LOW"),
+                "hedging_pressure": mm.get("hedging_pressure", "NEUTRAL"),
+            },
+            "uoa_data": {
+                "net_flow":          state.get("uoa_data", {}).get("net_flow", "NEUTRAL"),
+                "total_call_premium":state.get("uoa_data", {}).get("total_call_premium", 0),
+                "total_put_premium": state.get("uoa_data", {}).get("total_put_premium", 0),
+                "whale_alerts":      state.get("uoa_data", {}).get("whale_alerts", [])[:3],
+            },
+            "sizing": state.get("sizing", {}),
+            "spock_accuracy": state.get("spock_accuracy", {}),
+            "ml_ready": _ml_ready,
+            "ml_retraining": _ml_retraining,
+            "wa_enabled": WA_ENABLED,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e), "ticker": TICKER})
 
 @app.route("/api/status")
 def api_status():
@@ -12912,10 +13007,23 @@ function _updateUI_inner(s) {
     window._firstLoad = true;
     console.log('[SPOCK] First state received:', {
       ticker: s.ticker, price: s.price,
-      signal: s.master_signal?.action,
+      signal: s.master_signal && s.master_signal.action,
       updated: s.last_updated,
       loading: s._loading,
-      keys: Object.keys(s).length + ' keys'
+      keys: Object.keys(s).length + ' keys',
+      hasUOA: !!s.uoa_data,
+      hasMM: !!s.mm_data,
+      hasVH: !!s.vol_hawk,
+      hasDC: !!s.donchian,
+      hasTM: !!s.trump_monitor,
+      hasLL: !!s.lead_lag,
+    });
+    // Verify the most critical elements exist
+    var criticalIds = ['spockAction','scoreNum','convPct','topPrice','topTicker'];
+    criticalIds.forEach(function(id) {
+      if (!document.getElementById(id)) {
+        console.error('[SPOCK] MISSING ELEMENT: #' + id);
+      }
     });
   }
 
