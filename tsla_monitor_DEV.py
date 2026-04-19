@@ -7868,17 +7868,38 @@ def run_analysis(refresh_4h=True, refresh_news=True):
         if signal == "SELL" and not _allow_sell:
             signal = "HOLD"
 
-        # SPOCK conviction check — use current master_signal (just computed above)
-        # Fall back to previous cycle if master hasn't been written yet (cycle 1)
+        # SPOCK conviction check — use previous cycle master_signal as gate
+        # On cycle 1, master_signal is empty — use current cycle signals as proxy
         _spock = state.get("master_signal", {})
         _spock_action    = _spock.get("action", "HOLD")
         _spock_conv      = _spock.get("conviction", 0) or 0
-        # On first cycle, master_signal has conviction=0 — use score as proxy
         _spock_score     = _spock.get("score", 0) or 0
-        if _spock_conv == 0 and abs(_spock_score) >= 15:
-            _spock_conv = 40  # bootstrap: strong score = treat as ok
-        _spock_ok_buy    = (_spock_conv >= 35 or _spock_score >= 20) and "BUY"  in _spock_action
-        _spock_ok_sell   = (_spock_conv >= 35 or _spock_score <= -20) and "SELL" in _spock_action
+
+        # Bootstrap for cycle 1: if master_signal is empty, infer from current signals
+        _uoa_now     = uoa_data.get("net_flow", "") if uoa_data else ""
+        _dv_now      = dv_result.get("tsla_state", {}).get("state", "") if dv_result else ""
+        _entry_now   = entry_data.get("entry_score", 0) if entry_data else 0
+        _is_first_cycle = _spock_conv == 0 and _spock_score == 0
+
+        if _is_first_cycle:
+            # Build synthetic conviction from this cycle's strongest signals
+            _syn_score = 0
+            if "STRONGLY BULLISH" in _uoa_now: _syn_score += 40
+            elif "BULLISH" in _uoa_now:         _syn_score += 25
+            if "TREND_EXPANSION" in _dv_now:    _syn_score += 30
+            elif "CAPITULATION" in _dv_now:     _syn_score += 25
+            if _entry_now >= 50:                _syn_score += 10
+            if signal == "BUY":                 _syn_score += 10
+            _spock_conv  = min(70, _syn_score // 2)   # rough conviction estimate
+            _spock_action = "BUY" if _syn_score >= 50 else "HOLD"
+            _spock_score  = _syn_score - 50  # normalize around 0
+            if _spock_conv > 0:
+                print(f"  🔄 SPOCK bootstrap (cycle 1): synthetic conv={_spock_conv}% score={_spock_score}", flush=True)
+        elif _spock_conv == 0 and abs(_spock_score) >= 15:
+            _spock_conv = 40  # fallback bootstrap
+
+        _spock_ok_buy  = (_spock_conv >= 35 or _spock_score >= 20) and ("BUY" in _spock_action or signal == "BUY")
+        _spock_ok_sell = (_spock_conv >= 35 or _spock_score <= -20) and ("SELL" in _spock_action or signal == "SELL")
 
         # Signal coherence — check last alert direction to prevent BUY+SELL flip
         _last_sell_time = _last_wa_send.get("signal_SELL")
@@ -7895,9 +7916,9 @@ def run_analysis(refresh_4h=True, refresh_news=True):
             if signal == "SELL" and not _momentum_ok_sell:
                 print(f"  ⚠️ SELL suppressed — momentum up ({_recent_momentum:.3%})", flush=True)
                 signal = "HOLD"
-            # Recompute with lower threshold
-            _spock_ok_buy  = _spock_conv >= 35 and "BUY"  in _spock_action
-            _spock_ok_sell = _spock_conv >= 35 and "SELL" in _spock_action
+            # Keep bootstrap values — don't strip score-based override
+            # _spock_ok_buy already set correctly above with bootstrap logic
+            pass  # keep existing _spock_ok_buy / _spock_ok_sell
 
             # ── HARD BYPASS RULE ────────────────────────────────────────────
             # If ML conf > 80 AND capitulation/bounce detected AND price below
