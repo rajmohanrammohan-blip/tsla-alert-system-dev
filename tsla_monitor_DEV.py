@@ -6688,12 +6688,21 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
         score -= 3  # small penalty — don't add bear vote at 55, it's just mild caution
         votes["neutral"] += 1
 
-    # 7. HMM regime
-    hmm_reg = hmm_result.get("regime", "NEUTRAL") if hmm_result else "NEUTRAL"
+    # 7. HMM regime — discount on weekends/stale data (HMM trained on market-hours data)
+    hmm_reg  = hmm_result.get("regime", "NEUTRAL") if hmm_result else "NEUTRAL"
+    hmm_conf = float(hmm_result.get("confidence", 0.5) or 0.5) if hmm_result else 0.5
+    _session = state.get("session_type", "UNKNOWN") if isinstance(state, dict) else "UNKNOWN"
+    _is_stale_session = _session in ("WEEKEND", "UNKNOWN") or state.get("ext_data", {}).get("session", "") == "WEEKEND" if isinstance(state, dict) else False
+    _hmm_weight = 0.4 if _is_stale_session else 1.0  # 60% discount on weekend
     if "BULL" in hmm_reg:
-        score += 8; votes["bull"] += 1
+        _pts = round(8 * _hmm_weight)
+        score += _pts; votes["bull"] += 1
     elif "BEAR" in hmm_reg:
-        score -= 8; votes["bear"] += 1
+        _pts = round(8 * _hmm_weight)
+        if _is_stale_session:
+            score -= _pts; votes["neutral"] += 1  # weekend bearish HMM = uncertain not wrong
+        else:
+            score -= _pts; votes["bear"] += 1
     else:
         votes["neutral"] += 1
 
@@ -6937,8 +6946,14 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
         score -= 5; reasons.append(f"Price extended above VWAP ({_vwap_dist:+.1f}%) — overbought vs VWAP")
         votes["bear"] += 1
     elif _vwap_sig == "BELOW_VWAP" and _anc_above is False:
-        score -= 8; reasons.append(f"Price below VWAP and anchored VWAP — institutional selling")
-        votes["bear"] += 1
+        # Only penalize if meaningfully below (-0.5%+), not just touching VWAP
+        if _vwap_dist < -0.5:
+            score -= 8; reasons.append(f"Price below VWAP ({_vwap_dist:+.1f}%) — institutional selling")
+            votes["bear"] += 1
+        elif _vwap_dist < -0.15:
+            score -= 3; votes["neutral"] += 1  # marginal — at VWAP essentially
+        else:
+            votes["neutral"] += 1  # < 0.15% below = at VWAP
     elif _vwap_sig == "EXTENDED_BELOW":
         score += 5; reasons.append(f"Price extended below VWAP ({_vwap_dist:+.1f}%) — oversold vs VWAP")
         votes["bull"] += 1
@@ -8433,6 +8448,10 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 # Save spy_data to state for WA alerts + dashboard
                 if spy_data and isinstance(spy_data, dict):
                     state["spy_data"] = spy_data
+                    # Promote lead_lag to top-level for dashboard
+                    if "lead_lag" in spy_data:
+                        state["lead_lag"] = spy_data["lead_lag"]
+                        state["lead_lag_signal"] = spy_data.get("lead_lag_signal", "MIXED")
                 state["spock_accuracy"] = _spock_accuracy
                 state["spock_weights"]  = _spock_weights
                 print(f"  🖖 SPOCK MTF: {mtf['direction']} {mtf['magnitude']} | "
