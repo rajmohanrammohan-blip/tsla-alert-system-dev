@@ -6665,10 +6665,11 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
     elif entry_score >= 50:
         score += 5; votes["bull"] += 1
     if exit_score >= 70:
-        score -= 10; reasons.append(f"Exit score HIGH ({exit_score}/100) — overbought")
+        score -= 10; reasons.append(f"Exit score HIGH ({exit_score}/100) — consider scaling out")
         votes["bear"] += 1
     elif exit_score >= 55:
-        score -= 5; votes["bear"] += 1
+        score -= 3  # small penalty — don't add bear vote at 55, it's just mild caution
+        votes["neutral"] += 1
 
     # 7. HMM regime
     hmm_reg = hmm_result.get("regime", "NEUTRAL") if hmm_result else "NEUTRAL"
@@ -6725,15 +6726,29 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
     spy_rsi_4h = float(spy_data.get("spy_rsi_4h", 50) or 50)
     qqq_rsi_4h = float(spy_data.get("qqq_rsi_4h", 50) or 50)
 
+    # Context: during a confirmed TSLA uptrend, overbought macro = momentum not reversal
+    _tsla_trend_up = state.get("tsla_4h", {}).get("trend_4h", "") == "BULLISH" if isinstance(state, dict) else False
+    _dv_trend = dv_result.get("tsla_state", {}).get("state", "") if dv_result else ""
+    _in_trend = _tsla_trend_up or "TREND_EXPANSION" in _dv_trend or "CAPITULATION_BOUNCE" in _dv_trend
     if mtf_both_ob:
-        score -= 15; reasons.append(f"SPY+QQQ overbought on 4h+daily (SPY 4h RSI:{spy_rsi_4h:.0f}, QQQ 4h RSI:{qqq_rsi_4h:.0f})")
-        votes["bear"] += 1
+        if _in_trend:
+            # Overbought during trend = momentum continuation, not reversal
+            score -= 5   # small penalty for stretched conditions (down from 15)
+            reasons.append(f"SPY+QQQ overbought (RSI {spy_rsi_4h:.0f}/{qqq_rsi_4h:.0f}) — momentum trend, reduced penalty")
+            votes["neutral"] += 1  # neutral not bear — uncertain not wrong
+        else:
+            score -= 12  # non-trend context: overbought is a real warning
+            reasons.append(f"SPY+QQQ overbought on 4h+daily ({spy_rsi_4h:.0f}/{qqq_rsi_4h:.0f}) — top risk")
+            votes["bear"] += 1
     elif mtf_both_os:
         score += 15; reasons.append(f"SPY+QQQ oversold on 4h+daily — high-conviction bounce setup")
         votes["bull"] += 1
     elif spy_ob and qqq_ob:
-        score -= 10; reasons.append("SPY + QQQ both overbought daily — market stretched")
-        votes["bear"] += 1
+        if _in_trend:
+            score -= 3; votes["neutral"] += 1  # minor in trend context
+        else:
+            score -= 8; reasons.append("SPY + QQQ both overbought daily — market stretched")
+            votes["bear"] += 1
     elif spy_os and qqq_os:
         score += 10; reasons.append("SPY + QQQ both oversold daily — market washed out")
         votes["bull"] += 1
@@ -6763,9 +6778,11 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
         else:
             reasons.append(f"VIX backwardation — stress elevated, use caution")
     elif _breadth.get("breadth_signal") == "COMPLACENT":
-        score -= 5; votes["bear"] += 1
-    # 4h alone is also meaningful
-    elif spy_rsi_4h > 72:
+        if not _in_trend:
+            score -= 5; votes["bear"] += 1
+        # In trend, complacency is normal — don't penalize
+    # 4h alone is also meaningful — but only if not in strong trend
+    elif spy_rsi_4h > 72 and not _in_trend:
         score -= 6; reasons.append(f"SPY overbought on 4h (RSI {spy_rsi_4h:.0f}) — pullback risk")
         votes["bear"] += 1
     elif spy_rsi_4h < 28:
@@ -8500,7 +8517,7 @@ def run_analysis(refresh_4h=True, refresh_news=True):
         _cap_cf = state.get("darthvader", {}).get("tsla_state", {}).get("confidence", 0) or 0
         if _cap_on and _cap_cf >= 70 and exit_score < 75:
             print(f"  ⚠️ EXIT SELL suppressed — {_dv_st} active (conf={_cap_cf}%)", flush=True)
-        elif exit_score >= 55 and prev_exit_score < 55:  # Raised from 45→55 to reduce noise
+        elif exit_score >= 55 and prev_exit_score < 55 and curr_entry < 45:  # Never fire with entry signal
             sell_low  = exit_analysis.get("optimal_sell_low", price)
             sell_high = exit_analysis.get("optimal_sell_high", price * 1.02)
             stop      = exit_analysis.get("stop_loss", price * 0.97)
