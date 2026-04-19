@@ -10554,52 +10554,6 @@ def stream():
 @app.route("/health")
 def health(): return jsonify({"status": "ok"}), 200
 
-@app.route("/api/debug")
-def api_debug():
-    """Minimal safe state for frontend debugging — guaranteed to not crash JS."""
-    ms = state.get("master_signal", {})
-    mm = state.get("mm_data", {})
-    try:
-        return jsonify({
-            "ticker":      TICKER,
-            "price":       state.get("price"),
-            "price_change_pct": state.get("price_change_pct"),
-            "last_updated": state.get("last_updated"),
-            "session_type": state.get("session_type", "UNKNOWN"),
-            "_loading":    not bool(state.get("last_updated")),
-            "master_signal": {
-                "action":     ms.get("action", "HOLD"),
-                "score":      int(ms.get("score", 0) or 0),
-                "conviction": int(ms.get("conviction", 0) or 0),
-                "risk":       ms.get("risk", "UNKNOWN"),
-                "reasons":    (ms.get("reasons", []) or [])[:3],
-                "color":      ms.get("color", "#ffb300"),
-            },
-            "mm_data": {
-                "gex_total":     float(mm.get("gex_total", 0) or 0),
-                "max_pain":      mm.get("max_pain"),
-                "pc_ratio":      mm.get("pc_ratio"),
-                "call_wall":     mm.get("call_wall"),
-                "put_wall":      mm.get("put_wall"),
-                "gex_flip_level":mm.get("gex_flip_level"),
-                "charm_urgency": mm.get("charm_urgency", "LOW"),
-                "hedging_pressure": mm.get("hedging_pressure", "NEUTRAL"),
-            },
-            "uoa_data": {
-                "net_flow":          state.get("uoa_data", {}).get("net_flow", "NEUTRAL"),
-                "total_call_premium":state.get("uoa_data", {}).get("total_call_premium", 0),
-                "total_put_premium": state.get("uoa_data", {}).get("total_put_premium", 0),
-                "whale_alerts":      state.get("uoa_data", {}).get("whale_alerts", [])[:3],
-            },
-            "sizing": state.get("sizing", {}),
-            "spock_accuracy": state.get("spock_accuracy", {}),
-            "ml_ready": _ml_ready,
-            "ml_retraining": _ml_retraining,
-            "wa_enabled": WA_ENABLED,
-        })
-    except Exception as e:
-        return jsonify({"error": str(e), "ticker": TICKER})
-
 @app.route("/api/status")
 def api_status():
     """Lightweight status — just price, signal, ticker. Fast to load."""
