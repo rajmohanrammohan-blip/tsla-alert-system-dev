@@ -6265,10 +6265,17 @@ def calculate_spock_mtf_narrative(tsla_4h, spy_data, price):
         bull_signals += 1
         reasons.append(f"TSLA 4h RSI approaching oversold ({t_rsi:.0f})")
     elif t_ob:
-        bear_signals += 2
-        reasons.append(f"TSLA 4h RSI overbought ({t_rsi:.0f}) — pullback risk")
+        # During BULLISH trend, overbought = strong momentum, not reversal
+        # Only penalize if trend is weakening or already at extreme levels
+        if t_trend == "BULLISH" and t_rsi < 95:
+            # Strong trend with elevated RSI — continuation signal
+            bull_signals += 1
+            reasons.append(f"TSLA 4h RSI elevated ({t_rsi:.0f}) in BULLISH trend — momentum")
+        else:
+            bear_signals += 1   # reduced from 2 — extreme RSI (95+) or non-bullish trend
+            reasons.append(f"TSLA 4h RSI overbought ({t_rsi:.0f}) — pullback risk")
     elif t_rsi > 60:
-        bear_signals += 1
+        bull_signals += 1  # 60-70 RSI in healthy uptrend = good
 
     if t_cross:
         bull_signals += 2
@@ -6319,21 +6326,31 @@ def calculate_spock_mtf_narrative(tsla_4h, spy_data, price):
         reasons.append(f"Low 4h volume ({t_vol:.1f}x avg) — low conviction, be cautious")
 
     # ── Cross-reference SPY/QQQ 4h ──────────────────────────────────────────
+    # Key insight: during a strong trend, overbought RSI = momentum continuation
+    # Only penalize overbought if TSLA trend is also weakening or already peaked
+    _in_strong_uptrend = t_trend == "BULLISH" and bull_signals > bear_signals
     if mtf_both_ob:
-        bear_signals += 3
-        reasons.append(f"SPY+QQQ both overbought on 4h+daily (SPY:{s_rsi_4h:.0f}, QQQ:{q_rsi_4h:.0f}) — market top risk")
+        if _in_strong_uptrend:
+            # Trend continuation — reduce penalty significantly
+            bear_signals += 1
+            reasons.append(f"SPY+QQQ overbought ({s_rsi_4h:.0f}/{q_rsi_4h:.0f}) but in uptrend — momentum, reduce size")
+        else:
+            bear_signals += 2   # reduced from 3 — still a caution signal
+            reasons.append(f"SPY+QQQ both overbought on 4h (SPY:{s_rsi_4h:.0f}, QQQ:{q_rsi_4h:.0f}) — top risk")
     elif mtf_both_os:
         bull_signals += 3
         reasons.append(f"SPY+QQQ both oversold on 4h+daily — market bottom, TSLA to follow")
     elif s_ob_4h and q_ob_4h:
-        bear_signals += 2
-        reasons.append(f"SPY+QQQ both overbought on 4h (SPY:{s_rsi_4h:.0f}, QQQ:{q_rsi_4h:.0f})")
+        if _in_strong_uptrend:
+            bear_signals += 1   # reduced from 2 in uptrend
+        else:
+            bear_signals += 2
+            reasons.append(f"SPY+QQQ both overbought on 4h (SPY:{s_rsi_4h:.0f}, QQQ:{q_rsi_4h:.0f})")
     elif s_os_4h and q_os_4h:
         bull_signals += 2
         reasons.append(f"SPY+QQQ both oversold on 4h — market finding support")
     elif s_ob_4h:
-        bear_signals += 1
-        reasons.append(f"SPY overbought on 4h (RSI {s_rsi_4h:.0f})")
+        bear_signals += 1 if not _in_strong_uptrend else 0
     elif s_os_4h:
         bull_signals += 1
         reasons.append(f"SPY oversold on 4h (RSI {s_rsi_4h:.0f})")
@@ -6993,7 +7010,9 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
         score = round(score * _hr_conv_mult)
         if _hr_reasons:
             reasons.insert(0, _hr_reasons[0])
-        votes["neutral"] += 1  # count as uncertain, not wrong
+        # Only add ONE neutral — don't flood neutral votes and tank conviction
+        if votes["neutral"] < 4:
+            votes["neutral"] += 1
 
     # Risk level — includes SPY/QQQ overbought state
     vix = float(spy_data.get("vix", 20) or 20)
@@ -7800,12 +7819,17 @@ def run_analysis(refresh_4h=True, refresh_news=True):
         if signal == "SELL" and not _allow_sell:
             signal = "HOLD"
 
-        # SPOCK conviction check — don't alert if SPOCK disagrees
+        # SPOCK conviction check — use current master_signal (just computed above)
+        # Fall back to previous cycle if master hasn't been written yet (cycle 1)
         _spock = state.get("master_signal", {})
         _spock_action    = _spock.get("action", "HOLD")
         _spock_conv      = _spock.get("conviction", 0) or 0
-        _spock_ok_buy    = _spock_conv >= 55 and "BUY"  in _spock_action
-        _spock_ok_sell   = _spock_conv >= 55 and "SELL" in _spock_action
+        # On first cycle, master_signal has conviction=0 — use score as proxy
+        _spock_score     = _spock.get("score", 0) or 0
+        if _spock_conv == 0 and abs(_spock_score) >= 15:
+            _spock_conv = 40  # bootstrap: strong score = treat as ok
+        _spock_ok_buy    = (_spock_conv >= 35 or _spock_score >= 20) and "BUY"  in _spock_action
+        _spock_ok_sell   = (_spock_conv >= 35 or _spock_score <= -20) and "SELL" in _spock_action
 
         # Signal coherence — check last alert direction to prevent BUY+SELL flip
         _last_sell_time = _last_wa_send.get("signal_SELL")
