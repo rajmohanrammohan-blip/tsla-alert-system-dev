@@ -6621,12 +6621,18 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
         votes["bear"] += 1
     else:
         votes["neutral"] += 1
+    # pain_pull = (max_pain - price) / price * 100
+    # Positive = price BELOW max pain → magnetic pull UP (bullish)
+    # Negative = price ABOVE max pain → price extended above pin (momentum, but slight pull back)
     if pain_pull > 3:
-        score += 8; reasons.append(f"Max Pain ${max_pain:.0f} is {pain_pull:.1f}% above — magnetic pull UP")
+        score += 8; reasons.append(f"Price ${price:.0f} below Max Pain ${max_pain:.0f} — magnetic pull UP")
         votes["bull"] += 1
+    elif pain_pull < -5:
+        # Price significantly above max pain — momentum overshoot, mild caution
+        score -= 4; reasons.append(f"Price {abs(pain_pull):.1f}% above Max Pain ${max_pain:.0f} — extended")
+        votes["neutral"] += 1  # neutral not bear — just extended
     elif pain_pull < -3:
-        score -= 8; reasons.append(f"Max Pain ${max_pain:.0f} is {abs(pain_pull):.1f}% below — pull DOWN")
-        votes["bear"] += 1
+        votes["neutral"] += 1  # slightly above max pain — fine, no penalty
 
     # 4. DarthVader institutional intelligence
     dv_state = dv_result.get("tsla_state", {}).get("state", "") if dv_result else ""
@@ -6635,13 +6641,24 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
     if "CAPITULATION_BOUNCE" in dv_state and dv_conf > 0.5:
         score += 20; reasons.append(f"DarthVader: CAPITULATION BOUNCE ({dv_conf:.0%} conf)")
         votes["bull"] += 1
+    elif "TREND_EXPANSION" in dv_state:
+        pts = 20 if dv_conf >= 0.8 else 12
+        score += pts; reasons.append(f"DarthVader: TREND_EXPANSION ({dv_conf:.0%} conf) — ride the trend")
+        votes["bull"] += 1
     elif "ACCUMULATION" in dv_state:
         score += 15; votes["bull"] += 1
+        reasons.append(f"DarthVader: ACCUMULATION ({dv_conf:.0%} conf)")
+    elif "DEALER_GAMMA_PIN" in dv_state:
+        score += 5; votes["neutral"] += 1   # pinned = sideways but not bearish
+        reasons.append("DarthVader: GAMMA PIN — range-bound, sell options")
     elif "LIQUIDITY_VACUUM" in dv_state and dv_risk == "DEFENSIVE":
         score -= 15; reasons.append("DarthVader: DEFENSIVE — institutional caution")
         votes["bear"] += 1
-    elif "DISTRIBUTION" in dv_state or "MEAN_REVERSION" in dv_state:
-        score -= 10; votes["bear"] += 1
+    elif "DISTRIBUTION" in dv_state:
+        score -= 12; reasons.append(f"DarthVader: DISTRIBUTION — smart money selling")
+        votes["bear"] += 1
+    elif "MEAN_REVERSION" in dv_state:
+        score -= 8; votes["bear"] += 1
     else:
         votes["neutral"] += 1
 
