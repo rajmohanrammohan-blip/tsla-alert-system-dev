@@ -3049,6 +3049,200 @@ NEWS_KEYWORDS = {
 }
 
 
+
+def fetch_trump_monitor():
+    """
+    Monitor Trump Truth Social posts for market-moving keywords.
+    Uses multiple public RSS/scraper sources.
+    Correlates with recent volume spikes.
+    Returns dict with latest post, keywords, market impact score.
+    """
+    import time as _t
+    _cache = getattr(fetch_trump_monitor, '_cache', None)
+    _cache_ts = getattr(fetch_trump_monitor, '_cache_ts', 0)
+    # Cache for 2 minutes — posts don't come that fast
+    if _cache and (_t.time() - _cache_ts) < 120:
+        return _cache
+
+    result = {
+        "latest_post":      None,
+        "latest_post_time": None,
+        "post_age_mins":    999,
+        "recent_post_mins": 999,
+        "keywords_hit":     [],
+        "market_keywords":  [],
+        "impact_score":     0,
+        "signal":           "NEUTRAL",
+        "posts":            [],
+        "source":           None,
+        "error":            None,
+    }
+
+    # Market-moving keyword categories
+    BULLISH_KEYWORDS = [
+        "tariff", "deal", "trade deal", "china deal", "agreement",
+        "tax cut", "deregulation", "manufacturing", "jobs", "economy great",
+        "stock market", "dow", "nasdaq", "great deal", "winning",
+        "tesla", "elon", "spacex", "america first", "no tariff",
+        "exemption", "pause tariff",
+    ]
+    BEARISH_KEYWORDS = [
+        "tariff", "sanction", "war", "china bad", "trade war",
+        "inflation", "fed", "interest rate", "crash", "disaster",
+        "recession", "boycott", "ban", "enemy", "attack", "threat",
+        "impose tariff", "new tariff", "higher tariff",
+    ]
+    # Context matters — same word can be bull/bear
+    STRONG_MARKET_WORDS = [
+        "tariff", "trade", "china", "economy", "market", "stock",
+        "rate", "fed", "deal", "sanction", "tax",
+    ]
+
+    try:
+        import requests as _rq
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/rss+xml, application/xml, text/xml, */*",
+        }
+
+        # Source 1: Truth Social RSS (via third-party aggregators)
+        rss_sources = [
+            ("TruthSocial-RSS", "https://truthsocial.com/@realDonaldTrump.rss"),
+            ("TruthSocial-Alt",  "https://www.truthsocial.com/@realDonaldTrump.rss"),
+        ]
+
+        posts = []
+        for src_name, url in rss_sources:
+            try:
+                resp = _rq.get(url, headers=headers, timeout=8)
+                if resp.status_code == 200:
+                    import xml.etree.ElementTree as _ET
+                    root = _ET.fromstring(resp.text)
+                    ns = {"atom": "http://www.w3.org/2005/Atom"}
+                    # Try Atom format first
+                    entries = root.findall(".//atom:entry", ns) or root.findall(".//item")
+                    for entry in entries[:10]:
+                        title = (entry.findtext("atom:title", namespaces=ns) or
+                                 entry.findtext("title") or "")
+                        content_el = (entry.find("atom:content", ns) or
+                                      entry.find("description"))
+                        body = content_el.text if content_el is not None else title
+                        # Strip HTML tags
+                        import re as _re
+                        body_clean = _re.sub(r'<[^>]+>', ' ', body or '').strip()
+
+                        pub_date = (entry.findtext("atom:published", namespaces=ns) or
+                                    entry.findtext("pubDate") or "")
+                        posts.append({
+                            "title": title[:200],
+                            "body":  body_clean[:500],
+                            "date":  pub_date,
+                            "source": src_name,
+                        })
+                    if posts:
+                        result["source"] = src_name
+                        break
+            except Exception as _se:
+                continue
+
+        if not posts:
+            # Fallback: scrape via public proxy / news aggregators that track Truth Social
+            fallback_urls = [
+                "https://rss.app/feeds/trump-truth-social.xml",
+                "https://api.rss2json.com/v1/api.json?rss_url=https://truthsocial.com/@realDonaldTrump.rss",
+            ]
+            for url in fallback_urls:
+                try:
+                    resp = _rq.get(url, headers=headers, timeout=8)
+                    if resp.status_code == 200:
+                        data = resp.json() if 'json' in url else None
+                        if data and data.get("items"):
+                            for item in data["items"][:10]:
+                                posts.append({
+                                    "title": item.get("title", "")[:200],
+                                    "body":  item.get("description", item.get("content",""))[:500],
+                                    "date":  item.get("pubDate", ""),
+                                    "source": "rss2json",
+                                })
+                            result["source"] = "rss2json"
+                            break
+                except Exception:
+                    continue
+
+        if not posts:
+            result["error"] = "No sources available"
+            fetch_trump_monitor._cache = result
+            fetch_trump_monitor._cache_ts = _t.time()
+            return result
+
+        # Parse most recent post
+        import re as _re
+        from datetime import datetime as _dt, timezone as _tz
+        import email.utils as _eu
+
+        def _parse_date(date_str):
+            if not date_str:
+                return None
+            try:
+                # RFC 2822 (RSS)
+                return _dt(*_eu.parsedate(date_str)[:6], tzinfo=_tz.utc)
+            except Exception:
+                pass
+            try:
+                # ISO 8601
+                return _dt.fromisoformat(date_str.replace("Z", "+00:00"))
+            except Exception:
+                return None
+
+        latest = posts[0]
+        latest_dt = _parse_date(latest.get("date"))
+        now_utc = _dt.now(_tz.utc)
+        age_mins = int((now_utc - latest_dt).total_seconds() / 60) if latest_dt else 999
+
+        # Keyword analysis
+        full_text = (latest["title"] + " " + latest["body"]).lower()
+        bull_hits = [kw for kw in BULLISH_KEYWORDS if kw in full_text]
+        bear_hits = [kw for kw in BEARISH_KEYWORDS if kw in full_text]
+        market_hits = [kw for kw in STRONG_MARKET_WORDS if kw in full_text]
+
+        # Impact score: recent + market keywords = higher
+        recency_mult = 3.0 if age_mins < 5 else 2.0 if age_mins < 15 else 1.5 if age_mins < 30 else 1.0 if age_mins < 60 else 0.3
+        bull_score = len(bull_hits) * 10 * recency_mult
+        bear_score = len(bear_hits) * 10 * recency_mult
+        market_score = len(market_hits) * 5 * recency_mult
+        net_score = bull_score - bear_score
+
+        if net_score > 15:
+            signal = "BULLISH"
+        elif net_score < -15:
+            signal = "BEARISH"
+        elif market_score > 10:
+            signal = "MARKET_MOVING"  # has market keywords but unclear direction
+        else:
+            signal = "NEUTRAL"
+
+        result.update({
+            "latest_post":      latest["body"][:300],
+            "latest_post_time": latest.get("date"),
+            "post_age_mins":    age_mins,
+            "recent_post_mins": age_mins,
+            "keywords_hit":     list(set(bull_hits + bear_hits)),
+            "market_keywords":  market_hits,
+            "impact_score":     round(net_score, 1),
+            "market_impact":    round(market_score, 1),
+            "signal":           signal,
+            "posts":            posts[:5],
+            "bull_keywords":    bull_hits,
+            "bear_keywords":    bear_hits,
+        })
+
+    except Exception as e:
+        result["error"] = str(e)[:100]
+
+    fetch_trump_monitor._cache = result
+    fetch_trump_monitor._cache_ts = _t.time()
+    return result
+
 def fetch_stocktwits_sentiment(ticker="TSLA"):
     """
     Fetch StockTwits bull/bear ratio — free API, no key needed.
@@ -5126,6 +5320,51 @@ def calculate_vwap_bands(closes, highs, lows, volumes):
     return result
 
 
+def calculate_donchian(highs, lows, closes, period=20):
+    """
+    Donchian Channel: period-bar highest high / lowest low.
+    Returns dict with upper, lower, mid, width, position (0-1), signal.
+    """
+    try:
+        if len(highs) < period:
+            return {}
+        upper  = float(highs.iloc[-period:].max())
+        lower  = float(lows.iloc[-period:].min())
+        mid    = (upper + lower) / 2
+        width  = round((upper - lower) / mid * 100, 2) if mid else 0
+        price  = float(closes.iloc[-1])
+        pos    = round((price - lower) / (upper - lower), 3) if (upper - lower) > 0 else 0.5
+        # Signal: near upper = overbought/resistance, near lower = oversold/support
+        if pos >= 0.90:
+            signal = "UPPER_BAND"   # price at/near 20-bar high — potential resistance
+        elif pos <= 0.10:
+            signal = "LOWER_BAND"   # price at/near 20-bar low — potential support
+        elif pos >= 0.60:
+            signal = "UPPER_HALF"
+        else:
+            signal = "LOWER_HALF"
+
+        # Breakout: today's close exceeds yesterday's upper/lower
+        prev_upper = float(highs.iloc[-period-1:-1].max()) if len(highs) > period else upper
+        prev_lower = float(lows.iloc[-period-1:-1].min())  if len(lows)  > period else lower
+        breakout_up   = price > prev_upper
+        breakout_down = price < prev_lower
+
+        return {
+            "upper":         round(upper, 2),
+            "lower":         round(lower, 2),
+            "mid":           round(mid,   2),
+            "width_pct":     width,
+            "position":      pos,
+            "signal":        signal,
+            "breakout_up":   breakout_up,
+            "breakout_down": breakout_down,
+            "period":        period,
+        }
+    except Exception:
+        return {}
+
+
 def calculate_vwap_bands_daily(closes, highs, lows, volumes):
     """Same but filters to today's bars only before computing."""
     from datetime import date as _d
@@ -6851,6 +7090,42 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                     if _st.get("contrarian_signal"):
                         print(f"  ⚡ Contrarian: {_st['contrarian_signal']}", flush=True)
                 except Exception: pass
+
+                # Trump / Truth Social monitor
+                try:
+                    _trump = fetch_trump_monitor()
+                    state["trump_monitor"] = _trump
+                    _trump_age  = _trump.get("post_age_mins", 999)
+                    _trump_sig  = _trump.get("signal", "NEUTRAL")
+                    _trump_kws  = _trump.get("keywords_hit", [])
+                    _trump_imp  = _trump.get("impact_score", 0)
+                    if _trump_age < 60:
+                        print(f"  🇺🇸 Trump post {_trump_age}min ago | Signal:{_trump_sig} | "
+                              f"Score:{_trump_imp:+.0f} | Keywords:{_trump_kws[:3]}", flush=True)
+                        # Volume correlation check
+                        _vh = state.get("vol_hawk", {})
+                        _vol_rat = _vh.get("ratio", 1.0)
+                        if _trump_age < 30 and _vol_rat >= 1.5:
+                            print(f"  🔥 TRUMP-VOLUME CORRELATION: Post {_trump_age}min ago + "
+                                  f"volume {_vol_rat:.1f}x avg — potential catalyst!", flush=True)
+                            _nl = "\n"
+                            _corr_msg = (
+                                f"🇺🇸🔥 {TICKER} *TRUMP-VOLUME SPIKE*{_nl}"
+                                f"━━━━━━━━━━━━━━━━━━━━━━{_nl}"
+                                f"⏱️ Trump posted *{_trump_age}min ago*{_nl}"
+                                f"📊 Volume: *{_vol_rat:.1f}x* average{_nl}"
+                                f"💰 Price: *${price}*{_nl}"
+                                f"🔑 Keywords: {', '.join(_trump_kws[:4]) or 'none'}{_nl}"
+                                f"📢 Signal: *{_trump_sig}* (score: {_trump_imp:+.0f}){_nl}"
+                                f"📝 Post: {_trump.get('latest_post','')[:120]}..."
+                            )
+                            log_alert(_corr_msg, alert_key="trump_volume")
+                    else:
+                        print(f"  🇺🇸 Trump: last post {_trump_age}min ago | {_trump_sig}", flush=True)
+                except Exception as _te:
+                    print(f"  ⚠️ Trump monitor error: {_te}", flush=True)
+                    state["trump_monitor"] = {"error": str(_te)[:60]}
+
                 state["news_data"] = news_data
             except Exception as _e:
                 print(f"  ⚠️ News error: {_e}")
@@ -7166,6 +7441,68 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                   f"Dist:{_vb.get('vwap_dist_pct',0):+.2f}% | "
                   f"Anchored:${_vb.get('anchored_vwap','?')} "
                   f"({'above' if _vb.get('anchored_above') else 'below'})", flush=True)
+
+            # ── Donchian Channel ──
+            try:
+                donchian = calculate_donchian(highs, lows, closes, period=20)
+                state["donchian"] = donchian
+                if donchian:
+                    _dc_sig = donchian.get("signal", "")
+                    _dc_pos = donchian.get("position", 0.5)
+                    print(f"  📐 Donchian(20): Upper=${donchian.get('upper','?')} "
+                          f"Mid=${donchian.get('mid','?')} Lower=${donchian.get('lower','?')} "
+                          f"| Pos:{_dc_pos:.0%} | {_dc_sig}"
+                          f"{' 🚀BREAKOUT' if donchian.get('breakout_up') else ' 💥BREAK_DOWN' if donchian.get('breakout_down') else ''}",
+                          flush=True)
+            except Exception as _dc_err:
+                state["donchian"] = {}
+
+            # ── Volume Hawk — multi-tier spike detection ──
+            try:
+                _vol_now   = float(volumes.iloc[-1])
+                _vol_ma20  = float(volumes.iloc[-20:].mean())
+                _vol_ma5   = float(volumes.iloc[-5:].mean())
+                _vol_ratio = _vol_now / (_vol_ma20 + 1e-9)
+                _vol_ratio5 = _vol_ma5 / (_vol_ma20 + 1e-9)
+                _vol_trend  = "SURGING" if _vol_ratio5 > 1.5 else "FADING" if _vol_ratio5 < 0.7 else "NORMAL"
+                # 5-day volume context
+                _vol_5d_avg = float(volumes.iloc[-5*78:].mean()) if len(volumes) > 5*78 else _vol_ma20
+                _vol_percentile = round(sum(1 for v in volumes.iloc[-20:] if v <= _vol_now) / 20 * 100)
+                _vol_hawk = {
+                    "current":      round(_vol_now),
+                    "ma20":         round(_vol_ma20),
+                    "ma5":          round(_vol_ma5),
+                    "ratio":        round(_vol_ratio, 2),
+                    "ratio5":       round(_vol_ratio5, 2),
+                    "trend":        _vol_trend,
+                    "percentile":   _vol_percentile,
+                    "spike":        _vol_ratio >= 3.0,
+                    "elevated":     _vol_ratio >= 1.5,
+                    "dry":          _vol_ratio <= 0.5,
+                    "alert_level":  "EXTREME" if _vol_ratio >= 4.0 else "HIGH" if _vol_ratio >= 2.5 else "ELEVATED" if _vol_ratio >= 1.5 else "NORMAL",
+                }
+                state["vol_hawk"] = _vol_hawk
+                _vh_emoji = "🔥" if _vol_ratio >= 3.0 else "📈" if _vol_ratio >= 1.5 else "📉" if _vol_ratio <= 0.5 else "📊"
+                print(f"  {_vh_emoji} Volume Hawk: {_vol_ratio:.1f}x avg | "
+                      f"Trend:{_vol_trend} | Percentile:{_vol_percentile}th | "
+                      f"Alert:{_vol_hawk['alert_level']}", flush=True)
+                # Extreme volume spike alert
+                if _vol_ratio >= 3.0:
+                    _trump_ctx = state.get("trump_monitor", {})
+                    _trump_recent = _trump_ctx.get("recent_post_mins", 999)
+                    _trump_note = f" ⚠️ TRUMP POST {_trump_recent}min ago" if _trump_recent < 30 else ""
+                    _nl2 = "\n"
+                    log_alert(
+                        f"🔥 {TICKER} *VOLUME SPIKE*{_trump_note}{_nl2}"
+                        f"━━━━━━━━━━━━━━━━━━━━━━{_nl2}"
+                        f"Volume: *{_vol_ratio:.1f}x* average (20-bar){_nl2}"
+                        f"💰 Price: *${price}* | {_vol_hawk['alert_level']}{_nl2}"
+                        f"📊 Trend: {_vol_trend} | {_vol_percentile}th percentile",
+                        alert_key="vol_spike"
+                    )
+            except Exception as _vh_err:
+                state["vol_hawk"] = {}
+
         except Exception as _vwap_err:
             state["vwap_bands"] = {}
 
@@ -11948,6 +12285,37 @@ body {
         <div class="data-row"><span class="data-row-label">TSLA 4h Trend</span><span class="data-row-val" id="tsla-4h-trend">—</span></div>
         <div class="data-row"><span class="data-row-label">Daily Pattern</span><span class="data-row-val" id="swing-pattern">—</span></div>
       </div>
+      <div class="data-card">
+        <h3>🏹 Donchian Channel (20)</h3>
+        <div class="data-row"><span class="data-row-label">Upper Band</span><span class="data-row-val" id="dc-upper">—</span></div>
+        <div class="data-row"><span class="data-row-label">Midline</span><span class="data-row-val" id="dc-mid">—</span></div>
+        <div class="data-row"><span class="data-row-label">Lower Band</span><span class="data-row-val" id="dc-lower">—</span></div>
+        <div class="data-row"><span class="data-row-label">Position</span><span class="data-row-val" id="dc-pos">—</span></div>
+        <div class="data-row"><span class="data-row-label">Signal</span><span class="data-row-val" id="dc-signal">—</span></div>
+        <div class="data-row"><span class="data-row-label">Width</span><span class="data-row-val" id="dc-width">—</span></div>
+        <div class="data-row"><span class="data-row-label">Breakout</span><span class="data-row-val" id="dc-breakout">—</span></div>
+      </div>
+      <div class="data-card">
+        <h3>🦅 Volume Hawk</h3>
+        <div class="data-row"><span class="data-row-label">Current Vol</span><span class="data-row-val" id="vh-current">—</span></div>
+        <div class="data-row"><span class="data-row-label">vs 20-bar Avg</span><span class="data-row-val" id="vh-ratio">—</span></div>
+        <div class="data-row"><span class="data-row-label">5-bar Trend</span><span class="data-row-val" id="vh-trend">—</span></div>
+        <div class="data-row"><span class="data-row-label">Percentile</span><span class="data-row-val" id="vh-pct">—</span></div>
+        <div class="data-row"><span class="data-row-label">Alert Level</span><span class="data-row-val" id="vh-alert">—</span></div>
+      </div>
+      <div class="data-card" style="grid-column:1/-1">
+        <h3>🇺🇸 Trump Monitor</h3>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:12px;margin-bottom:10px;">
+          <div><div style="font-size:10px;color:var(--dim);">POST AGE</div><div class="data-row-val" id="trump-age">—</div></div>
+          <div><div style="font-size:10px;color:var(--dim);">SIGNAL</div><div class="data-row-val" id="trump-signal">—</div></div>
+          <div><div style="font-size:10px;color:var(--dim);">IMPACT SCORE</div><div class="data-row-val" id="trump-score">—</div></div>
+          <div><div style="font-size:10px;color:var(--dim);">VOL CORRELATION</div><div class="data-row-val" id="trump-volcorr">—</div></div>
+        </div>
+        <div style="font-size:10px;color:var(--dim);margin-bottom:4px;">KEYWORDS</div>
+        <div id="trump-keywords" style="font-size:11px;color:var(--accent);margin-bottom:8px;">—</div>
+        <div style="font-size:10px;color:var(--dim);margin-bottom:4px;">LATEST POST</div>
+        <div id="trump-post" style="font-size:11px;color:var(--text);line-height:1.5;max-height:60px;overflow:hidden;">—</div>
+      </div>
     </div>
 
     <!-- ALERTS TAB -->
@@ -12035,7 +12403,7 @@ function updateUI(s) {
   try {
     _updateUI_inner(s);
   } catch(e) {
-    console.error('[SPOCK] updateUI crash at:', e.message, '\nStack:', e.stack);
+    console.error('[SPOCK] crash:', e.message, e.stack);
     // Emergency render — show at least the SPOCK decision even if tabs fail
     try {
       var ms = s.master_signal || {};
@@ -12342,6 +12710,57 @@ function _updateUI_inner(s) {
   var sw = s.swing_context || {};
   setText('swing-pattern', sw.daily_pattern || 'None',
     sw.pattern_signal === 'BUY' ? 'bull' : sw.pattern_signal === 'SELL' ? 'bear' : '');
+
+  // Donchian Channel
+  var dc = s.donchian || {};
+  setText('dc-upper',  dc.upper ? '$' + dc.upper : '—');
+  setText('dc-mid',    dc.mid   ? '$' + dc.mid   : '—');
+  setText('dc-lower',  dc.lower ? '$' + dc.lower : '—');
+  setText('dc-pos',    dc.position != null ? Math.round(dc.position*100) + '% of range' : '—',
+    dc.position >= 0.9 ? 'extreme' : dc.position <= 0.1 ? 'bull' : '');
+  setText('dc-signal', dc.signal || '—',
+    dc.signal === 'UPPER_BAND' ? 'extreme' : dc.signal === 'LOWER_BAND' ? 'bull' : '');
+  setText('dc-width',  dc.width_pct != null ? dc.width_pct + '% range' : '—');
+  var dcBk = dc.breakout_up ? '🚀 BREAKOUT UP' : dc.breakout_down ? '💥 BREAK DOWN' : 'None';
+  setText('dc-breakout', dcBk, dc.breakout_up ? 'bull' : dc.breakout_down ? 'bear' : '');
+
+  // Volume Hawk
+  var vh = s.vol_hawk || {};
+  var vhRatio = vh.ratio || 0;
+  setText('vh-current', vh.current ? (vh.current/1000).toFixed(0) + 'K' : '—');
+  setText('vh-ratio',   vhRatio ? vhRatio.toFixed(2) + 'x avg' : '—',
+    vhRatio >= 3 ? 'extreme' : vhRatio >= 1.5 ? 'bull' : vhRatio <= 0.5 ? 'bear' : '');
+  setText('vh-trend',   vh.trend || '—',
+    vh.trend === 'SURGING' ? 'bull' : vh.trend === 'FADING' ? 'bear' : '');
+  setText('vh-pct',     vh.percentile != null ? vh.percentile + 'th' : '—',
+    vh.percentile >= 90 ? 'extreme' : vh.percentile >= 70 ? 'warn' : '');
+  setText('vh-alert',   vh.alert_level || '—',
+    vh.alert_level === 'EXTREME' ? 'extreme' : vh.alert_level === 'HIGH' ? 'warn' : vh.alert_level === 'ELEVATED' ? 'bull' : '');
+
+  // Trump Monitor
+  var tm = s.trump_monitor || {};
+  var tmAge = tm.post_age_mins;
+  var tmAgeStr = tmAge != null ? (tmAge < 60 ? tmAge + 'min ago' : Math.round(tmAge/60) + 'h ago') : '—';
+  var tmAgeClass = tmAge != null && tmAge < 15 ? 'extreme' : tmAge != null && tmAge < 60 ? 'warn' : '';
+  setText('trump-age', tmAgeStr, tmAgeClass);
+  var tmSig = tm.signal || '—';
+  setText('trump-signal', tmSig,
+    tmSig.indexOf('BULL') >= 0 ? 'bull' : tmSig.indexOf('BEAR') >= 0 ? 'bear' : tmSig === 'MARKET_MOVING' ? 'warn' : '');
+  setText('trump-score', tm.impact_score != null ? (tm.impact_score >= 0 ? '+' : '') + tm.impact_score : '—',
+    tm.impact_score > 0 ? 'bull' : tm.impact_score < 0 ? 'bear' : '');
+  // Volume correlation
+  var tmVolCorr = '—';
+  if (tmAge != null && tmAge < 30 && vhRatio >= 1.5) {
+    tmVolCorr = '🔥 YES — ' + vhRatio.toFixed(1) + 'x vol';
+  } else if (tmAge != null && tmAge < 60) {
+    tmVolCorr = vhRatio >= 1.2 ? 'Possible' : 'No';
+  }
+  setText('trump-volcorr', tmVolCorr, tmVolCorr.indexOf('YES') >= 0 ? 'extreme' : '');
+  var tmKws = tm.keywords_hit || [];
+  var tmKwEl = document.getElementById('trump-keywords');
+  if (tmKwEl) tmKwEl.textContent = tmKws.length ? tmKws.slice(0,6).join(', ') : 'none';
+  var tmPostEl = document.getElementById('trump-post');
+  if (tmPostEl) tmPostEl.textContent = tm.latest_post || (tm.error ? 'Error: ' + tm.error : 'No recent posts');
 
   // Alerts tab
   var alerts = s.alerts_log || [];
