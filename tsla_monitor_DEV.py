@@ -3276,23 +3276,24 @@ NEWS_KEYWORDS = {
 
 def fetch_trump_monitor():
     """
-    Monitor Trump Truth Social posts for market-moving keywords.
-    Uses multiple public RSS/scraper sources.
-    Correlates with recent volume spikes.
-    Returns dict with latest post, keywords, market impact score.
+    Monitor Trump Truth Social / X posts for market-moving keywords.
+    Sources (in priority order):
+      1. feedparser on Truth Social RSS (no auth required)
+      2. News API keyword search for Trump market posts
+      3. Existing news feed fallback
+    Caches 2 minutes — Trump doesn't post that fast.
     """
     import time as _t
     _cache = getattr(fetch_trump_monitor, '_cache', None)
     _cache_ts = getattr(fetch_trump_monitor, '_cache_ts', 0)
-    # Cache for 2 minutes — posts don't come that fast
     if _cache and (_t.time() - _cache_ts) < 120:
         return _cache
 
     result = {
         "latest_post":      None,
         "latest_post_time": None,
-        "post_age_mins":    999,
-        "recent_post_mins": 999,
+        "post_age_mins":    None,   # None = unknown, not 999
+        "recent_post_mins": None,
         "keywords_hit":     [],
         "market_keywords":  [],
         "impact_score":     0,
@@ -3302,170 +3303,168 @@ def fetch_trump_monitor():
         "error":            None,
     }
 
-    # Market-moving keyword categories
-    BULLISH_KEYWORDS = [
-        "tariff", "deal", "trade deal", "china deal", "agreement",
-        "tax cut", "deregulation", "manufacturing", "jobs", "economy great",
-        "stock market", "dow", "nasdaq", "great deal", "winning",
-        "tesla", "elon", "spacex", "america first", "no tariff",
-        "exemption", "pause tariff",
+    BULLISH_KW = [
+        "deal", "trade deal", "agreement", "exemption", "pause tariff",
+        "no tariff", "tax cut", "deregulation", "great economy",
+        "tesla", "elon", "spacex", "winning", "great deal",
     ]
-    BEARISH_KEYWORDS = [
-        "tariff", "sanction", "war", "china bad", "trade war",
-        "inflation", "fed", "interest rate", "crash", "disaster",
-        "recession", "boycott", "ban", "enemy", "attack", "threat",
-        "impose tariff", "new tariff", "higher tariff",
+    BEARISH_KW = [
+        "impose tariff", "new tariff", "higher tariff", "sanction",
+        "trade war", "china bad", "boycott", "ban", "attack",
+        "investigation", "crisis", "disaster", "recession",
     ]
-    # Context matters — same word can be bull/bear
-    STRONG_MARKET_WORDS = [
+    MARKET_KW = [
         "tariff", "trade", "china", "economy", "market", "stock",
-        "rate", "fed", "deal", "sanction", "tax",
+        "rate", "fed", "deal", "sanction", "tax", "tesla", "elon",
     ]
+
+    import re as _re
+    from datetime import datetime as _dt, timezone as _tz
+    import email.utils as _eu
+
+    def _parse_date(s):
+        if not s: return None
+        for fmt in ("%a, %d %b %Y %H:%M:%S %z", "%Y-%m-%dT%H:%M:%S%z",
+                    "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S"):
+            try: return _dt.strptime(s.strip(), fmt).replace(tzinfo=_tz.utc)
+            except: pass
+        try:
+            return _dt(*_eu.parsedate(s)[:6], tzinfo=_tz.utc)
+        except: pass
+        try:
+            return _dt.fromisoformat(s.replace("Z", "+00:00"))
+        except: return None
+
+    def _score_text(text):
+        t = text.lower()
+        b = [k for k in BULLISH_KW if k in t]
+        br = [k for k in BEARISH_KW if k in t]
+        mk = [k for k in MARKET_KW  if k in t]
+        net = (len(b) - len(br)) * 20
+        sig = "BULLISH" if net > 15 else "BEARISH" if net < -15 else               "MARKET_MOVING" if mk else "NEUTRAL"
+        return b, br, mk, net, sig
 
     try:
         import requests as _rq
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/rss+xml, application/xml, text/xml, */*",
+        _hdr = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/rss+xml,application/xml,text/xml,*/*",
         }
 
-        # Source 1: Truth Social RSS (via third-party aggregators)
-        rss_sources = [
-            ("TruthSocial-RSS", "https://truthsocial.com/@realDonaldTrump.rss"),
-            ("TruthSocial-Alt",  "https://www.truthsocial.com/@realDonaldTrump.rss"),
-        ]
-
         posts = []
-        for src_name, url in rss_sources:
+
+        # ── Source 1: feedparser on Truth Social RSS ───────────────────────
+        try:
+            import feedparser as _fp
+            _feed = _fp.parse(
+                "https://truthsocial.com/@realDonaldTrump.rss",
+                request_headers=_hdr,
+                response_headers={"Cache-Control": "no-cache"},
+            )
+            if _feed.entries:
+                for e in _feed.entries[:10]:
+                    _body = _re.sub(r"<[^>]+>", " ", e.get("summary", e.get("title", ""))).strip()
+                    posts.append({
+                        "body":   _body[:500],
+                        "date":   e.get("published", ""),
+                        "source": "truthsocial_feedparser",
+                    })
+                result["source"] = "truthsocial_feedparser"
+        except Exception as _fe:
+            pass  # feedparser not installed or blocked — try next
+
+        # ── Source 2: rss2json proxy (avoids Cloudflare) ──────────────────
+        if not posts:
             try:
-                resp = _rq.get(url, headers=headers, timeout=8)
-                if resp.status_code == 200:
+                _r2j = _rq.get(
+                    "https://api.rss2json.com/v1/api.json"
+                    "?rss_url=https%3A%2F%2Ftruthsocial.com%2F%40realDonaldTrump.rss",
+                    headers=_hdr, timeout=8
+                )
+                if _r2j.status_code == 200:
+                    _rdata = _r2j.json()
+                    if _rdata.get("status") == "ok" and _rdata.get("items"):
+                        for item in _rdata["items"][:10]:
+                            _body = _re.sub(r"<[^>]+>", " ",
+                                           item.get("description", item.get("content", ""))).strip()
+                            posts.append({
+                                "body":   _body[:500],
+                                "date":   item.get("pubDate", ""),
+                                "source": "rss2json",
+                            })
+                        result["source"] = "rss2json"
+            except Exception:
+                pass
+
+        # ── Source 3: News search for Trump market posts ───────────────────
+        # Fallback: scan existing news articles for Trump market-moving posts
+        if not posts:
+            try:
+                _yt_url = "https://news.google.com/rss/search?q=Trump+tariff+market+OR+Tesla+OR+China&hl=en-US&gl=US&ceid=US:en"
+                _gr = _rq.get(_yt_url, headers=_hdr, timeout=8)
+                if _gr.status_code == 200:
                     import xml.etree.ElementTree as _ET
-                    root = _ET.fromstring(resp.text)
-                    ns = {"atom": "http://www.w3.org/2005/Atom"}
-                    # Try Atom format first
-                    entries = root.findall(".//atom:entry", ns) or root.findall(".//item")
-                    for entry in entries[:10]:
-                        title = (entry.findtext("atom:title", namespaces=ns) or
-                                 entry.findtext("title") or "")
-                        content_el = (entry.find("atom:content", ns) or
-                                      entry.find("description"))
-                        body = content_el.text if content_el is not None else title
-                        # Strip HTML tags
-                        import re as _re
-                        body_clean = _re.sub(r'<[^>]+>', ' ', body or '').strip()
-
-                        pub_date = (entry.findtext("atom:published", namespaces=ns) or
-                                    entry.findtext("pubDate") or "")
-                        posts.append({
-                            "title": title[:200],
-                            "body":  body_clean[:500],
-                            "date":  pub_date,
-                            "source": src_name,
-                        })
+                    _root = _ET.fromstring(_gr.text)
+                    for item in _root.findall(".//item")[:10]:
+                        _title = item.findtext("title", "")
+                        _desc  = item.findtext("description", "")
+                        _date  = item.findtext("pubDate", "")
+                        _body  = _re.sub(r"<[^>]+>", " ", _title + " " + _desc).strip()
+                        if any(kw in _body.lower() for kw in ["trump", "tariff", "trade"]):
+                            posts.append({
+                                "body":   _body[:500],
+                                "date":   _date,
+                                "source": "google_news",
+                            })
                     if posts:
-                        result["source"] = src_name
-                        break
-            except Exception as _se:
-                continue
+                        result["source"] = "google_news"
+            except Exception:
+                pass
 
         if not posts:
-            # Fallback: scrape via public proxy / news aggregators that track Truth Social
-            fallback_urls = [
-                "https://rss.app/feeds/trump-truth-social.xml",
-                "https://api.rss2json.com/v1/api.json?rss_url=https://truthsocial.com/@realDonaldTrump.rss",
-            ]
-            for url in fallback_urls:
-                try:
-                    resp = _rq.get(url, headers=headers, timeout=8)
-                    if resp.status_code == 200:
-                        data = resp.json() if 'json' in url else None
-                        if data and data.get("items"):
-                            for item in data["items"][:10]:
-                                posts.append({
-                                    "title": item.get("title", "")[:200],
-                                    "body":  item.get("description", item.get("content",""))[:500],
-                                    "date":  item.get("pubDate", ""),
-                                    "source": "rss2json",
-                                })
-                            result["source"] = "rss2json"
-                            break
-                except Exception:
-                    continue
-
-        if not posts:
-            result["error"] = "No sources available"
+            result["error"] = "All sources failed"
+            result["signal"] = "UNAVAILABLE"
             fetch_trump_monitor._cache = result
             fetch_trump_monitor._cache_ts = _t.time()
             return result
 
         # Parse most recent post
-        import re as _re
-        from datetime import datetime as _dt, timezone as _tz
-        import email.utils as _eu
-
-        def _parse_date(date_str):
-            if not date_str:
-                return None
-            try:
-                # RFC 2822 (RSS)
-                return _dt(*_eu.parsedate(date_str)[:6], tzinfo=_tz.utc)
-            except Exception:
-                pass
-            try:
-                # ISO 8601
-                return _dt.fromisoformat(date_str.replace("Z", "+00:00"))
-            except Exception:
-                return None
-
         latest = posts[0]
         latest_dt = _parse_date(latest.get("date"))
         now_utc = _dt.now(_tz.utc)
-        age_mins = int((now_utc - latest_dt).total_seconds() / 60) if latest_dt else 999
+        age_mins = int((now_utc - latest_dt).total_seconds() / 60) if latest_dt else None
 
-        # Keyword analysis
-        full_text = (latest["title"] + " " + latest["body"]).lower()
-        bull_hits = [kw for kw in BULLISH_KEYWORDS if kw in full_text]
-        bear_hits = [kw for kw in BEARISH_KEYWORDS if kw in full_text]
-        market_hits = [kw for kw in STRONG_MARKET_WORDS if kw in full_text]
+        # Score content
+        bull, bear, mkt, net_score, signal = _score_text(latest["body"])
 
-        # Impact score: recent + market keywords = higher
-        recency_mult = 3.0 if age_mins < 5 else 2.0 if age_mins < 15 else 1.5 if age_mins < 30 else 1.0 if age_mins < 60 else 0.3
-        bull_score = len(bull_hits) * 10 * recency_mult
-        bear_score = len(bear_hits) * 10 * recency_mult
-        market_score = len(market_hits) * 5 * recency_mult
-        net_score = bull_score - bear_score
-
-        if net_score > 15:
-            signal = "BULLISH"
-        elif net_score < -15:
-            signal = "BEARISH"
-        elif market_score > 10:
-            signal = "MARKET_MOVING"  # has market keywords but unclear direction
-        else:
-            signal = "NEUTRAL"
+        # Recency multiplier
+        if age_mins is not None:
+            recency = 3.0 if age_mins < 5 else 2.0 if age_mins < 15 else                       1.5 if age_mins < 30 else 1.0 if age_mins < 60 else 0.3
+            net_score = round(net_score * recency, 1)
 
         result.update({
             "latest_post":      latest["body"][:300],
             "latest_post_time": latest.get("date"),
             "post_age_mins":    age_mins,
             "recent_post_mins": age_mins,
-            "keywords_hit":     list(set(bull_hits + bear_hits)),
-            "market_keywords":  market_hits,
-            "impact_score":     round(net_score, 1),
-            "market_impact":    round(market_score, 1),
+            "keywords_hit":     list(set(bull + bear)),
+            "market_keywords":  mkt,
+            "impact_score":     net_score,
+            "market_impact":    len(mkt) * 5,
             "signal":           signal,
             "posts":            posts[:5],
-            "bull_keywords":    bull_hits,
-            "bear_keywords":    bear_hits,
+            "bull_keywords":    bull,
+            "bear_keywords":    bear,
         })
 
     except Exception as e:
         result["error"] = str(e)[:100]
 
-    fetch_trump_monitor._cache = result
+    fetch_trump_monitor._cache    = result
     fetch_trump_monitor._cache_ts = _t.time()
     return result
+
 
 def fetch_stocktwits_sentiment(ticker="TSLA"):
     """
@@ -6035,12 +6034,15 @@ def _spock_measure_outcomes(current_price):
         action = dec["action"]
         # Outcome classifier — lower threshold, no pure NEUTRAL
         def _outcome(pnl_pct, action):
-            threshold = 0.15   # 0.15% = meaningful move (was 0.3% — too high for AH)
+            # Dead zone: weekend / no real movement — exclude from accuracy
+            threshold = 0.20  # raised slightly: only count moves that matter
+            if abs(pnl_pct) < 0.05:
+                return "NEUTRAL"   # essentially flat — don't count as WRONG or CORRECT
             if   action in ("BUY","STRONG BUY")   and pnl_pct >  threshold: return "CORRECT"
             elif action in ("SELL","STRONG SELL")  and pnl_pct < -threshold: return "CORRECT"
             elif action in ("BUY","STRONG BUY")   and pnl_pct < -threshold: return "WRONG"
             elif action in ("SELL","STRONG SELL")  and pnl_pct >  threshold: return "WRONG"
-            else: return "NEUTRAL"  # price barely moved — inconclusive
+            else: return "NEUTRAL"  # move below threshold — inconclusive
 
         # 1-hour outcome
         if elapsed_h >= 1.0 and dec["outcome_1h"] is None:
@@ -6116,8 +6118,10 @@ def _spock_update_accuracy():
 
     wr1h = _spock_accuracy["win_rate_1h"]
     wr4h = _spock_accuracy["win_rate_4h"]
-    print(f"[SPOCK-BRAIN] Accuracy: 1h={wr1h}% | 4h={wr4h}% | "
-          f"n={total} decisions", flush=True)
+    wr1h_str = f"{wr1h:.1f}%" if wr1h is not None else f"—({len(decisive_1h)} decisive)"
+    wr4h_str = f"{wr4h:.1f}%" if wr4h is not None else "—"
+    print(f"[SPOCK-BRAIN] Accuracy: 1h={wr1h_str} | 4h={wr4h_str} | "
+          f"n={total} total ({len(decisive_1h)} decisive)", flush=True)
     # Run signal weight feedback update — only on NEWLY measured decisions
     _newly_measured = [d for d in measured if not d.get("_weight_updated")]
     if _newly_measured:
@@ -13414,8 +13418,9 @@ function _updateUI_inner(s) {
   // Trump Monitor
   var tm = s.trump_monitor || {};
   var tmAge = tm.post_age_mins;
-  var tmAgeStr = tmAge != null ? (tmAge < 60 ? tmAge + 'min ago' : Math.round(tmAge/60) + 'h ago') : '—';
-  var tmAgeClass = tmAge != null && tmAge < 15 ? 'extreme' : tmAge != null && tmAge < 60 ? 'warn' : '';
+  var tmFailed = tm.signal === 'UNAVAILABLE' || tm.signal === 'FETCH_ERROR';
+  var tmAgeStr = tmFailed ? 'unavailable' : tmAge == null ? '—' : tmAge < 60 ? tmAge + 'min ago' : Math.round(tmAge/60) + 'h ago';
+  var tmAgeClass = tmFailed ? 'bear' : tmAge != null && tmAge < 15 ? 'extreme' : tmAge != null && tmAge < 60 ? 'warn' : '';
   setText('trump-age', tmAgeStr, tmAgeClass);
   var tmSig = tm.signal || '—';
   setText('trump-signal', tmSig,
