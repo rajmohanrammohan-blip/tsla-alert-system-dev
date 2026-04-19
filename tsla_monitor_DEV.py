@@ -1424,6 +1424,49 @@ def calculate_spy_analysis(tsla_closes, tsla_price):
         result["macro_signal"]  = "ERROR"
         result["macro_reasons"] = [str(e)]
 
+    # ── Cross-Asset Lead-Lag (EV sector + macro correlates) ─────────────────
+    try:
+        import yfinance as _yf_ll
+        _lead_lag = {}
+        _correlates = {
+            "LIT":  {"lag_min": 30, "direction": 1,  "desc": "Lithium ETF"},
+            "NIO":  {"lag_min": 15, "direction": 1,  "desc": "Chinese EV"},
+            "RIVN": {"lag_min": 20, "direction": 1,  "desc": "EV sector"},
+            "TLT":  {"lag_min": 45, "direction": -1, "desc": "Rates inverse"},
+        }
+        for sym, cfg in _correlates.items():
+            try:
+                _h = _yf_ll.Ticker(sym).history(period="5d", interval="30m")
+                if _h.empty or len(_h) < 4:
+                    continue
+                _c = _h["Close"]
+                _chg_1h  = round((_c.iloc[-1] / _c.iloc[-2] - 1) * 100, 2) if len(_c) >= 2 else 0
+                _chg_2h  = round((_c.iloc[-1] / _c.iloc[-4] - 1) * 100, 2) if len(_c) >= 4 else 0
+                _signal  = "BULL" if _chg_1h * cfg["direction"] > 0.3 else "BEAR" if _chg_1h * cfg["direction"] < -0.3 else "NEUTRAL"
+                _lead_lag[sym] = {
+                    "price":    round(float(_c.iloc[-1]), 2),
+                    "chg_1h":   _chg_1h,
+                    "chg_2h":   _chg_2h,
+                    "signal":   _signal,
+                    "lag_min":  cfg["lag_min"],
+                    "direction":cfg["direction"],
+                    "desc":     cfg["desc"],
+                }
+            except Exception:
+                continue
+        if _lead_lag:
+            result["lead_lag"] = _lead_lag
+            # Composite lead-lag signal
+            _bull_ct = sum(1 for v in _lead_lag.values() if v["signal"] == "BULL")
+            _bear_ct = sum(1 for v in _lead_lag.values() if v["signal"] == "BEAR")
+            result["lead_lag_signal"] = "BULLISH" if _bull_ct > _bear_ct else "BEARISH" if _bear_ct > _bull_ct else "MIXED"
+            print(f"  🔗 Lead-lag: {result['lead_lag_signal']} "
+                  f"({_bull_ct}B/{_bear_ct}Br) — "
+                  f"LIT:{_lead_lag.get('LIT',{}).get('chg_1h','?')}% "
+                  f"NIO:{_lead_lag.get('NIO',{}).get('chg_1h','?')}%", flush=True)
+    except Exception as _ll_err:
+        pass
+
     return result
 
 # ═══════════════════════════════════════════════════════════════
@@ -6420,13 +6463,17 @@ def detect_vix_regime_flip(spy_data):
 
 def check_hard_risk_rules(price, spy_data, indicators, mm_data):
     """
-    Hard override rules that gate all signals regardless of SPOCK score.
-    Returns: (allow_buy, allow_sell, risk_override, reasons)
+    Risk rules: graduated penalties not binary vetoes.
+    High RSI during a trend is a caution signal, not a kill switch.
+    Only extreme conditions (VIX>30, gap down >3%) are hard blocks.
+    Returns: (allow_buy, allow_sell, risk_override, reasons, conviction_mult, size_mult)
     """
     allow_buy  = True
     allow_sell = True
     reasons    = []
-    risk_override = None
+    risk_override    = None
+    conviction_mult  = 1.0   # multiplier applied to conviction score
+    size_mult        = 1.0   # multiplier applied to position size
 
     vix       = float(spy_data.get("vix", 20) or 20)
     spy_rsi4h = float(spy_data.get("spy_rsi_4h", 50) or 50)
@@ -6435,41 +6482,57 @@ def check_hard_risk_rules(price, spy_data, indicators, mm_data):
     beta      = float(spy_data.get("beta_20d", 2.0) or 2.0)
     spy_move  = float(spy_data.get("spy_change_pct", 0) or 0)
     implied_tsla_move = abs(spy_move * beta)
+    gex = float(mm_data.get("gex_total", 0) or 0)
 
-    # Rule 1: VIX > 30 — no new longs
-    if vix > 30:
+    # ── HARD BLOCKS — these truly stop trading ─────────────────────────────
+    # Rule 1: VIX > 35 — genuine fear regime, no new longs
+    if vix > 35:
         allow_buy = False
         risk_override = "DEFENSIVE"
-        reasons.append(f"⛔ VIX={vix:.1f} > 30 — no new longs in fear regime")
+        reasons.append(f"⛔ VIX={vix:.1f} > 35 — fear regime, no new longs")
 
-    # Rule 2: VIX > 25 — reduce size signal
-    elif vix > 25:
-        risk_override = "CAUTION"
-        reasons.append(f"⚠️ VIX={vix:.1f} > 25 — elevated fear, reduce size")
+    # Rule 2: Gap down > 4% at open — wait for stabilization
+    if gap_pct < -4.0:
+        allow_buy = False
+        reasons.append(f"⛔ Gap down {gap_pct:.1f}% — wait for gap fill")
 
-    # Rule 3: SPY + QQQ both 4h RSI > 88 — no new longs
+    # Rule 3: Beta-adjusted SPY crash implies > 6% TSLA move intraday
+    if implied_tsla_move > 6.0 and spy_move < -2.0:
+        allow_buy = False
+        risk_override = "DEFENSIVE"
+        reasons.append(f"⛔ SPY crash {spy_move:.1f}% × beta {beta:.1f}x = {implied_tsla_move:.1f}% implied")
+
+    # ── GRADUATED PENALTIES — reduce conviction + size, don't block ────────
+    # Rule 4: VIX 25-35 — elevated fear, reduce size 40%
+    if 25 < vix <= 35:
+        risk_override = "HIGH"
+        size_mult     = min(size_mult, 0.60)
+        conviction_mult = min(conviction_mult, 0.85)
+        reasons.append(f"⚠️ VIX={vix:.1f} — elevated fear, size reduced")
+
+    # Rule 5: SPY+QQQ 4h RSI both > 88 — overbought, reduce conviction 25%
+    # NOTE: This is a TREND indicator. RSI staying >88 = strong trend.
+    # Penalty not veto — during trends RSI stays elevated for weeks.
     if spy_rsi4h > 88 and qqq_rsi4h > 88:
-        allow_buy = False
-        risk_override = "EXTREME"
-        reasons.append(f"⛔ SPY 4h RSI={spy_rsi4h:.0f} + QQQ 4h RSI={qqq_rsi4h:.0f} — market extremely overbought")
+        risk_override = risk_override or "ELEVATED"
+        conviction_mult = min(conviction_mult, 0.75)
+        size_mult       = min(size_mult, 0.70)
+        reasons.append(f"⚠️ SPY 4h RSI={spy_rsi4h:.0f} + QQQ 4h RSI={qqq_rsi4h:.0f} — overbought, reduced size")
 
-    # Rule 4: Gap down > 3% — suppress BUY for first 30 min
-    if gap_pct < -3.0:
-        allow_buy = False
-        reasons.append(f"⛔ Gap down {gap_pct:.1f}% — wait for gap fill attempt before buying")
-
-    # Rule 5: Beta-adjusted SPY move implies > 5% TSLA move
-    if implied_tsla_move > 5.0:
-        risk_override = "EXTREME"
-        reasons.append(f"⚠️ SPY move {spy_move:.1f}% × beta {beta:.1f}x = {implied_tsla_move:.1f}% implied TSLA move")
-
-    # Rule 6: GEX extremely negative (< -300M) — amplified moves, reduce size
-    gex = float(mm_data.get("gex_total", 0) or 0)
+    # Rule 6: GEX extremely negative — amplified moves, reduce size
     if gex < -300:
         risk_override = risk_override or "HIGH"
-        reasons.append(f"⚠️ GEX={gex:.0f}M — dealers short gamma, moves amplified")
+        size_mult     = min(size_mult, 0.60)
+        reasons.append(f"⚠️ GEX={gex:.0f}M — short gamma, amplified moves")
 
-    return allow_buy, allow_sell, risk_override, reasons
+    # Risk label
+    if not risk_override:
+        if vix > 20 or (spy_rsi4h > 80 and qqq_rsi4h > 80):
+            risk_override = "CAUTION"
+        else:
+            risk_override = "NORMAL"
+
+    return allow_buy, allow_sell, risk_override, reasons, conviction_mult, size_mult
 
 def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
                              dv_result, entry_data, peak_data, exit_score,
@@ -6839,6 +6902,37 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
     else:
         votes["neutral"] += 1
 
+    # ── TIER 5: INSTITUTIONAL FLOW ENHANCEMENT ───────────────────────────────
+
+    # Lead-lag cross-asset signal (+10 pts)
+    _ll = spy_data.get("lead_lag", {})
+    _ll_sig = spy_data.get("lead_lag_signal", "MIXED")
+    if _ll_sig == "BULLISH":
+        score += 8; votes["bull"] += 1
+        reasons.append(f"Lead-lag: EV/macro correlates bullish ({len(_ll)} symbols)")
+    elif _ll_sig == "BEARISH":
+        score -= 8; votes["bear"] += 1
+        reasons.append(f"Lead-lag: EV/macro correlates bearish")
+
+    # Sweep velocity signal (+15 pts — high urgency institutional commitment)
+    _uoa_sweeps = uoa_data.get("sweep_count", 0)
+    _sweep_dir  = uoa_data.get("sweep_direction", "")
+    if _uoa_sweeps >= 3 and _sweep_dir == "BULLISH":
+        score += 15; votes["bull"] += 1
+        reasons.append(f"Sweep velocity: {_uoa_sweeps} call sweeps — institutional urgency")
+    elif _uoa_sweeps >= 3 and _sweep_dir == "BEARISH":
+        score -= 15; votes["bear"] += 1
+        reasons.append(f"Sweep velocity: {_uoa_sweeps} put sweeps — bearish urgency")
+    elif _uoa_sweeps >= 1:
+        votes["neutral"] += 1
+
+    # Time-of-day signal weight — boost/reduce OFI-derived score
+    _tod_w = float(state.get("tod_weight", 1.0) if isinstance(state, dict) else 1.0)
+    if _tod_w >= 1.3 and score > 0:
+        score = min(100, round(score * 1.1))   # institutional window: slight boost
+    elif _tod_w <= 0.6 and abs(score) < 30:
+        score = round(score * 0.8)             # lunch/open noise: dampen weak signals
+
     # ── FINAL DECISION ───────────────────────────────────────────────────────
     score = max(-100, min(100, score))
 
@@ -6886,14 +6980,20 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
         elif score <= -_dyn_score_buy and conviction < _dyn_conv:
             action = "HOLD — LOW CONVICTION"; color = "#ffb300"
 
-    # Apply hard risk rules to SPOCK as well
-    _hr_allow_buy, _, _hr_risk, _hr_reasons = check_hard_risk_rules(
+    # Apply hard risk rules to SPOCK — graduated penalty not veto
+    _hr_allow_buy, _, _hr_risk, _hr_reasons, _hr_conv_mult, _hr_size_mult = check_hard_risk_rules(
         price, spy_data, indicators or {}, mm_data)
     if not _hr_allow_buy and score > 0:
-        score = min(score, 20)   # cap bullish score — but don't zero it
+        score = 0  # hard block = clear BUY
         if _hr_reasons:
             reasons.insert(0, _hr_reasons[0])
-        votes["neutral"] += 1   # neutral, not bear — risk is elevated not reversed
+        votes["neutral"] += 1
+    elif _hr_conv_mult < 1.0 and score > 0:
+        # Graduated penalty: reduce score proportionally
+        score = round(score * _hr_conv_mult)
+        if _hr_reasons:
+            reasons.insert(0, _hr_reasons[0])
+        votes["neutral"] += 1  # count as uncertain, not wrong
 
     # Risk level — includes SPY/QQQ overbought state
     vix = float(spy_data.get("vix", 20) or 20)
@@ -7210,6 +7310,65 @@ def run_analysis(refresh_4h=True, refresh_news=True):
         except Exception as _e:
             print(f"  ⚠️ UOA error: {_e}")
             uoa_data = {"net_flow":"ERROR","flow_score":0,"whale_alerts":[],"unusual_calls":[],"unusual_puts":[],"total_call_premium":0,"total_put_premium":0,"uoa_reasons":["Options data unavailable"]}
+
+        # ── Options Sweep Velocity — detect sudden volume bursts per strike ──
+        try:
+            _prev_uoa_snap = state.get("_uoa_snapshot", {})
+            _curr_calls    = {c.get("strike"): c.get("call_volume",0)
+                              for c in uoa_data.get("unusual_calls", [])}
+            _curr_puts     = {p.get("strike"): p.get("put_volume",0)
+                              for p in uoa_data.get("unusual_puts", [])}
+            _sweeps = []
+            # Call sweeps
+            for strike, vol in _curr_calls.items():
+                prev_vol = _prev_uoa_snap.get(f"c_{strike}", 0)
+                delta = vol - prev_vol
+                if delta >= 500:  # 500+ new contracts in 5min = sweep
+                    # Find option price for premium calc
+                    _opt = next((c for c in uoa_data.get("unusual_calls",[])
+                                 if c.get("strike") == strike), {})
+                    prem = delta * 100 * float(_opt.get("iv", 0.3) * price * 0.1 + 0.5)
+                    _sweeps.append({"strike": strike, "type": "CALL",
+                                    "delta_vol": delta, "premium_est": round(prem),
+                                    "urgency": "HIGH" if delta >= 2000 else "MEDIUM"})
+            # Put sweeps
+            for strike, vol in _curr_puts.items():
+                prev_vol = _prev_uoa_snap.get(f"p_{strike}", 0)
+                delta = vol - prev_vol
+                if delta >= 500:
+                    _opt = next((p for p in uoa_data.get("unusual_puts",[])
+                                 if p.get("strike") == strike), {})
+                    prem = delta * 100 * float(_opt.get("iv", 0.3) * price * 0.1 + 0.5)
+                    _sweeps.append({"strike": strike, "type": "PUT",
+                                    "delta_vol": delta, "premium_est": round(prem),
+                                    "urgency": "HIGH" if delta >= 2000 else "MEDIUM"})
+            if _sweeps:
+                _call_sweeps = [s for s in _sweeps if s["type"] == "CALL"]
+                _put_sweeps  = [s for s in _sweeps if s["type"] == "PUT"]
+                _sweep_dir   = "BULLISH" if len(_call_sweeps) > len(_put_sweeps) else "BEARISH" if _put_sweeps else "MIXED"
+                uoa_data["sweep_velocity"]  = _sweeps
+                uoa_data["sweep_direction"] = _sweep_dir
+                uoa_data["sweep_count"]     = len(_sweeps)
+                print(f"  ⚡ SWEEP VELOCITY: {len(_sweeps)} strikes swept | {_sweep_dir} "
+                      f"| Calls:{len(_call_sweeps)} Puts:{len(_put_sweeps)}", flush=True)
+                if len(_sweeps) >= 3 or any(s["urgency"] == "HIGH" for s in _sweeps):
+                    _nl = "\n"
+                    log_alert(
+                        f"⚡ {TICKER} *OPTIONS SWEEP DETECTED*{_nl}"
+                        f"━━━━━━━━━━━━━━━━━━━━━━{_nl}"
+                        f"Direction: *{_sweep_dir}*{_nl}"
+                        f"Strikes swept: {len(_sweeps)} | 💰 Price: *${price}*{_nl}"
+                        f"Top sweep: ${_sweeps[0]['strike']} {_sweeps[0]['type']} "
+                        f"+{_sweeps[0]['delta_vol']:,} contracts",
+                        alert_key="sweep_velocity"
+                    )
+            # Save snapshot for next cycle
+            state["_uoa_snapshot"] = {
+                **{f"c_{s}": v for s, v in _curr_calls.items()},
+                **{f"p_{s}": v for s, v in _curr_puts.items()},
+            }
+        except Exception as _sv_err:
+            pass  # sweep velocity is best-effort
 
         # ── Derived values needed for indicators dict ──
         prev_macd_hist = state.get("indicators", {}).get("macd_hist", macd_hist)
@@ -7626,15 +7785,18 @@ def run_analysis(refresh_4h=True, refresh_news=True):
         _momentum_ok_buy  = _recent_momentum >= -0.003
         _momentum_ok_sell = _recent_momentum <= 0.003
 
-        # ── HARD RISK RULES — override everything ─────────────────────────
-        _allow_buy, _allow_sell, _risk_ovr, _risk_reasons = check_hard_risk_rules(
+        # ── HARD RISK RULES — graduated penalty, not absolute veto ──────────
+        _allow_buy, _allow_sell, _risk_ovr, _risk_reasons, _conv_mult, _size_mult = check_hard_risk_rules(
             price, spy_data, indicators, mm_data)
-        if _risk_ovr:
-            state["hard_risk"] = {"override": _risk_ovr, "reasons": _risk_reasons}
-            print(f"  🛡 Hard risk: {_risk_ovr} — {'; '.join(_risk_reasons[:2])}", flush=True)
-        if signal == "BUY"  and not _allow_buy:
-            print(f"  ⛔ BUY blocked by hard risk rule: {_risk_reasons[0] if _risk_reasons else ''}", flush=True)
+        if _risk_ovr and _risk_ovr not in ("NORMAL", "CAUTION"):
+            state["hard_risk"] = {"override": _risk_ovr, "reasons": _risk_reasons,
+                                  "conviction_mult": _conv_mult, "size_mult": _size_mult}
+            print(f"  🛡 Hard risk: {_risk_ovr} (conv×{_conv_mult:.2f} size×{_size_mult:.2f}) — {'; '.join(_risk_reasons[:2])}", flush=True)
+        if signal == "BUY" and not _allow_buy:
+            print(f"  ⛔ BUY hard-blocked: {_risk_reasons[0] if _risk_reasons else ''}", flush=True)
             signal = "HOLD"
+        elif signal == "BUY" and _conv_mult < 1.0:
+            print(f"  ⚠️ BUY conviction reduced ×{_conv_mult:.2f} — {_risk_reasons[0] if _risk_reasons else 'risk elevated'}", flush=True)
         if signal == "SELL" and not _allow_sell:
             signal = "HOLD"
 
@@ -7851,6 +8013,21 @@ def run_analysis(refresh_4h=True, refresh_news=True):
             _atr_ratio = _atr5 / (_atr20 + 1e-9)
             _ret_std = float(closes.pct_change().iloc[-20:].std() or 0.01)
             _ofi_ratio = float(_dv_ft.get("ofi_ratio", 0) or 0)
+
+            # ── Time-of-Day OFI Weighting (Method 4 institutional flow) ──────
+            # Institutional windows: 10:00-11:30 and 14:00-15:00 are primary
+            # Lunch (11:30-13:00) and open (9:30-10:00) are noisy/retail-heavy
+            _tod_weight = 1.0
+            if   9.5  <= _now_h < 10.0:  _tod_weight = 0.5   # open — retail noise
+            elif 10.0 <= _now_h < 11.5:  _tod_weight = 1.5   # primary institutional window
+            elif 11.5 <= _now_h < 13.0:  _tod_weight = 0.6   # lunch lull
+            elif 13.0 <= _now_h < 14.0:  _tod_weight = 0.8   # early afternoon
+            elif 14.0 <= _now_h < 15.0:  _tod_weight = 1.3   # secondary inst window
+            elif 15.0 <= _now_h < 15.5:  _tod_weight = 0.5   # distribution window
+            elif 15.5 <= _now_h < 16.0:  _tod_weight = 0.8   # MOC orders
+            _ofi_weighted = _ofi_ratio * _tod_weight
+            state["tod_weight"] = round(_tod_weight, 2)
+
             _vwap_val  = float(indicators.get("vwap", price) or price)
             _vwap_dist = (price - _vwap_val) / (_vwap_val + 1e-9) if _vwap_val else 0
             _ema50  = float(indicators.get("ema50",  price) or price)
@@ -8143,7 +8320,8 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 # overrides the SPY/QQQ RSI block (RSI=100 is a momentum artifact,
                 # not a reversal signal during a confirmed breakout)
                 _hr = state.get("hard_risk", {})
-                if _hr.get("override") == "EXTREME" and "BUY" in master.get("action", ""):
+                _hr_ovr = _hr.get("override", "NORMAL")
+                if _hr_ovr in ("DEFENSIVE",) and "BUY" in master.get("action", ""):
                     _bk = master.get("breakout", {})
                     _bk_confirmed  = _bk.get("breakout", False) and _bk.get("vol_ratio", 0) >= 2.0
                     _uoa_net       = uoa_data.get("total_call_premium", 0) - uoa_data.get("total_put_premium", 0)
@@ -12303,6 +12481,16 @@ body {
         <div class="data-row"><span class="data-row-label">Percentile</span><span class="data-row-val" id="vh-pct">—</span></div>
         <div class="data-row"><span class="data-row-label">Alert Level</span><span class="data-row-val" id="vh-alert">—</span></div>
       </div>
+      <div class="data-card">
+        <h3>🔗 Lead-Lag Signals</h3>
+        <div class="data-row"><span class="data-row-label">Composite</span><span class="data-row-val" id="ll-signal">—</span></div>
+        <div class="data-row"><span class="data-row-label">LIT (30min lead)</span><span class="data-row-val" id="ll-lit">—</span></div>
+        <div class="data-row"><span class="data-row-label">NIO (15min lead)</span><span class="data-row-val" id="ll-nio">—</span></div>
+        <div class="data-row"><span class="data-row-label">RIVN (20min lead)</span><span class="data-row-val" id="ll-rivn">—</span></div>
+        <div class="data-row"><span class="data-row-label">TLT inverse (45m)</span><span class="data-row-val" id="ll-tlt">—</span></div>
+        <div class="data-row"><span class="data-row-label">Sweep Velocity</span><span class="data-row-val" id="ll-sweep">—</span></div>
+        <div class="data-row"><span class="data-row-label">Time Window</span><span class="data-row-val" id="ll-tod">—</span></div>
+      </div>
       <div class="data-card" style="grid-column:1/-1">
         <h3>🇺🇸 Trump Monitor</h3>
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:12px;margin-bottom:10px;">
@@ -12761,6 +12949,29 @@ function _updateUI_inner(s) {
   if (tmKwEl) tmKwEl.textContent = tmKws.length ? tmKws.slice(0,6).join(', ') : 'none';
   var tmPostEl = document.getElementById('trump-post');
   if (tmPostEl) tmPostEl.textContent = tm.latest_post || (tm.error ? 'Error: ' + tm.error : 'No recent posts');
+
+  // Lead-lag signals
+  var ll = s.lead_lag || {};
+  var llSig = s.lead_lag_signal || (spy.lead_lag_signal || '—');
+  setText('ll-signal', llSig || '—',
+    (llSig||'').indexOf('BULL') >= 0 ? 'bull' : (llSig||'').indexOf('BEAR') >= 0 ? 'bear' : '');
+  function fmtLL(d) {
+    if (!d) return '—';
+    var cls = d.signal === 'BULL' ? ' (bull)' : d.signal === 'BEAR' ? ' (bear)' : '';
+    return (d.chg_1h >= 0 ? '+' : '') + d.chg_1h + '%' + cls;
+  }
+  setText('ll-lit',  fmtLL(ll.LIT),  ll.LIT  && ll.LIT.signal  === 'BULL' ? 'bull' : ll.LIT  && ll.LIT.signal  === 'BEAR' ? 'bear' : '');
+  setText('ll-nio',  fmtLL(ll.NIO),  ll.NIO  && ll.NIO.signal  === 'BULL' ? 'bull' : ll.NIO  && ll.NIO.signal  === 'BEAR' ? 'bear' : '');
+  setText('ll-rivn', fmtLL(ll.RIVN), ll.RIVN && ll.RIVN.signal === 'BULL' ? 'bull' : ll.RIVN && ll.RIVN.signal === 'BEAR' ? 'bear' : '');
+  setText('ll-tlt',  fmtLL(ll.TLT),  ll.TLT  && ll.TLT.signal  === 'BEAR' ? 'bull' : ll.TLT  && ll.TLT.signal  === 'BULL' ? 'bear' : '');
+  var swDir = (s.uoa_data || {}).sweep_direction;
+  var swCnt = (s.uoa_data || {}).sweep_count || 0;
+  setText('ll-sweep', swCnt ? swCnt + ' sweeps · ' + (swDir || '?') : 'None',
+    swDir === 'BULLISH' ? 'bull' : swDir === 'BEARISH' ? 'bear' : '');
+  var todW = s.tod_weight;
+  var todLabel = todW >= 1.4 ? 'Institutional (1°)' : todW >= 1.2 ? 'Institutional (2°)' : todW <= 0.6 ? 'Noise (discount)' : 'Normal';
+  setText('ll-tod', todW ? todLabel + ' ×' + todW : '—',
+    todW >= 1.3 ? 'bull' : todW <= 0.6 ? 'bear' : '');
 
   // Alerts tab
   var alerts = s.alerts_log || [];
