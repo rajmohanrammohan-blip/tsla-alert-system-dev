@@ -3456,7 +3456,7 @@ def fetch_trump_monitor():
 
         # Recency multiplier — only for fresh posts
         if age_mins is not None and age_mins <= 60:
-            recency = 3.0 if age_mins < 5 else 2.0 if age_mins < 15 else                       1.5 if age_mins < 30 else 1.0
+            recency = 3.0 if age_mins < 5 else 2.0 if age_mins < 15 else 1.5 if age_mins < 30 else 1.0
             net_score = round(net_score * recency, 1)
         elif signal in ("STALE", "NEUTRAL"):
             net_score = 0  # stale posts have zero market impact
@@ -7567,17 +7567,17 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 try:
                     _trump = fetch_trump_monitor()
                     state["trump_monitor"] = _trump
-                    _trump_age  = _trump.get("post_age_mins", 999)
+                    _trump_age  = _trump.get("post_age_mins")  # None = unknown
                     _trump_sig  = _trump.get("signal", "NEUTRAL")
                     _trump_kws  = _trump.get("keywords_hit", [])
                     _trump_imp  = _trump.get("impact_score", 0)
-                    if _trump_age < 60:
+                    if _trump_age is not None and _trump_age < 60:
                         print(f"  🇺🇸 Trump post {_trump_age}min ago | Signal:{_trump_sig} | "
                               f"Score:{_trump_imp:+.0f} | Keywords:{_trump_kws[:3]}", flush=True)
                         # Volume correlation check
                         _vh = state.get("vol_hawk", {})
                         _vol_rat = _vh.get("ratio", 1.0)
-                        if _trump_age < 30 and _vol_rat >= 1.5:
+                        if _trump_age is not None and _trump_age < 30 and _vol_rat >= 1.5:
                             print(f"  🔥 TRUMP-VOLUME CORRELATION: Post {_trump_age}min ago + "
                                   f"volume {_vol_rat:.1f}x avg — potential catalyst!", flush=True)
                             _nl = "\n"
@@ -7593,7 +7593,8 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                             )
                             log_alert(_corr_msg, alert_key="trump_volume")
                     else:
-                        print(f"  🇺🇸 Trump: last post {_trump_age}min ago | {_trump_sig}", flush=True)
+                        _age_disp = f"{_trump_age}min ago" if _trump_age is not None else "age unknown"
+                        print(f"  🇺🇸 Trump: last post {_age_disp} | {_trump_sig}", flush=True)
                 except Exception as _te:
                     print(f"  ⚠️ Trump monitor error: {_te}", flush=True)
                     state["trump_monitor"] = {"error": str(_te)[:60]}
@@ -8071,8 +8072,8 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 # Extreme volume spike alert
                 if _vol_ratio >= 3.0:
                     _trump_ctx = state.get("trump_monitor", {})
-                    _trump_recent = _trump_ctx.get("recent_post_mins", 999)
-                    _trump_note = f" ⚠️ TRUMP POST {_trump_recent}min ago" if _trump_recent < 30 else ""
+                    _trump_recent = _trump_ctx.get("recent_post_mins")
+                    _trump_note = f" ⚠️ TRUMP POST {_trump_recent}min ago" if (_trump_recent is not None and _trump_recent < 30) else ""
                     _nl2 = "\n"
                     log_alert(
                         f"🔥 {TICKER} *VOLUME SPIKE*{_trump_note}{_nl2}"
@@ -8244,6 +8245,17 @@ def run_analysis(refresh_4h=True, refresh_news=True):
         if signal == "SELL" and not _allow_sell:
             signal = "HOLD"
 
+        # ── Pre-flight checks before any alert ────────────────────────────────
+        # 1. AUC gate: don't alert on near-random models
+        _cur_auc = float((_ml_model_cache or {}).get("auc", 0.0) if _ml_model_cache else 0.0)
+        _auc_ok  = _cur_auc >= 0.55 or _cur_auc == 0.0  # 0.0 = not loaded yet, allow
+        if not _auc_ok:
+            print(f"  ⚠️ Alerts suppressed — model AUC {_cur_auc:.3f} below 0.55 minimum", flush=True)
+
+        # 2. Bootstrap suppression: don't alert on cycle 1 synthetic conviction
+        _cycle_num = state.get("_cycle_count", 0)
+        _bootstrap_ok = _cycle_num >= 3  # require at least 3 real cycles
+
         # SPOCK conviction check — use previous cycle master_signal as gate
         # On cycle 1, master_signal is empty — use current cycle signals as proxy
         _spock = state.get("master_signal", {})
@@ -8318,6 +8330,16 @@ def run_analysis(refresh_4h=True, refresh_news=True):
             if _bypass_buy and signal in ("HOLD", "BUY"):
                 signal = "BUY"
                 print(f"  🚨 BYPASS: ML conf={_ml_conf:.0f}% + {_dv_state} → BUY forced through", flush=True)
+
+            # AUC gate — don't alert on near-random models
+            if not _auc_ok and signal in ("BUY", "SELL", "STRONG BUY", "STRONG SELL"):
+                print(f"  ⚠️ {signal} suppressed — model AUC {_cur_auc:.3f} < 0.55 minimum", flush=True)
+                signal = "HOLD"
+
+            # Bootstrap suppression — no alerts on cycle 1 synthetic conviction
+            if not _bootstrap_ok and signal in ("BUY", "SELL", "STRONG BUY", "STRONG SELL"):
+                print(f"  ⚠️ {signal} suppressed — bootstrap cycle {_cycle_num}/3, need real data first", flush=True)
+                signal = "HOLD"
 
             # SPOCK conviction check (with lowered threshold)
             if signal == "BUY"  and not _spock_ok_buy and not _bypass_buy:
@@ -9167,6 +9189,7 @@ def monitor_loop():
     cycle = 0
     while True:
         cycle += 1
+        state["_cycle_count"] = cycle  # track for bootstrap suppression
         now_ts = time.time()
         print(f"[LOOP] cycle {cycle} starting", flush=True)
 
@@ -10224,8 +10247,33 @@ def _run_ml_retrain():
             "pc_ratio_ref": pc_ratio_now,
         }
         pkl_path = f"/data/{TICKER.lower()}_model.pkl"  # Railway volume — persists across restarts
-        with open(pkl_path,"wb") as f: pickle.dump(pkg,f)
-        print(f"[ML-RETRAIN] Saved to {pkl_path}", flush=True)
+
+        # Guard: only save if new model is meaningfully better than existing
+        _current_auc = 0.0
+        try:
+            import pickle as _pk2
+            if __import__("os").path.exists(pkl_path):
+                with open(pkl_path, "rb") as _cf:
+                    _cur_pkg = _pk2.load(_cf)
+                    _current_auc = float(_cur_pkg.get("auc", 0.0))
+        except Exception:
+            _current_auc = 0.0
+
+        _should_save = (auc > _current_auc + 0.005) or _current_auc == 0.0
+        if _should_save:
+            with open(pkl_path,"wb") as f: pickle.dump(pkg,f)
+            print(f"[ML-RETRAIN] ✅ Saved to {pkl_path} (AUC {_current_auc:.3f} → {auc:.3f})", flush=True)
+        else:
+            print(f"[ML-RETRAIN] ⚠️ NOT saved — new AUC {auc:.3f} ≤ current {_current_auc:.3f} — keeping better model", flush=True)
+            # Reload the better model so this session uses it
+            try:
+                import pickle as _pk3
+                with open(pkl_path, "rb") as _rf:
+                    pkg = _pk3.load(_rf)
+                    auc = float(pkg.get("auc", auc))
+                print(f"[ML-RETRAIN] Reloaded better model (AUC={auc:.3f})", flush=True)
+            except Exception:
+                pass
         # Persist to all available locations so restarts don't lose the model
         _extra_paths = [
             f"/tmp/{TICKER.lower()}_model_backup.pkl",   # survives within session
@@ -12328,7 +12376,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SPOCK — TSLA Intelligence</title>
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<title>SPOCK — TSLA Intelligence v20260420_1200</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -14037,6 +14088,33 @@ def start_background_threads():
             threading.Thread(target=_run_ml_retrain, daemon=True).start()
     except Exception as _mle:
         print(f"[STARTUP] ML model load error: {_mle}", flush=True)
+    # Pre-populate earnings_context so position sizing cap works on cycle 1
+    # (earnings check runs inside run_analysis, but sizing runs before it reads context)
+    try:
+        from datetime import date as _sd, timedelta as _std
+        _today_s = _sd.today()
+        # Known TSLA earnings dates — update when calendar changes
+        _known_earnings = [
+            _sd(2026, 4, 22),   # Q1 2026
+            _sd(2026, 7, 22),   # Q2 2026 estimate
+            _sd(2026, 10, 21),  # Q3 2026 estimate
+        ]
+        _next_earn = None
+        for _ed in sorted(_known_earnings):
+            if _ed >= _today_s:
+                _next_earn = _ed
+                break
+        if _next_earn:
+            _days_away = (_next_earn - _today_s).days
+            state["earnings_context"] = {
+                "earnings_mode": _days_away <= 14,
+                "days_away":     _days_away,
+                "next_date":     str(_next_earn),
+            }
+            if _days_away <= 14:
+                print(f"[STARTUP] ⚠️ Earnings in {_days_away} days — sizing cap pre-applied", flush=True)
+    except Exception: pass
+
     # Run first analysis immediately so dashboard populates fast
     try:
         print("[STARTUP] Running first analysis...", flush=True)
