@@ -2772,7 +2772,14 @@ def calculate_market_maker_data(ticker_symbol, current_price):
                 import pandas as _pd_mm
                 if not isinstance(calls, _pd_mm.DataFrame) or not isinstance(puts, _pd_mm.DataFrame):
                     continue
+                # Flatten MultiIndex columns if present (yfinance sometimes returns these)
+                if hasattr(calls.columns, 'levels'):
+                    calls.columns = calls.columns.get_level_values(0)
+                if hasattr(puts.columns, 'levels'):
+                    puts.columns = puts.columns.get_level_values(0)
+                # Validate required columns exist
                 if "strike" not in calls.columns or "openInterest" not in calls.columns:
+                    print(f"  ⚠️ MM chain missing columns for {exp}: {list(calls.columns)[:5]}", flush=True)
                     continue
                 chain = _raw_chain
 
@@ -13130,7 +13137,7 @@ function switchTab(name) {
   document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
   event.target.classList.add('active');
   var panel = document.getElementById('tab-' + name);
-  panel.classList.add('active');
+  if (panel) panel.classList.add('active');
   // Trigger chart redraw when chart tab becomes visible
   if (name === 'chart') {
     setTimeout(function() {
@@ -13406,11 +13413,13 @@ function _updateUI_inner(s) {
   // Earnings warning
   var earn = s.earnings_context || {};
   var ew = document.getElementById('earnWarn');
-  if (earn.earnings_mode) {
-    ew.classList.add('active');
-    var ewt = document.getElementById('earnWarnText'); if(ewt) ewt.textContent = '⚠️ EARNINGS IN ' + (earn.days_away || '?') + ' DAYS — size reduced';
-  } else {
-    ew.classList.remove('active');
+  if (ew) {
+    if (earn.earnings_mode) {
+      ew.classList.add('active');
+      var ewt = document.getElementById('earnWarnText'); if(ewt) ewt.textContent = '⚠️ EARNINGS IN ' + (earn.days_away || '?') + ' DAYS — size reduced';
+    } else {
+      ew.classList.remove('active');
+    }
   }
 
   // ══ TABS ══
