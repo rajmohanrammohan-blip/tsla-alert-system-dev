@@ -7691,6 +7691,49 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 mm_data["data_note"]    = ""
                 mm_data["_walls_from_cache"] = False
 
+                # ── Compute Call/Put walls directly from Schwab data ────────────
+                # Bypasses the failing yfinance MM function which has the tuple error.
+                # Schwab returns clean list-of-dicts — reliable even when yfinance fails.
+                if mm_data.get("call_wall") is None and _schwab_opts.get("calls"):
+                    try:
+                        _sc_calls = [c for c in _schwab_opts["calls"]
+                                     if isinstance(c, dict) and c.get("strike", 0) > price]
+                        _sc_puts  = [p for p in _schwab_opts["puts"]
+                                     if isinstance(p, dict) and p.get("strike", 0) < price]
+                        # Aggregate OI by strike
+                        _call_oi_by_strike = {}
+                        for _c in _sc_calls:
+                            _s = round(float(_c.get("strike", 0)))
+                            _call_oi_by_strike[_s] = _call_oi_by_strike.get(_s, 0) + int(_c.get("oi", 0))
+                        _put_oi_by_strike = {}
+                        for _p in _sc_puts:
+                            _s = round(float(_p.get("strike", 0)))
+                            _put_oi_by_strike[_s] = _put_oi_by_strike.get(_s, 0) + int(_p.get("oi", 0))
+                        # Find highest OI strike = wall
+                        if _call_oi_by_strike:
+                            _cw_strike = max(_call_oi_by_strike, key=_call_oi_by_strike.get)
+                            mm_data["call_wall"]          = _cw_strike
+                            mm_data["call_wall_oi"]       = _call_oi_by_strike[_cw_strike]
+                            mm_data["call_wall_dist_pct"] = round((_cw_strike - price) / price * 100, 2)
+                        if _put_oi_by_strike:
+                            _pw_strike = max(_put_oi_by_strike, key=_put_oi_by_strike.get)
+                            mm_data["put_wall"]           = _pw_strike
+                            mm_data["put_wall_oi"]        = _put_oi_by_strike[_pw_strike]
+                            mm_data["put_wall_dist_pct"]  = round((price - _pw_strike) / price * 100, 2)
+                        # Top 4 for dashboard
+                        mm_data["call_walls"] = [{"strike": s, "oi": _call_oi_by_strike[s]}
+                                                  for s in sorted(_call_oi_by_strike,
+                                                  key=_call_oi_by_strike.get, reverse=True)[:4]]
+                        mm_data["put_walls"]  = [{"strike": s, "oi": _put_oi_by_strike[s]}
+                                                  for s in sorted(_put_oi_by_strike,
+                                                  key=_put_oi_by_strike.get, reverse=True)[:4]]
+                        print(f"  🏦 Walls (Schwab): Call=${mm_data.get('call_wall')} "
+                              f"(+{mm_data.get('call_wall_dist_pct',0):.1f}%) | "
+                              f"Put=${mm_data.get('put_wall')} "
+                              f"(-{mm_data.get('put_wall_dist_pct',0):.1f}%)", flush=True)
+                    except Exception as _wle:
+                        print(f"  ⚠️ Wall computation error: {_wle}", flush=True)
+
             # Rebuild summary string with Schwab-corrected values
             _gex_s  = mm_data.get("gex_total", 0)
             _pc_s   = mm_data.get("pc_ratio", "?")
