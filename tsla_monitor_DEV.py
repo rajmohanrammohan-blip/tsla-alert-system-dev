@@ -8093,15 +8093,20 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 _cw2     = mm_data.get("call_wall")
                 _pw2     = mm_data.get("put_wall")
                 _chm2    = mm_data.get("charm_urgency", "LOW")
-                if _gfl2 and _gfd2 <= 3.0:
+                _earn_days = state.get("earnings_context", {}).get("days_away", 99)
+                _gex_warn_threshold = 5.0 if (_earn_days is not None and _earn_days <= 3) else 3.0
+                if _gfl2 and _gfd2 <= _gex_warn_threshold:
                     _nl = "\n"
+                    _earn_note = f"⚠️ EARNINGS IN {_earn_days} DAYS — regime flip risk is ELEVATED{_nl}" if _earn_days <= 3 else ""
                     log_alert(
                         f"🚨 {TICKER} *GEX FLIP WARNING*{_nl}"
                         f"━━━━━━━━━━━━━━━━━━━━━━{_nl}"
-                        f"Price *${price}* approaching GEX flip at *${_gfl2}*{_nl}"
-                        f"Distance: *{_gfd2:.1f}%* — dealer regime change imminent{_nl}"
-                        f"⚠️ Below ${_gfl2}: dealers AMPLIFY moves (not stabilize){_nl}"
-                        f"Call Wall: ${_cw2} | Put Wall: ${_pw2} | Charm: {_chm2}",
+                        f"{_earn_note}"
+                        f"GEX Flip: *${_gfl2}* — only *{_gfd2:.1f}%* from price{_nl}"
+                        f"Price *${price}* | MaxPain *${_cw2 or '?'}*{_nl}"
+                        f"⚠️ Below ${_gfl2}: dealer hedging AMPLIFIES moves{_nl}"
+                        f"Stop loss should be above ${_gfl2} or well below it{_nl}"
+                        f"Charm: {_chm2} | Call Wall: ${_cw2} | Put Wall: ${_pw2}",
                         alert_key="gex_flip_warning"
                     )
             except Exception:
@@ -8916,7 +8921,8 @@ def run_analysis(refresh_4h=True, refresh_news=True):
         # ── Entry signal WhatsApp alert ──
         prev_entry = state.get("_prev_entry_score", 0)
         curr_entry = entry_data.get("entry_score", 0)
-        if curr_entry >= 50 and prev_entry < 50:  # Raised 45→50 to match ACCUMULATE tier
+        # Apply same AUC gate and bootstrap suppression as directional signals
+        if curr_entry >= 50 and prev_entry < 50 and _auc_ok and _bootstrap_ok:  # AUC + cycle gate
             tp = entry_data.get("tranche_plan", [])
             t1 = tp[0] if tp else {}
             t2 = tp[1] if len(tp) > 1 else {}
@@ -9263,6 +9269,11 @@ def api_state():
             **state,
             "wa_enabled":    WA_ENABLED,
             "wa_phone_tail": GREEN_PHONE[-4:] if GREEN_PHONE else "",
+            # Explicitly set retraining from global — never inherit stale value from state dict
+            "ml_retraining": _ml_retraining,
+            "ml_ready":      _ml_ready,
+            # Ensure _loading is correct — False if we have price data
+            "_loading":      not bool(state.get("price")),
         })
         return jsonify(payload)
     except Exception as e:
