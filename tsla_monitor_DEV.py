@@ -2824,18 +2824,23 @@ def calculate_market_maker_data(ticker_symbol, current_price):
                         pass
 
                 # Max Pain: for each strike, sum total OI loss for all options
-                all_strikes = sorted(set(
-                    calls["strike"].tolist() + puts["strike"].tolist()
-                ))
-                for s_test in all_strikes:
-                    pain = 0
-                    # Call pain: calls ITM at s_test
-                    pain += (calls[calls["strike"] < s_test]["openInterest"].fillna(0) *
-                             (s_test - calls[calls["strike"] < s_test]["strike"])).sum()
-                    # Put pain: puts ITM at s_test
-                    pain += (puts[puts["strike"] > s_test]["openInterest"].fillna(0) *
-                             (puts[puts["strike"] > s_test]["strike"] - s_test)).sum()
-                    max_pain_map[s_test] = max_pain_map.get(s_test, 0) + pain
+                try:
+                    # Guard: verify calls/puts are still DataFrames at this point
+                    import pandas as _pd_mp
+                    if not isinstance(calls, _pd_mp.DataFrame) or not isinstance(puts, _pd_mp.DataFrame):
+                        raise TypeError(f"calls={type(calls).__name__} puts={type(puts).__name__} — expected DataFrame")
+                    all_strikes = sorted(set(
+                        calls["strike"].tolist() + puts["strike"].tolist()
+                    ))
+                    for s_test in all_strikes:
+                        pain = 0
+                        pain += (calls[calls["strike"] < s_test]["openInterest"].fillna(0) *
+                                 (s_test - calls[calls["strike"] < s_test]["strike"])).sum()
+                        pain += (puts[puts["strike"] > s_test]["openInterest"].fillna(0) *
+                                 (puts[puts["strike"] > s_test]["strike"] - s_test)).sum()
+                        max_pain_map[s_test] = max_pain_map.get(s_test, 0) + pain
+                except Exception as _mp_err:
+                    print(f"  ⚠️ Max pain calc error ({exp}): {_mp_err}", flush=True)
 
             except Exception as e:
                 print(f"  ⚠️ Options chain error ({exp}): {e}")
@@ -2850,8 +2855,8 @@ def calculate_market_maker_data(ticker_symbol, current_price):
         # ── Put/Call Ratio ──
         if total_call_oi > 0:
             result["pc_ratio"]    = round(total_put_oi / total_call_oi, 2)
-            result["total_call_oi"] = int(total_call_oi or 0)
-            result["total_put_oi"]  = int(total_put_oi or 0)
+            result["total_call_oi"] = int(total_call_oi) if total_call_oi == total_call_oi else 0
+            result["total_put_oi"]  = int(total_put_oi)  if total_put_oi  == total_put_oi  else 0
 
         # ── IV Rank / Signal ──
         if iv_list:
@@ -3438,10 +3443,23 @@ def fetch_trump_monitor():
         # Score content
         bull, bear, mkt, net_score, signal = _score_text(latest["body"])
 
-        # Recency multiplier
-        if age_mins is not None:
-            recency = 3.0 if age_mins < 5 else 2.0 if age_mins < 15 else                       1.5 if age_mins < 30 else 1.0 if age_mins < 60 else 0.3
+        # Freshness gate — stale posts cannot be MARKET_MOVING
+        if age_mins is not None and age_mins > 60 * 24:
+            # Post older than 24 hours — timestamp parse error or truly stale
+            # Treat age as unknown rather than reporting 26000min
+            age_mins = None
+            signal   = "STALE"
+        elif age_mins is not None and age_mins > 120:
+            signal = "STALE"          # >2hr old: not actionable
+        elif age_mins is not None and age_mins > 60:
+            signal = "NEUTRAL"        # 1-2hr: too old to be directional
+
+        # Recency multiplier — only for fresh posts
+        if age_mins is not None and age_mins <= 60:
+            recency = 3.0 if age_mins < 5 else 2.0 if age_mins < 15 else                       1.5 if age_mins < 30 else 1.0
             net_score = round(net_score * recency, 1)
+        elif signal in ("STALE", "NEUTRAL"):
+            net_score = 0  # stale posts have zero market impact
 
         result.update({
             "latest_post":      latest["body"][:300],
@@ -5606,8 +5624,14 @@ def calculate_vwap_bands_daily(closes, highs, lows, volumes):
 # ── Signal Weight Feedback — rolling accuracy per signal type ────────────────
 _signal_accuracy_table = {}   # {signal_type: {correct:0, total:0, weight_adj:1.0}}
 
+# Minimum decisive outcomes required before adjusting weights.
+# 5 trades in a pre-earnings drift is not enough to calibrate — need 20.
+_MIN_SAMPLES_FOR_FEEDBACK = 20
+
 def _update_signal_weight(signal_type, was_correct):
-    """Update rolling accuracy for a signal type and adjust its SPOCK weight."""
+    """Update rolling accuracy for a signal type and adjust its SPOCK weight.
+    Weight adjustments only applied after MIN_SAMPLES_FOR_FEEDBACK decisive outcomes.
+    """
     if signal_type not in _signal_accuracy_table:
         _signal_accuracy_table[signal_type] = {
             "correct": 0, "total": 0, "weight_adj": 1.0, "history": []}
@@ -5618,19 +5642,24 @@ def _update_signal_weight(signal_type, was_correct):
     entry["correct"] = sum(entry["history"])
     win_rate = entry["correct"] / max(entry["total"], 1)
 
-    # Adjust weight: good signal → boost, bad signal → reduce
-    if entry["total"] >= 5:
+    # Only adjust weights after sufficient sample size — prevents one bad streak
+    # from crippling the entire signal engine before it's had a chance to calibrate
+    if entry["total"] >= _MIN_SAMPLES_FOR_FEEDBACK:
         if win_rate >= 0.70:
             entry["weight_adj"] = min(1.5, entry["weight_adj"] + 0.05)
         elif win_rate >= 0.55:
             entry["weight_adj"] = min(1.2, entry["weight_adj"])
         elif win_rate < 0.40:
-            entry["weight_adj"] = max(0.5, entry["weight_adj"] - 0.1)
+            entry["weight_adj"] = max(0.6, entry["weight_adj"] - 0.05)  # slower decay
         elif win_rate < 0.50:
-            entry["weight_adj"] = max(0.7, entry["weight_adj"] - 0.05)
+            entry["weight_adj"] = max(0.8, entry["weight_adj"] - 0.02)  # very slow decay
+    else:
+        entry["weight_adj"] = 1.0  # hold at neutral until calibrated
 
+    calibrated = entry["total"] >= _MIN_SAMPLES_FOR_FEEDBACK
     print(f"[FEEDBACK] {signal_type}: {win_rate:.0%} win ({entry['correct']}/{entry['total']}) "
-          f"→ weight={entry['weight_adj']:.2f}", flush=True)
+          f"→ weight={entry['weight_adj']:.2f}"
+          f"{'' if calibrated else ' (calibrating — need ' + str(_MIN_SAMPLES_FOR_FEEDBACK - entry['total']) + ' more)'}", flush=True)
 
 
 def get_signal_weight(signal_type):
@@ -6808,16 +6837,28 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
         votes["neutral"] += 1
     # pain_pull = (max_pain - price) / price * 100
     # Positive = price BELOW max pain → magnetic pull UP (bullish)
-    # Negative = price ABOVE max pain → price extended above pin (momentum, but slight pull back)
-    if pain_pull > 3:
-        score += 8; reasons.append(f"Price ${price:.0f} below Max Pain ${max_pain:.0f} — magnetic pull UP")
+    # Negative = price ABOVE max pain → price extended above pin
+    #
+    # MaxPain gravity: when price is above MaxPain and within 5%, GEX forces
+    # will pull price DOWN toward MaxPain into expiry. This is a headwind for BUY.
+    _mp_above = -pain_pull   # positive = price is above MaxPain (likely scenario)
+    if pain_pull > 5:
+        # Price meaningfully below MaxPain — strong magnetic pull UP
+        score += 10; reasons.append(f"MaxPain ${max_pain:.0f} is {pain_pull:.1f}% above — strong pull UP")
         votes["bull"] += 1
-    elif pain_pull < -5:
-        # Price significantly above max pain — momentum overshoot, mild caution
-        score -= 4; reasons.append(f"Price {abs(pain_pull):.1f}% above Max Pain ${max_pain:.0f} — extended")
-        votes["neutral"] += 1  # neutral not bear — just extended
-    elif pain_pull < -3:
-        votes["neutral"] += 1  # slightly above max pain — fine, no penalty
+    elif pain_pull > 1:
+        # Price slightly below MaxPain — mild pull up
+        score += 4; votes["bull"] += 1
+    elif _mp_above > 5:
+        # Price extended well above MaxPain — strong gravitational pull DOWN
+        score -= 10; reasons.append(f"MaxPain ${max_pain:.0f} is {_mp_above:.1f}% below — gravity headwind")
+        votes["bear"] += 1
+    elif _mp_above > 2:
+        # Price moderately above MaxPain — reduce BUY conviction
+        score -= 5; reasons.append(f"MaxPain ${max_pain:.0f} ({_mp_above:.1f}% below) — drag on rally")
+        votes["neutral"] += 1
+    elif _mp_above > 0:
+        votes["neutral"] += 1  # at MaxPain — neutral
 
     # 3b. Dealer hedge structure — GEX flip, call/put wall, vanna, charm
     _gex_flip    = float(mm_data.get("gex_flip_level", 0) or 0)
