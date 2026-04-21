@@ -7667,7 +7667,11 @@ def run_analysis(refresh_4h=True, refresh_news=True):
 
             # ── Weekend / Stale Data Guard ──────────────────────────────────────
             # Don't compute dealer walls from stale weekend chain — use cached values
-            _is_stale_chain = _schwab_opts.get("_stale", False) or                               state.get("session_type", "") in ("WEEKEND", "HOLIDAY")
+            _session_now = state.get("session_type", "UNKNOWN")
+            _is_stale_chain = (
+                _schwab_opts.get("_stale", False) and
+                _session_now not in ("MARKET", "PRE-MARKET", "POST-MARKET")
+            ) or _session_now in ("WEEKEND", "HOLIDAY")
             if _is_stale_chain:
                 # Preserve last-known-good dealer levels from previous live session
                 _prev_mm = state.get("mm_data", {})
@@ -7694,7 +7698,8 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 # ── Compute Call/Put walls directly from Schwab data ────────────
                 # Bypasses the failing yfinance MM function which has the tuple error.
                 # Schwab returns clean list-of-dicts — reliable even when yfinance fails.
-                if mm_data.get("call_wall") is None and _schwab_opts.get("calls"):
+                # Always recompute walls from Schwab — more reliable than yfinance MM
+                if _schwab_opts.get("calls"):
                     try:
                         _sc_calls = [c for c in _schwab_opts["calls"]
                                      if isinstance(c, dict) and c.get("strike", 0) > price]
