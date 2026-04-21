@@ -7668,9 +7668,11 @@ def run_analysis(refresh_4h=True, refresh_news=True):
             # ── Weekend / Stale Data Guard ──────────────────────────────────────
             # Don't compute dealer walls from stale weekend chain — use cached values
             _session_now = state.get("session_type", "UNKNOWN")
+            _LIVE_SESSIONS = {"REGULAR", "MARKET", "PRE-MARKET", "POST-MARKET",
+                              "pre-market", "regular", "post-market"}
             _is_stale_chain = (
                 _schwab_opts.get("_stale", False) and
-                _session_now not in ("MARKET", "PRE-MARKET", "POST-MARKET")
+                _session_now not in _LIVE_SESSIONS
             ) or _session_now in ("WEEKEND", "HOLIDAY")
             if _is_stale_chain:
                 # Preserve last-known-good dealer levels from previous live session
