@@ -7721,10 +7721,18 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 # Always recompute walls from Schwab — more reliable than yfinance MM
                 if _schwab_opts.get("calls"):
                     try:
+                        # Filter to near-term strikes only (±20%) with minimum OI
+                        # Excludes LEAPS ($960) and ultra-deep OTM ($300) which skew the wall
+                        _wall_lo = price * 0.80
+                        _wall_hi = price * 1.20
                         _sc_calls = [c for c in _schwab_opts["calls"]
-                                     if isinstance(c, dict) and c.get("strike", 0) > price]
+                                     if isinstance(c, dict)
+                                     and price < c.get("strike", 0) <= _wall_hi
+                                     and c.get("oi", 0) > 50]
                         _sc_puts  = [p for p in _schwab_opts["puts"]
-                                     if isinstance(p, dict) and p.get("strike", 0) < price]
+                                     if isinstance(p, dict)
+                                     and _wall_lo <= p.get("strike", 0) < price
+                                     and p.get("oi", 0) > 50]
                         # Aggregate OI by strike
                         _call_oi_by_strike = {}
                         for _c in _sc_calls:
@@ -8686,8 +8694,10 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                     "post_earnings_mode":  _post_earnings_mode,
                     "near_5d":        bool(_earn_near_5d),
                     "near_10d":       bool(_earn_near_10d),
-                    "next_date":      str(_future[0]) if _earn_dates and _future else "Unknown",
-                    "next_earnings":  str(_future[0]) if _earn_dates and _future else "Unknown",
+                    # next_date: prefer future, fall back to today if it's earnings day
+                    "next_date":      str(_future[0]) if _future else (str(_earn_dates[0]) if _earn_dates and _earn_days_away == 0 else "Unknown"),
+                    "next_earnings":  str(_future[0]) if _future else (str(_earn_dates[0]) if _earn_dates and _earn_days_away == 0 else "Unknown"),
+                    "days_since_earnings": 0 if _earn_days_away == 0 else None,
                 }
             except Exception: pass
 
@@ -13538,11 +13548,10 @@ function _updateUI_inner(s) {
   setText('uoa-puts', _pp ? '$' + (_pp/1e6).toFixed(1) + 'M puts' : '—', 'bear');
 
   setText('earn-next', earn.next_earnings || earn.next_date || '—');
-  setText('earn-days', earn.days_away != null ? earn.days_away + ' days' : '—',
-    earn.days_away <= 7 ? 'warn' : '');
+  var daysLabel = earn.days_away == null ? '—' : earn.days_away === 0 ? 'TODAY 🚨' : earn.days_away + ' days';
+  setText('earn-days', daysLabel, earn.days_away != null && earn.days_away <= 7 ? 'extreme' : '');
   setText('earn-mode', earn.earnings_mode ? 'YES ⚠️' : 'No', earn.earnings_mode ? 'warn' : '');
-  setText('earn-size', earn.earnings_mode ?
-    (earn.days_away <= 3 ? 'Max 40%' : 'Max 60%') : 'Normal', 'warn');
+  setText('earn-size', earn.earnings_mode ? (earn.days_away <= 3 ? 'Max 40%' : 'Max 60%') : 'Normal', earn.earnings_mode ? 'warn' : '');
 
   // Market tab
   var spy = s.spy_data || {};
@@ -14221,9 +14230,13 @@ def start_background_threads():
         if _next_earn:
             _days_away = (_next_earn - _today_s).days
             state["earnings_context"] = {
-                "earnings_mode": _days_away <= 14,
-                "days_away":     _days_away,
-                "next_date":     str(_next_earn),
+                "earnings_mode":      _days_away <= 14,
+                "days_away":          _days_away,
+                "next_date":          str(_next_earn),
+                "next_earnings":      str(_next_earn),
+                "post_earnings_mode": False,
+                "near_5d":            _days_away <= 5,
+                "near_10d":           _days_away <= 10,
             }
             if _days_away <= 14:
                 print(f"[STARTUP] ⚠️ Earnings in {_days_away} days — sizing cap pre-applied", flush=True)
