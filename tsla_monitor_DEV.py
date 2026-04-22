@@ -7644,11 +7644,22 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                             _prev_gex == _curr_gex
                         ) or _session_type in ("WEEKEND", "HOLIDAY")
                         _schwab_opts["_stale"] = _gex_stale
-                        print(f"  📡 Schwab options: {len(_schwab_opts['calls'])} calls, "
-                              f"{len(_schwab_opts['puts'])} puts, "
+                        _n_calls = len(_schwab_opts['calls'])
+                        _n_puts  = len(_schwab_opts['puts'])
+                        print(f"  📡 Schwab options: {_n_calls} calls, "
+                              f"{_n_puts} puts, "
                               f"GEX={_curr_gex:.0f}M "
                               f"PC={_schwab_opts.get('pc_ratio',0):.2f}"
                               f"{' [STALE-AH]' if _gex_stale else ''}", flush=True)
+                        # Data quality gate: sparse chain = degraded Schwab token
+                        # Normal chain: 2,800+ calls/puts. Under 800 = partial/broken.
+                        _chain_ok = _n_calls >= 800 and _n_puts >= 800
+                        if not _chain_ok:
+                            print(f"  ⚠️ DATA QUALITY: sparse options chain ({_n_calls}C/{_n_puts}P) "
+                                  f"— signals suppressed until chain recovers", flush=True)
+                            state["_data_degraded"] = True
+                        else:
+                            state["_data_degraded"] = False
                 except Exception as _soe:
                     print(f"  ⚠️ Schwab options failed: {_soe}", flush=True)
                     _schwab_opts = {}
@@ -8400,6 +8411,12 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 signal = "BUY"
                 print(f"  🚨 BYPASS: ML conf={_ml_conf:.0f}% + {_dv_state} → BUY forced through", flush=True)
 
+            # Data quality gate — suppress signals when Schwab chain is broken
+            _data_degraded = state.get("_data_degraded", False)
+            if _data_degraded and signal in ("BUY", "SELL", "STRONG BUY", "STRONG SELL"):
+                print(f"  ⚠️ {signal} suppressed — data quality degraded (sparse options chain)", flush=True)
+                signal = "HOLD"
+
             # AUC gate — don't alert on near-random models
             if not _auc_ok and signal in ("BUY", "SELL", "STRONG BUY", "STRONG SELL"):
                 print(f"  ⚠️ {signal} suppressed — model AUC {_cur_auc:.3f} < 0.55 minimum", flush=True)
@@ -8408,6 +8425,13 @@ def run_analysis(refresh_4h=True, refresh_news=True):
             # Bootstrap suppression — no alerts on cycle 1 synthetic conviction
             if not _bootstrap_ok and signal in ("BUY", "SELL", "STRONG BUY", "STRONG SELL"):
                 print(f"  ⚠️ {signal} suppressed — bootstrap cycle {_cycle_num}/3, need real data first", flush=True)
+                signal = "HOLD"
+
+            # Post-earnings suppression — wait 15min after earnings for dust to settle
+            _earn_ctx_now = state.get("earnings_context", {})
+            if _earn_ctx_now.get("post_earnings_mode") and signal in ("BUY", "SELL", "STRONG BUY", "STRONG SELL"):
+                _since_earn = _earn_ctx_now.get("days_since_earnings", 1)
+                print(f"  ⚠️ {signal} suppressed — post-earnings mode ({_since_earn}d ago) — wait for reaction to settle", flush=True)
                 signal = "HOLD"
 
             # SPOCK conviction check (with lowered threshold)
@@ -8611,6 +8635,7 @@ def run_analysis(refresh_4h=True, refresh_news=True):
             # NEW: Earnings proximity — cached, with earnings mode detection
             _earn_proximity = 0.0; _earn_near_5d = 0; _earn_near_10d = 0
             _earn_days_away = 99; _earnings_mode = False
+            _post_earnings_mode = False  # True for 24h after earnings
             try:
                 _earn_dates = state.get("_ml_earn_dates", [])
                 _earn_ticker = state.get("_ml_earn_ticker", "")
@@ -8640,13 +8665,25 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                     _earn_near_10d   = 1 if _dte <= 10 else 0
                     _earnings_mode   = _dte <= 7  # within 1 week of earnings
 
+                    # Post-earnings mode: check if earnings was 0-1 days AGO
+                    _past = [ed for ed in _earn_dates if ed < _today]
+                    if _past:
+                        _days_since = (_today - max(_past)).days
+                        _post_earnings_mode = _days_since <= 1  # 24h post-earnings window
+                    else:
+                        _post_earnings_mode = False
+
                     if _earnings_mode:
                         print(f"  ⚠️ EARNINGS MODE: {TICKER} earnings in {_dte} days!", flush=True)
+                    if _post_earnings_mode:
+                        print(f"  📋 POST-EARNINGS MODE: {TICKER} reported {_days_since}d ago — "
+                              f"wait 15min for initial reaction to settle", flush=True)
 
                 # Store earnings context in state for dashboard
                 state["earnings_context"] = {
                     "days_away":      _earn_days_away,
-                    "earnings_mode":  _earnings_mode,
+                    "earnings_mode":       _earnings_mode,
+                    "post_earnings_mode":  _post_earnings_mode,
                     "near_5d":        bool(_earn_near_5d),
                     "near_10d":       bool(_earn_near_10d),
                     "next_date":      str(_future[0]) if _earn_dates and _future else "Unknown",
