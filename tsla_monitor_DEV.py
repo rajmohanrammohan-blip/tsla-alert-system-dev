@@ -7636,7 +7636,13 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                         _prev_gex = state.get("mm_data", {}).get("gex_total", None)
                         _curr_gex = _schwab_opts.get('gex_total', 0)
                         _session_type = state.get("session_type", "UNKNOWN")
-                        _gex_stale = (_prev_gex is not None and _prev_gex == _curr_gex) or                                      _session_type in ("WEEKEND", "HOLIDAY")
+                        # Only flag stale if GEX is non-zero AND unchanged (true staleness)
+                        # GEX=0 means options fetch failed — not the same as stale data
+                        _gex_stale = (
+                            _curr_gex != 0 and
+                            _prev_gex is not None and
+                            _prev_gex == _curr_gex
+                        ) or _session_type in ("WEEKEND", "HOLIDAY")
                         _schwab_opts["_stale"] = _gex_stale
                         print(f"  📡 Schwab options: {len(_schwab_opts['calls'])} calls, "
                               f"{len(_schwab_opts['puts'])} puts, "
@@ -7669,7 +7675,8 @@ def run_analysis(refresh_4h=True, refresh_news=True):
             # Don't compute dealer walls from stale weekend chain — use cached values
             _session_now = state.get("session_type", "UNKNOWN")
             _LIVE_SESSIONS = {"REGULAR", "MARKET", "PRE-MARKET", "POST-MARKET",
-                              "pre-market", "regular", "post-market"}
+                              "OVERNIGHT", "EXTENDED", "pre-market", "regular",
+                              "post-market", "overnight", "extended"}
             _is_stale_chain = (
                 _schwab_opts.get("_stale", False) and
                 _session_now not in _LIVE_SESSIONS
