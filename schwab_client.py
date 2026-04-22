@@ -26,6 +26,60 @@ _client = None          # cached schwab client
 _client_ts = 0          # when it was created
 _token_cache = {}       # in-memory token (refreshed automatically)
 
+# Token health tracking
+_token_ok = True                  # False when auth errors detected
+_token_failed_at = 0              # timestamp of first auth failure
+_token_alert_sent = False         # only send WhatsApp alert once per expiry
+_token_fail_count = 0             # consecutive auth failures
+
+def _on_auth_error(e):
+    """Called when any Schwab auth error is detected. Sends WhatsApp alert once."""
+    global _token_ok, _token_failed_at, _token_alert_sent, _token_fail_count
+    import time as _t
+    _token_fail_count += 1
+    if _token_ok:
+        _token_ok = False
+        _token_failed_at = _t.time()
+        log.error(f"[SCHWAB] 🚨 TOKEN EXPIRED — all Schwab data degraded. Re-auth at developer.schwab.com")
+    # Send WhatsApp alert once — don't spam on every failed call
+    if not _token_alert_sent and _token_fail_count >= 3:
+        _token_alert_sent = True
+        try:
+            import os as _os, requests as _rq
+            _gp  = _os.environ.get("GREEN_PHONE", "")
+            _gt  = _os.environ.get("GREEN_TOKEN", "")
+            _gi  = _os.environ.get("GREEN_INSTANCE", "")
+            if _gp and _gt and _gi:
+                _nl = "\n"
+                _msg = (
+                    f"🚨 *SCHWAB TOKEN EXPIRED*{_nl}"
+                    f"━━━━━━━━━━━━━━━━━━━━━━{_nl}"
+                    f"All Schwab data is degraded. Signals unreliable.{_nl}{_nl}"
+                    f"Fix: Go to developer.schwab.com → re-run OAuth flow{_nl}"
+                    f"Then update SCHWAB_TOKEN_JSON in Railway env vars.{_nl}{_nl}"
+                    f"⚠️ Do NOT trade until token is refreshed."
+                )
+                _rq.post(
+                    f"https://api.green-api.com/waInstance{_gi}/sendMessage/{_gt}",
+                    json={"chatId": f"{_gp}@c.us", "message": _msg},
+                    timeout=5
+                )
+                log.info("[SCHWAB] Token expiry WhatsApp alert sent")
+        except Exception as _ae:
+            log.warning(f"[SCHWAB] Could not send token alert: {_ae}")
+
+def is_token_healthy():
+    """Returns True if Schwab token is working."""
+    return _token_ok
+
+def reset_token_health():
+    """Call after successful re-auth to restore healthy state."""
+    global _token_ok, _token_alert_sent, _token_fail_count
+    _token_ok = True
+    _token_alert_sent = False
+    _token_fail_count = 0
+    log.info("[SCHWAB] Token health restored")
+
 def is_configured():
     """True if Schwab credentials are present."""
     return bool(SCHWAB_APP_KEY and SCHWAB_APP_SECRET)
@@ -271,6 +325,9 @@ def get_price_history(symbol, period_years=2, freq_minutes=5):
         return df
 
     except Exception as e:
+        _err_str = str(e)
+        if "refresh_token" in _err_str or "unsupported_token_type" in _err_str or "OAuthError" in type(e).__name__:
+            _on_auth_error(e)
         log.error(f"[SCHWAB] price_history error: {e}")
         return _yf_fallback_history(symbol, period_years, freq_minutes)
 
@@ -285,7 +342,13 @@ def _yf_fallback_history(symbol, period_years, freq_minutes):
         if freq_minutes <= 5 and period_years > 0.16:
             period = "60d"
         else:
-            period = f"{min(period_years, 2)}y"
+            # yfinance only accepts integer years or specific strings
+            _py = min(period_years, 2)
+            if _py <= 0.25:   period = "3mo"
+            elif _py <= 0.5:  period = "6mo"
+            elif _py < 1.0:   period = "6mo"
+            elif _py < 2.0:   period = "1y"
+            else:             period = "2y"
         df = yf.download(symbol, period=period, interval=interval,
                          progress=False, auto_adjust=True)
         if hasattr(df.columns, "levels"):
@@ -473,6 +536,9 @@ def get_option_chain(symbol, current_price=None):
         }
 
     except Exception as e:
+        _err_str = str(e)
+        if "refresh_token" in _err_str or "unsupported_token_type" in _err_str:
+            _on_auth_error(e)
         log.error(f"[SCHWAB] option_chain error: {e}")
         import traceback; traceback.print_exc()
         return _yf_fallback_options(symbol)
