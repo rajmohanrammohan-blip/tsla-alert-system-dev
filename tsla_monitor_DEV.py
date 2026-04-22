@@ -8437,10 +8437,41 @@ def run_analysis(refresh_4h=True, refresh_news=True):
 
             # Post-earnings suppression — wait 15min after earnings for dust to settle
             _earn_ctx_now = state.get("earnings_context", {})
-            if _earn_ctx_now.get("post_earnings_mode") and signal in ("BUY", "SELL", "STRONG BUY", "STRONG SELL"):
+            _post_earn = _earn_ctx_now.get("post_earnings_mode", False)
+            if _post_earn and signal in ("BUY", "SELL", "STRONG BUY", "STRONG SELL"):
                 _since_earn = _earn_ctx_now.get("days_since_earnings", 1)
-                print(f"  ⚠️ {signal} suppressed — post-earnings mode ({_since_earn}d ago) — wait for reaction to settle", flush=True)
+                print(f"  ⚠️ {signal} suppressed — post-earnings ({_since_earn}d ago) — waiting for reaction to settle", flush=True)
                 signal = "HOLD"
+
+            # ── Post-earnings gap alert ─────────────────────────────────────────
+            # When earnings are today (days_away=0) and price gaps >3% after-hours,
+            # fire a special post-earnings gap alert instead of normal BUY/SELL
+            if _earn_ctx_now.get("days_away") == 0 and state.get("session_type") in ("POST-MARKET", "OVERNIGHT", "EXTENDED"):
+                _earn_price = state.get("_earn_close_price")
+                if _earn_price and price and abs((price - _earn_price) / _earn_price) >= 0.03:
+                    _gap_pct = round((price - _earn_price) / _earn_price * 100, 2)
+                    _direction = "UP" if _gap_pct > 0 else "DOWN"
+                    _earn_levels = {
+                        "bull_target": 410, "call_wall": mm_data.get("call_wall", 400),
+                        "pivot": mm_data.get("max_pain", 390),
+                        "gex_flip": mm_data.get("gex_flip_level", 377),
+                        "danger": 365,
+                    }
+                    _nl = "\n"
+                    _earn_msg = (
+                        f"📋 TSLA *POST-EARNINGS GAP {_direction}*{_nl}"
+                        f"━━━━━━━━━━━━━━━━━━━━━━{_nl}"
+                        f"Gap: *{_gap_pct:+.1f}%* | Price: *${price:.2f}*{_nl}"
+                        f"Key levels:{_nl}"
+                        f"  Resistance: ${_earn_levels['call_wall']} (Call Wall){_nl}"
+                        f"  Pivot:      ${_earn_levels['pivot']} (MaxPain){_nl}"
+                        f"  GEX Flip:   ${_earn_levels['gex_flip']} ← regime change level{_nl}"
+                        f"{'⚠️ GEX FLIP BREACHED — moves will AMPLIFY' if price < _earn_levels['gex_flip'] else '✅ Above GEX flip — structure intact'}"
+                    )
+                    log_alert(_earn_msg, alert_key="earnings_gap", cooldown_mins=30)
+                # Record close price for gap comparison on first post-market cycle
+                elif not _earn_price and state.get("session_type") == "REGULAR":
+                    state["_earn_close_price"] = price
 
             # SPOCK conviction check (with lowered threshold)
             if signal == "BUY"  and not _spock_ok_buy and not _bypass_buy:
@@ -12501,7 +12532,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>SPOCK — TSLA Intelligence v20260420_1200</title>
+<title>SPOCK — TSLA Intelligence v20260422_1830</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
