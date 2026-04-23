@@ -9044,11 +9044,14 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 "vega_exposure":   _vega_atm,
                 "iv_skew":         _iv_skew,
             }
-            ml_signal = _get_ml_signal(_ml_features)
+            ml_signal = _get_ml_signal(_ml_features) or {"signal":"HOLD","confidence":0,"probability":0.5,"available":False,"error":""}
             state["ml_signal"]         = ml_signal
             state["_last_ml_features"] = _ml_features  # for SPOCK decision logging
 
             # ── MASTER SIGNAL — synthesize all models ──────────────────────
+            # Ensure ml_signal is always defined even if ML block throws early
+            if "ml_signal" not in dir() or ml_signal is None:
+                ml_signal = state.get("ml_signal", {"signal":"HOLD","confidence":0,"probability":0.5,"available":False,"error":""})
             try:
                 # Level 2 / Tape signal
                 try:
@@ -9217,7 +9220,8 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                   f"regime={_regime_str} matched={ml_signal.get('features_matched','?')}/{ml_signal.get('features_total','?')} "
                   f"avail={ml_signal.get('available')} err={ml_signal.get('error','')}", flush=True)
         except Exception as _ml_e:
-            state["ml_signal"] = {"signal":"HOLD","confidence":0,"probability":0.5,"available":False,"error":str(_ml_e)[:60]}
+            ml_signal = {"signal":"HOLD","confidence":0,"probability":0.5,"available":False,"error":str(_ml_e)[:60]}
+            state["ml_signal"] = ml_signal
             print(f"  [ML] EXCEPTION: {_ml_e}", flush=True)
 
         # ── Entry signal WhatsApp alert ──
