@@ -577,11 +577,11 @@ def generate_signal(indicators, price):
     # POC / Value Area in generate_signal
     # ── Session volume shelf signal ──────────────────────────────────────────
     _poc_raw = state.get("poc_data", {})
-    if _poc_raw.get("in_volume_vacuum") and price_arg and price_arg < _poc_raw.get("poc", price_arg):
+    if _poc_raw.get("in_volume_vacuum") and price and price < _poc_raw.get("poc", price):
         score -= 5; votes["neutral"] += 1
-        reasons.append(f"Volume vacuum — thin zone, nearest support ${_poc_raw.get('nearest_support','?'):.0f}")
-    elif _poc_raw.get("nearest_support") and price_arg:
-        _sup_dist = price_arg - _poc_raw["nearest_support"]
+        reasons.append(f"Volume vacuum — thin zone, nearest support ${_poc_raw.get('nearest_support', 0) or 0:.0f}")
+    elif _poc_raw.get("nearest_support") and price:
+        _sup_dist = price - _poc_raw["nearest_support"]
         if 0 <= _sup_dist <= 2.0:
             score += 6; votes["bull"] += 1
             reasons.append(f"Volume shelf support at ${_poc_raw['nearest_support']:.0f} — institutional floor")
@@ -589,7 +589,7 @@ def generate_signal(indicators, price):
     _poc_s = indicators.get("poc_price", 0) or 0
     _vah_s = indicators.get("vah", 0) or 0
     _val_s = indicators.get("val", 0) or 0
-    _cur   = float(indicators.get("current_price", 0) or price_arg)
+    _cur   = float(indicators.get("current_price", 0) or price or 0)
     if _poc_s > 0:
         if _vah_s > 0 and _cur > _vah_s:
             score += 12; reasons.append(f"Price above VAH ${_vah_s:.0f} — value area breakout ▲")
@@ -7735,18 +7735,18 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 # Always recompute walls from Schwab — more reliable than yfinance MM
                 if _schwab_opts.get("calls"):
                     try:
-                        # Filter to near-term strikes only (±20%) with minimum OI
-                        # Excludes LEAPS ($960) and ultra-deep OTM ($300) which skew the wall
-                        _wall_lo = price * 0.80
-                        _wall_hi = price * 1.20
+                        # Filter to near-term strikes only (±15%) with minimum OI > 100
+                        # Tighter range excludes post-expiry LEAPS and collapsed put floors
+                        _wall_lo = price * 0.85
+                        _wall_hi = price * 1.15
                         _sc_calls = [c for c in _schwab_opts["calls"]
                                      if isinstance(c, dict)
                                      and price < c.get("strike", 0) <= _wall_hi
-                                     and c.get("oi", 0) > 50]
+                                     and c.get("oi", 0) > 100]
                         _sc_puts  = [p for p in _schwab_opts["puts"]
                                      if isinstance(p, dict)
                                      and _wall_lo <= p.get("strike", 0) < price
-                                     and p.get("oi", 0) > 50]
+                                     and p.get("oi", 0) > 100]
                         # Aggregate OI by strike
                         _call_oi_by_strike = {}
                         for _c in _sc_calls:
