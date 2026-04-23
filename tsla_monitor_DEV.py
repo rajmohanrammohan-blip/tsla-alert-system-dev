@@ -549,7 +549,10 @@ def generate_signal(indicators, price):
         score -= pts; reasons.append(f"HMM: BEARISH regime ({int(hmm_conf*100)}% conf) -{pts}")
 
     # ── Volume Spike — confirmation amplifier ──
-    vol_ratio = indicators.get("volume_ratio", 1.0)
+    # Use session-adjusted volume ratio (pre-market gets 0.3x weight)
+    _raw_vol_ratio = indicators.get("volume_ratio", 1.0)
+    _vh_adj = state.get("vol_hawk", {}).get("ratio_adj") if state.get("vol_hawk") else None
+    vol_ratio = _vh_adj if _vh_adj is not None else _raw_vol_ratio
     vol_trend = indicators.get("volume_trend", 0)  # +1 rising, -1 falling, 0 flat
 
     if vol_ratio > 2.0:
@@ -8187,22 +8190,46 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 # 5-day volume context
                 _vol_5d_avg = float(volumes.iloc[-5*78:].mean()) if len(volumes) > 5*78 else _vol_ma20
                 _vol_percentile = round(sum(1 for v in volumes.iloc[-20:] if v <= _vol_now) / 20 * 100)
+                # ── Session-aware volume weighting ────────────────────────────
+                # Pre-market/AH volume is structurally thin — 3x pre-market ≠ 3x regular session
+                # Apply session weight before alert level classification
+                _sess_now = state.get("session_type", "UNKNOWN")
+                _session_vol_weight = {
+                    "REGULAR":      1.0,
+                    "MARKET":       1.0,
+                    "PRE-MARKET":   0.30,   # pre-mkt thin; 3x raw = 0.9x effective
+                    "POST-MARKET":  0.35,
+                    "OVERNIGHT":    0.20,
+                    "EXTENDED":     0.30,
+                    "WEEKEND":      0.0,
+                    "HOLIDAY":      0.0,
+                }.get(_sess_now, 1.0)
+                _vol_ratio_adj = round(_vol_ratio * _session_vol_weight, 2)
+                _vol_session_note = (
+                    f" (adj {_vol_ratio_adj:.1f}x — {_sess_now} session weight {_session_vol_weight})"
+                    if _session_vol_weight < 1.0 else ""
+                )
+                # Use adjusted ratio for alert level — raw ratio for display
+                _alert_ratio = _vol_ratio_adj
                 _vol_hawk = {
-                    "current":      round(_vol_now),
-                    "ma20":         round(_vol_ma20),
-                    "ma5":          round(_vol_ma5),
-                    "ratio":        round(_vol_ratio, 2),
-                    "ratio5":       round(_vol_ratio5, 2),
-                    "trend":        _vol_trend,
-                    "percentile":   _vol_percentile,
-                    "spike":        _vol_ratio >= 3.0,
-                    "elevated":     _vol_ratio >= 1.5,
-                    "dry":          _vol_ratio <= 0.5,
-                    "alert_level":  "EXTREME" if _vol_ratio >= 4.0 else "HIGH" if _vol_ratio >= 2.5 else "ELEVATED" if _vol_ratio >= 1.5 else "NORMAL",
+                    "current":          round(_vol_now),
+                    "ma20":             round(_vol_ma20),
+                    "ma5":              round(_vol_ma5),
+                    "ratio":            round(_vol_ratio, 2),
+                    "ratio_adj":        _vol_ratio_adj,
+                    "session_weight":   _session_vol_weight,
+                    "ratio5":           round(_vol_ratio5, 2),
+                    "trend":            _vol_trend,
+                    "percentile":       _vol_percentile,
+                    "spike":            _alert_ratio >= 3.0,
+                    "elevated":         _alert_ratio >= 1.5,
+                    "dry":              _vol_ratio <= 0.5,
+                    "alert_level":      "EXTREME" if _alert_ratio >= 4.0 else "HIGH" if _alert_ratio >= 2.5 else "ELEVATED" if _alert_ratio >= 1.5 else "NORMAL",
+                    "session":          _sess_now,
                 }
                 state["vol_hawk"] = _vol_hawk
-                _vh_emoji = "🔥" if _vol_ratio >= 3.0 else "📈" if _vol_ratio >= 1.5 else "📉" if _vol_ratio <= 0.5 else "📊"
-                print(f"  {_vh_emoji} Volume Hawk: {_vol_ratio:.1f}x avg | "
+                _vh_emoji = "🔥" if _alert_ratio >= 3.0 else "📈" if _alert_ratio >= 1.5 else "📉" if _vol_ratio <= 0.5 else "📊"
+                print(f"  {_vh_emoji} Volume Hawk: {_vol_ratio:.1f}x avg{_vol_session_note} | "
                       f"Trend:{_vol_trend} | Percentile:{_vol_percentile}th | "
                       f"Alert:{_vol_hawk['alert_level']}", flush=True)
                 # Extreme volume spike alert
@@ -8483,7 +8510,8 @@ def run_analysis(refresh_4h=True, refresh_news=True):
             _entry_score_now = entry_data.get("entry_score", 0) if entry_data else 0
             _ml_conf_now     = float(ml_signal.get("confidence", 0)) if ml_signal else 0
             _spock_conv_now  = master_signal.get("conviction", 0) if master_signal else 0
-            _vh_ratio_now    = state.get("vol_hawk", {}).get("ratio", 0) if state.get("vol_hawk") else 0
+            _vh_ratio_now    = state.get("vol_hawk", {}).get("ratio_adj",
+                               state.get("vol_hawk", {}).get("ratio", 0)) if state.get("vol_hawk") else 0
             _post_earn_now   = state.get("earnings_context", {}).get("post_earnings_mode", False)
             _high_conviction_override = (
                 _entry_score_now >= 80 and
