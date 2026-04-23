@@ -578,12 +578,12 @@ def generate_signal(indicators, price):
     # ── Session volume shelf signal ──────────────────────────────────────────
     _poc_raw = state.get("poc_data", {})
     if _poc_raw.get("in_volume_vacuum") and price and price < _poc_raw.get("poc", price):
-        score -= 5; votes["neutral"] += 1
+        score -= 5
         reasons.append(f"Volume vacuum — thin zone, nearest support ${_poc_raw.get('nearest_support', 0) or 0:.0f}")
     elif _poc_raw.get("nearest_support") and price:
         _sup_dist = price - _poc_raw["nearest_support"]
         if 0 <= _sup_dist <= 2.0:
-            score += 6; votes["bull"] += 1
+            score += 6
             reasons.append(f"Volume shelf support at ${_poc_raw['nearest_support']:.0f} — institutional floor")
 
     _poc_s = indicators.get("poc_price", 0) or 0
@@ -7778,6 +7778,68 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                               f"(+{mm_data.get('call_wall_dist_pct',0):.1f}%) | "
                               f"Put=${mm_data.get('put_wall')} "
                               f"(-{mm_data.get('put_wall_dist_pct',0):.1f}%)", flush=True)
+
+                        # ── GEX Flip from Schwab data (BS gamma scan) ───────────────
+                        # Runs when MM function crashes before setting gex_flip_level
+                        if mm_data.get("gex_flip_level") is None and _schwab_opts.get("calls"):
+                            try:
+                                import math as _mf
+                                from datetime import date as _df, datetime as _dtf
+                                _avg_iv  = float(_schwab_opts.get("avg_iv", 0.35) or 0.35)
+                                _exp_raw = _schwab_opts.get("expiries", [None])[0]
+                                _dte     = 5  # default
+                                if _exp_raw:
+                                    try:
+                                        _dte = max((_dtf.strptime(str(_exp_raw), "%Y-%m-%d").date() - _df.today()).days, 1)
+                                    except Exception:
+                                        pass
+                                _T = _dte / 365.0
+                                def _bsg(S, K, T, sig):
+                                    if T<=0 or sig<=0 or S<=0 or K<=0: return 0.0
+                                    try:
+                                        d1 = (_mf.log(S/K)+(0.05+0.5*sig**2)*T)/(sig*_mf.sqrt(T))
+                                        return _mf.exp(-0.5*d1**2)/(_mf.sqrt(2*_mf.pi)*S*sig*_mf.sqrt(T))
+                                    except Exception: return 0.0
+                                # Build OI map from Schwab options within ±25%
+                                _oi_map = {}
+                                for _opt in (_schwab_opts.get("calls",[]) + _schwab_opts.get("puts",[])):
+                                    if not isinstance(_opt, dict): continue
+                                    _k   = round(float(_opt.get("strike", 0)))
+                                    _oi  = int(_opt.get("oi", 0))
+                                    _typ = _opt.get("type", "call")
+                                    if _k not in _oi_map:
+                                        _oi_map[_k] = {"call_oi": 0, "put_oi": 0}
+                                    if _typ == "call":
+                                        _oi_map[_k]["call_oi"] += _oi
+                                    else:
+                                        _oi_map[_k]["put_oi"] += _oi
+                                # Scan ±20% from price in $2 steps
+                                _scan = [price*0.80 + i*2.0 for i in range(int(price*0.40/2.0)+1)]
+                                _gex_profile = []
+                                for _hypo in _scan:
+                                    _net = 0.0
+                                    for _k, _d in _oi_map.items():
+                                        _g = _bsg(_hypo, _k, _T, _avg_iv)
+                                        _net += (_d["call_oi"] - _d["put_oi"]) * _g * 100 * (_hypo**2) / 1e9
+                                    _gex_profile.append((_hypo, _net))
+                                # Find zero crossing below price
+                                _prev_gex2 = None
+                                for _hypo2, _net2 in sorted(_gex_profile, key=lambda x: -x[0]):
+                                    if _hypo2 >= price: continue
+                                    if _prev_gex2 is None:
+                                        _prev_gex2 = (_hypo2, _net2); continue
+                                    _ph, _pg = _prev_gex2
+                                    if _pg >= 0 and _net2 < 0:
+                                        _flip = _ph + (0-_pg)*((_hypo2-_ph)/(_net2-_pg+1e-9))
+                                        mm_data["gex_flip_level"]    = round(_flip, 1)
+                                        mm_data["gex_flip_dist_pct"] = round((price-_flip)/price*100, 2)
+                                        mm_data["gex_flip_strength"] = abs(_net2)
+                                        print(f"  🏦 GEX Flip (Schwab BS): ${round(_flip,1)} "
+                                              f"({mm_data['gex_flip_dist_pct']:.1f}% away)", flush=True)
+                                        break
+                                    _prev_gex2 = (_hypo2, _net2)
+                            except Exception as _gfx2: pass
+
                     except Exception as _wle:
                         print(f"  ⚠️ Wall computation error: {_wle}", flush=True)
 
