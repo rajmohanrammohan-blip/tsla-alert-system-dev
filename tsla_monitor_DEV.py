@@ -572,6 +572,17 @@ def generate_signal(indicators, price):
         score -= 10; reasons.append("OBV falling — distribution pressure ▼")
 
     # POC / Value Area in generate_signal
+    # ── Session volume shelf signal ──────────────────────────────────────────
+    _poc_raw = state.get("poc_data", {})
+    if _poc_raw.get("in_volume_vacuum") and price_arg and price_arg < _poc_raw.get("poc", price_arg):
+        score -= 5; votes["neutral"] += 1
+        reasons.append(f"Volume vacuum — thin zone, nearest support ${_poc_raw.get('nearest_support','?'):.0f}")
+    elif _poc_raw.get("nearest_support") and price_arg:
+        _sup_dist = price_arg - _poc_raw["nearest_support"]
+        if 0 <= _sup_dist <= 2.0:
+            score += 6; votes["bull"] += 1
+            reasons.append(f"Volume shelf support at ${_poc_raw['nearest_support']:.0f} — institutional floor")
+
     _poc_s = indicators.get("poc_price", 0) or 0
     _vah_s = indicators.get("vah", 0) or 0
     _val_s = indicators.get("val", 0) or 0
@@ -8093,6 +8104,48 @@ def run_analysis(refresh_4h=True, refresh_news=True):
             }
             print(f"  📊 Volume Profile: POC=${_poc_price} | VAH=${_vah} | VAL=${_val} | Price {'above' if poc_data['above_poc'] else 'below'} POC", flush=True)
 
+            # ── Session-anchored volume shelf (last 3 trading days) ────────────
+            # Shows WHERE volume is actually defending price NOW, not 30 days ago
+            # Critical post-earnings: reveals thin zones between real support levels
+            try:
+                _shelf_lookback = min(864, len(closes))  # 3 days × 288 5-min bars
+                _shelf_bins = {}
+                for _i in range(-_shelf_lookback, 0):
+                    _sh = float(highs.iloc[_i])
+                    _sl = float(lows.iloc[_i])
+                    _sv = float(volumes.iloc[_i])
+                    _ssteps = max(int((_sh - _sl) / 1.0), 1)
+                    _sv_step = _sv / _ssteps
+                    for _ss in range(_ssteps):
+                        _sbucket = round(_sl + (_ss + 0.5) * (_sh - _sl) / _ssteps, 0)
+                        _shelf_bins[_sbucket] = _shelf_bins.get(_sbucket, 0) + _sv_step
+                if _shelf_bins:
+                    _savg = sum(_shelf_bins.values()) / len(_shelf_bins)
+                    # Shelves = price levels with 2x+ average volume → real support/resistance
+                    _shelves = sorted(
+                        [(p, v) for p, v in _shelf_bins.items() if v > _savg * 2.0],
+                        key=lambda x: -x[1]
+                    )[:8]
+                    # Classify each shelf as support (below price) or resistance (above)
+                    _shelf_support    = sorted([(p, v) for p, v in _shelves if p < price], key=lambda x: -x[0])
+                    _shelf_resistance = sorted([(p, v) for p, v in _shelves if p > price], key=lambda x: x[0])
+                    _nearest_support    = _shelf_support[0][0]    if _shelf_support    else None
+                    _nearest_resistance = _shelf_resistance[0][0] if _shelf_resistance else None
+                    poc_data["session_shelves"]       = _shelves
+                    poc_data["nearest_support"]       = _nearest_support
+                    poc_data["nearest_resistance"]    = _nearest_resistance
+                    poc_data["session_shelf_count"]   = len(_shelves)
+                    poc_data["in_volume_vacuum"]      = (
+                        _nearest_support is not None and
+                        (price - _nearest_support) > 5.0  # >$5 below nearest shelf = thin zone
+                    )
+                    _vac_str = " ⚠️ VOLUME VACUUM" if poc_data["in_volume_vacuum"] else ""
+                    print(f"  📊 Volume Shelves (3d): "
+                          f"Support=${_nearest_support} Resistance=${_nearest_resistance} "
+                          f"({len(_shelves)} shelves){_vac_str}", flush=True)
+            except Exception as _shelf_err:
+                pass  # non-critical
+
         except Exception as _vol_profile_err:
             print(f"  ⚠️ vol_profile error: {_vol_profile_err}", flush=True)
             vol_profile = []
@@ -8426,9 +8479,26 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 signal = "HOLD"
 
             # AUC gate — don't alert on near-random models
+            # Exception: override when ALL confirmations align (high-conviction confluence)
+            _entry_score_now = entry_data.get("entry_score", 0) if entry_data else 0
+            _ml_conf_now     = float(ml_signal.get("confidence", 0)) if ml_signal else 0
+            _spock_conv_now  = master_signal.get("conviction", 0) if master_signal else 0
+            _vh_ratio_now    = state.get("vol_hawk", {}).get("ratio", 0) if state.get("vol_hawk") else 0
+            _post_earn_now   = state.get("earnings_context", {}).get("post_earnings_mode", False)
+            _high_conviction_override = (
+                _entry_score_now >= 80 and
+                _ml_conf_now     >= 75 and
+                _spock_conv_now  >= 65 and
+                _vh_ratio_now    >= 2.5
+            )
             if not _auc_ok and signal in ("BUY", "SELL", "STRONG BUY", "STRONG SELL"):
-                print(f"  ⚠️ {signal} suppressed — model AUC {_cur_auc:.3f} < 0.55 minimum", flush=True)
-                signal = "HOLD"
+                if _high_conviction_override:
+                    print(f"  ✅ AUC override: {signal} allowed — high-conviction confluence "
+                          f"(entry={_entry_score_now} ML={_ml_conf_now:.0f}% conv={_spock_conv_now}% vol={_vh_ratio_now:.1f}x)",
+                          flush=True)
+                else:
+                    print(f"  ⚠️ {signal} suppressed — model AUC {_cur_auc:.3f} < 0.55 minimum", flush=True)
+                    signal = "HOLD"
 
             # Bootstrap suppression — no alerts on cycle 1 synthetic conviction
             if not _bootstrap_ok and signal in ("BUY", "SELL", "STRONG BUY", "STRONG SELL"):
@@ -9534,6 +9604,17 @@ def api_watchlist_remove():
 
 
 
+
+@app.route("/api/retrain", methods=["POST", "GET"])
+def api_manual_retrain():
+    """Trigger an immediate ML retrain. Use after major market events."""
+    global _ml_retraining
+    if _ml_retraining:
+        return jsonify({"status": "already_retraining", "message": "Retrain already in progress"})
+    import threading as _thr_r
+    _thr_r.Thread(target=_run_ml_retrain, daemon=True).start()
+    print("[API] Manual retrain triggered via /api/retrain", flush=True)
+    return jsonify({"status": "started", "message": "ML retrain started — watch logs for [ML-RETRAIN] progress"})
 
 @app.route("/api/debug")
 def api_debug():
