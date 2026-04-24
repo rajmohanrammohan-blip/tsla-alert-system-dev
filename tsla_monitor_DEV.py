@@ -3042,8 +3042,9 @@ def calculate_market_maker_data(ticker_symbol, current_price):
 
         # ── Call Wall / Put Wall (highest OI concentration) ────────────────────
         # These are the true dealer-defended levels, more reliable than Max Pain
-        _cw_top = call_walls[0] if call_walls else None
-        _pw_top = put_walls[0]  if put_walls  else None
+        # Use result["call_walls"] (list of dicts) not local call_walls (list of tuples)
+        _cw_top = result["call_walls"][0] if result.get("call_walls") else None
+        _pw_top = result["put_walls"][0]  if result.get("put_walls")  else None
         result["call_wall"]     = _cw_top["strike"] if _cw_top else None
         result["call_wall_oi"]  = _cw_top["oi"]     if _cw_top else 0
         result["put_wall"]      = _pw_top["strike"]  if _pw_top else None
@@ -5190,8 +5191,11 @@ def send_whatsapp(message, alert_key="default"):
     _in_market = (_now.weekday() < 5 and
                   (_now.hour > 9 or (_now.hour == 9 and _now.minute >= 30)) and
                   _now.hour < 20)  # include pre/post market
+    # Gap/crash alerts use gap data (always fresh) — don't suppress them on stale price
+    _gap_alert_keys = {"premarket_crash", "afterhours_crash", "gex_flip_warning",
+                       "earnings_gap", "gap_down", "gap_up"}
     _price_stale = (_price_age is None or _price_age > 600) and not _in_market
-    if _price_stale:
+    if _price_stale and alert_key not in _gap_alert_keys:
         print(f"  ⚠️ Alert price may be stale (age={_price_age}s, outside market) — skipping alert", flush=True)
         return  # Don't send alert with stale overnight price
     _cur_signal = state.get("signal", "HOLD")
@@ -12712,7 +12716,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>SPOCK — TSLA Intelligence v20260424_0330</title>
+<title>SPOCK — TSLA Intelligence v20260424_0338</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -14484,3 +14488,4 @@ if __name__ == "__main__":
 """)
     port = int(os.getenv("PORT", 5050))
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True, use_reloader=False)
+  
