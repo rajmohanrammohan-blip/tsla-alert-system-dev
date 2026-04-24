@@ -8570,7 +8570,7 @@ def run_analysis(refresh_4h=True, refresh_news=True):
             # AUC gate — don't alert on near-random models
             # Exception: override when ALL confirmations align (high-conviction confluence)
             _entry_score_now = entry_data.get("entry_score", 0) if entry_data else 0
-            _ml_conf_now     = float(ml_signal.get("confidence", 0)) if ml_signal else 0
+            _ml_conf_now     = float(state.get("ml_signal", {}).get("confidence", 0) or 0)
             _spock_conv_now  = master_signal.get("conviction", 0) if master_signal else 0
             _vh_ratio_now    = state.get("vol_hawk", {}).get("ratio_adj",
                                state.get("vol_hawk", {}).get("ratio", 0)) if state.get("vol_hawk") else 0
@@ -12706,7 +12706,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>SPOCK — TSLA Intelligence v20260422_1830</title>
+<title>SPOCK — TSLA Intelligence v20260423_1722</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
