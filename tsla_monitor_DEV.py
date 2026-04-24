@@ -3140,7 +3140,13 @@ def calculate_market_maker_data(ticker_symbol, current_price):
         # MM summary printed again after Schwab override in run_analysis (more accurate)
 
     except Exception as e:
-        print(f"  ❌ Market Maker data error: {e}")
+        import traceback as _tb_mm
+        _tb_str = _tb_mm.format_exc()
+        # Print the full traceback to identify exact crash line
+        print(f"  ❌ Market Maker data error: {e}", flush=True)
+        for _tbl in _tb_str.split("\n")[-6:-1]:
+            if _tbl.strip():
+                print(f"     {_tbl.strip()}", flush=True)
         result["summary"] = f"Error: {str(e)[:60]}"
 
     return result
@@ -12706,7 +12712,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>SPOCK — TSLA Intelligence v20260424_0301</title>
+<title>SPOCK — TSLA Intelligence v20260424_0330</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
