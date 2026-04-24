@@ -10684,6 +10684,8 @@ def _run_ml_retrain():
         import traceback
         print(f"[ML-RETRAIN] Error: {e}", flush=True)
         traceback.print_exc()
+        _ml_retraining = False   # ← CRITICAL: always reset on exception so flag can't get stuck
+        _ml_ready = bool(_ml_model_cache)  # restore ready state if model was already loaded
 
 
 @app.route("/api/ml/retrain")
@@ -13546,8 +13548,8 @@ function _updateUI_inner(s) {
   }
 
   // Show loading state while analysis hasn't run yet
-  // Only show if BOTH _loading flag is set AND no price data yet
-  if (s._loading && !s.last_updated && !s.price) {
+  // Only show if there is genuinely no price data yet — never block on _loading or ml_retraining flags
+  if (!s.price && !s.last_updated) {
     var tEl = document.getElementById('topTicker');
     if (tEl && s.ticker) { tEl.textContent = s.ticker; _currentTicker = s.ticker; }
     var bt = document.getElementById('brandTicker'); if(bt && s.ticker) bt.textContent = s.ticker;
@@ -14488,4 +14490,3 @@ if __name__ == "__main__":
 """)
     port = int(os.getenv("PORT", 5050))
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True, use_reloader=False)
-  
