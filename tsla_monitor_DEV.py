@@ -23,6 +23,15 @@ import threading
 import time
 from datetime import datetime, timedelta
 
+def _now_est(fmt="%Y-%m-%d %H:%M:%S"):
+    """Return current time in US/Eastern (EST/EDT). Railway runs UTC."""
+    try:
+        import pytz
+        return datetime.now(pytz.timezone("America/New_York")).strftime(fmt)
+    except Exception:
+        # Fallback: UTC-5 (EST) or UTC-4 (EDT) — use UTC-5 as safe default
+        return (datetime.utcnow() - timedelta(hours=5)).strftime(fmt)
+
 import requests
 import yfinance as yf
 import pandas as pd
@@ -3797,12 +3806,7 @@ def calculate_news_sentiment(articles):
         "total":        len(articles),
         "high_impact":  high_impact[:5],
         "articles":     articles,
-        "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-
-
-# ═══════════════════════════════════════════════════════════════
-#  EXTENDED HOURS TRADING ENGINE
+        "last_updated": _now_est(),
 #  Pre-market (4:00–9:30 AM ET), After-hours (4:00–8:00 PM ET),
 #  Overnight gap analysis
 #
@@ -7814,7 +7818,7 @@ def run_analysis(refresh_4h=True, refresh_news=True):
 
         if hist is None or hist.empty:
             print(f"[FATAL] Could not fetch {TICKER} data — retrying next cycle",flush=True)
-            state.update({"signal":"WAIT","price":state.get("price",0),"market_state":"DATA UNAVAILABLE","last_updated":datetime.now().strftime("%H:%M:%S"),"signal_strength":0})
+            state.update({"signal":"WAIT","price":state.get("price",0),"market_state":"DATA UNAVAILABLE","last_updated":_now_est("%H:%M:%S"),"signal_strength":0})
             return
         closes  = hist["Close"]
         volumes = hist["Volume"]
@@ -8772,8 +8776,7 @@ def run_analysis(refresh_4h=True, refresh_news=True):
             "poc_data":           poc_data,
             "macd_history":       macd_history,
             "signal_reasons":     reasons,
-            "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "price_history": [{"date": str(d.date()), "price": round(v, 2)}
+            "last_updated": _now_est(),
                                for d, v in zip(hist.index[-90:], closes.iloc[-90:])],
             "ichimoku_history": ichi.get("history", []),
         })
@@ -13097,7 +13100,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>SPOCK — TSLA Intelligence v20260425_1900</title>
+<title>SPOCK — TSLA Intelligence v20260425_2000</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
