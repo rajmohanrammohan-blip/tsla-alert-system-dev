@@ -5423,21 +5423,44 @@ def _calculate_wyckoff(price, volume_shelf=None, ticker=None):
         "confidence":     0,
     }
     try:
-        import yfinance as yf
+        import numpy as np
+        import pandas as pd
 
-        # ── Fetch daily bars ──────────────────────────────────────────────────
-        # NOTE: Always use yfinance for daily bars — Schwab ignores freq_minutes=1440
-        # and returns 5-min bars regardless, which breaks SC/AR/ST detection.
+        # ── Fetch daily bars via Schwab 5-min → resample ─────────────────────
+        # Schwab has no daily frequency enum — fetch 5-min bars and resample.
+        # 90 days × 78 bars/day = ~7020 bars. Use 0.4yr to ensure coverage.
         _daily = None
         try:
-            _daily = yf.Ticker(_ticker).history(period="90d", interval="1d")
-        except Exception as _yfe:
-            print(f"  ⚠️ Wyckoff yfinance fetch failed: {_yfe}", flush=True)
-        if _daily is None or (hasattr(_daily, "empty") and _daily.empty) or len(_daily) < 20:
-            result["narrative"] = "Insufficient daily data for Wyckoff analysis"
-            return result
+            import schwab_client as _sc_wy
+            if _sc_wy.is_configured() and _sc_wy.get_client():
+                _raw = _sc_wy.get_price_history(_ticker, period_years=0.4, freq_minutes=5)
+                if _raw is not None and not _raw.empty and len(_raw) > 100:
+                    # Resample 5-min → daily OHLCV in ET timezone
+                    try:
+                        import pytz
+                        _et = pytz.timezone("America/New_York")
+                        _idx = _raw.index
+                        if _idx.tz is None:
+                            _idx = _idx.tz_localize("UTC")
+                        _raw.index = _idx.tz_convert(_et)
+                    except Exception:
+                        pass  # keep existing tz if pytz fails
+                    _daily = _raw.resample("1D").agg({
+                        "Open":   "first",
+                        "High":   "max",
+                        "Low":    "min",
+                        "Close":  "last",
+                        "Volume": "sum",
+                    }).dropna(subset=["Close"])
+                    # Keep only rows with real trading (volume > 0)
+                    _daily = _daily[_daily["Volume"] > 0]
+                    print(f"  📊 Wyckoff: Schwab 5min→daily resampled {len(_daily)} bars", flush=True)
+        except Exception as _swe:
+            print(f"  ⚠️ Wyckoff Schwab fetch failed: {_swe}", flush=True)
 
-        print(f"  📊 Wyckoff: yfinance daily {len(_daily)} bars (90d)", flush=True)
+        if _daily is None or len(_daily) < 20:
+            result["narrative"] = "Wyckoff: Schwab data unavailable — skipped"
+            return result
 
         d_closes  = _daily["Close"].astype(float).values
         d_highs   = _daily["High"].astype(float).values
@@ -13073,7 +13096,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>SPOCK — TSLA Intelligence v20260425_1500</title>
+<title>SPOCK — TSLA Intelligence v20260425_1600</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
