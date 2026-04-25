@@ -11043,9 +11043,8 @@ def _run_ml_retrain():
         print(f"[ML-RETRAIN] Error: {e}", flush=True)
         traceback.print_exc()
     finally:
-        _ml_retraining = False   # ALWAYS reset — even on crash, so flag can never get permanently stuck
-        _ml_ready = True         # allow alerts even if retrain failed (use existing model)
-        print("[ML-RETRAIN] _ml_retraining reset to False", flush=True)
+        _ml_retraining = False
+        print("[ML-RETRAIN] _ml_retraining cleared", flush=True)
 
 
 @app.route("/api/ml/retrain")
@@ -13078,7 +13077,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>SPOCK — TSLA Intelligence v20260424_0338</title>
+<title>SPOCK — TSLA Intelligence v20260425_1400</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -13994,14 +13993,10 @@ function _updateUI_inner(s) {
     if (s.ml_retraining && banner) banner.classList.add('active');
     return;
   }
-  // Also update WHY box with retrain notice if retraining mid-session
-  if (s.ml_retraining) {
-    var rl2 = document.getElementById('reasonsList');
+  // Only show retrain banner if genuinely no price data — never blank the WHY box
+  if (s.ml_retraining && !s.price) {
     var rbn = document.getElementById('retrainBanner');
     if (rbn) rbn.classList.add('active');
-    if (rl2 && (!s.master_signal || !s.master_signal.reasons || !s.master_signal.reasons.length)) {
-      rl2.innerHTML = '<div class="reason-item" style="color:var(--hold)">ML retraining in progress...</div>';
-    }
   }
 
   // Top bar — show loading state if no price yet
