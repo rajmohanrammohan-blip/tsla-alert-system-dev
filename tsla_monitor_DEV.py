@@ -13105,7 +13105,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>SPOCK — TSLA Intelligence v20260425_2100</title>
+<title>SPOCK — TSLA Intelligence v20260425_2200</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -14770,27 +14770,42 @@ async function refreshWatchlist() {
 
 // ── Fetch state ──
 async function fetchState() {
+  var dbgP = document.getElementById('dbg-price');
+  var dbgA = document.getElementById('dbg-action');
   try {
+    if (dbgP && !window._gotData) dbgP.textContent = 'fetching...';
     var r = await fetch('/api/state');
+    if (dbgP && !window._gotData) dbgP.textContent = 'HTTP:' + r.status;
     if (!r.ok) {
+      if (dbgA) dbgA.textContent = 'HTTP_ERR:' + r.status;
       console.warn('fetchState HTTP ' + r.status);
       return;
     }
-    var d = await r.json();
+    var text = await r.text();
+    if (dbgP && !window._gotData) dbgP.textContent = 'parsing ' + text.length + 'b';
+    var d;
+    try {
+      d = JSON.parse(text);
+    } catch(je) {
+      if (dbgA) dbgA.textContent = 'JSON_ERR:' + je.message.slice(0,40);
+      console.error('[SPOCK] JSON parse error:', je.message, text.slice(0,200));
+      return;
+    }
     if (d && typeof d === 'object') {
-      // Debug: log what we received
-      if (!window._gotData && d.last_updated) {
+      if (!window._gotData) {
         window._gotData = true;
-        console.log('[SPOCK] Full state received:', {
+        console.log('[SPOCK] State received:', {
           ticker: d.ticker, price: d.price, updated: d.last_updated,
           action: d.master_signal && d.master_signal.action,
-          score:  d.master_signal && d.master_signal.score,
           keys: Object.keys(d).length
         });
       }
       updateUI(d);
+    } else {
+      if (dbgA) dbgA.textContent = 'BAD_DATA:' + typeof d;
     }
   } catch(e) {
+    if (dbgA) dbgA.textContent = 'FETCH_ERR:' + e.message.slice(0,40);
     console.error('[SPOCK] fetchState error:', e);
   }
 }
