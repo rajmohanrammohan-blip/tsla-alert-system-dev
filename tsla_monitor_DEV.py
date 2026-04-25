@@ -5428,12 +5428,13 @@ def _calculate_wyckoff(price, volume_shelf=None, ticker=None):
 
         # ── Fetch daily bars via Schwab 5-min → resample ─────────────────────
         # Schwab has no daily frequency enum — fetch 5-min bars and resample.
-        # 90 days × 78 bars/day = ~7020 bars. Use 0.4yr to ensure coverage.
+        # Use 0.15yr (~35 trading days) to capture LOCAL post-earnings structure.
+        # Wider windows (90d+) pick up the April ATL as SC instead of post-earnings low.
         _daily = None
         try:
             import schwab_client as _sc_wy
             if _sc_wy.is_configured() and _sc_wy.get_client():
-                _raw = _sc_wy.get_price_history(_ticker, period_years=0.4, freq_minutes=5)
+                _raw = _sc_wy.get_price_history(_ticker, period_years=0.15, freq_minutes=5)
                 if _raw is not None and not _raw.empty and len(_raw) > 100:
                     # Resample 5-min → daily OHLCV in ET timezone
                     try:
@@ -13096,7 +13097,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>SPOCK — TSLA Intelligence v20260425_1700</title>
+<title>SPOCK — TSLA Intelligence v20260425_1800</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -13960,6 +13961,8 @@ function updateUI(s) {
 }
 function _updateUI_inner(s) {
   if (!s) return;
+  // Client-side override: if we have real data, clear loading flags regardless of server state
+  if (s.price || s.last_updated) { s._loading = false; s.ml_retraining = false; }
   window._lastState = s; // cache for chart redraw on tab switch
 
   // Debug: log first response to help diagnose loading issues
