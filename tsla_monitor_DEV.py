@@ -13097,7 +13097,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>SPOCK — TSLA Intelligence v20260425_1800</title>
+<title>SPOCK — TSLA Intelligence v20260425_1900</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -13485,6 +13485,17 @@ body {
 <!-- ML RETRAIN BANNER -->
 <div class="retrain-banner" id="retrainBanner">
   ⚙️ ML model retraining — signals suppressed until complete
+</div>
+
+<!-- DEBUG STRIP — shows raw API values to diagnose blank dashboard -->
+<div id="debugStrip" style="background:#111;border-bottom:1px solid #333;padding:4px 16px;font-size:10px;font-family:monospace;color:#888;display:flex;gap:16px;flex-wrap:wrap;">
+  <span>price:<span id="dbg-price" style="color:#0f0">—</span></span>
+  <span>updated:<span id="dbg-updated" style="color:#0f0">—</span></span>
+  <span>action:<span id="dbg-action" style="color:#0f0">—</span></span>
+  <span>score:<span id="dbg-score" style="color:#0f0">—</span></span>
+  <span>reasons:<span id="dbg-reasons" style="color:#0f0">—</span></span>
+  <span>loading:<span id="dbg-loading" style="color:#ff0">—</span></span>
+  <span>retraining:<span id="dbg-retrain" style="color:#ff0">—</span></span>
 </div>
 
 <!-- TOP BAR -->
@@ -13965,6 +13976,18 @@ function _updateUI_inner(s) {
   if (s.price || s.last_updated) { s._loading = false; s.ml_retraining = false; }
   window._lastState = s; // cache for chart redraw on tab switch
 
+  // Debug strip — always update so we can see raw API values
+  try {
+    var ms0 = s.master_signal || {};
+    document.getElementById('dbg-price').textContent   = s.price || 'null';
+    document.getElementById('dbg-updated').textContent = s.last_updated || 'null';
+    document.getElementById('dbg-action').textContent  = ms0.action || 'null';
+    document.getElementById('dbg-score').textContent   = ms0.score != null ? ms0.score : 'null';
+    document.getElementById('dbg-reasons').textContent = (ms0.reasons||[]).length;
+    document.getElementById('dbg-loading').textContent = s._loading;
+    document.getElementById('dbg-retrain').textContent = s.ml_retraining;
+  } catch(_) {}
+
   // Debug: log first response to help diagnose loading issues
   if (!window._firstLoad) {
     window._firstLoad = true;
@@ -14114,14 +14137,18 @@ function _updateUI_inner(s) {
   setText('voteBear', (ms.bear_votes || 0) + ' BEAR');
   setText('voteNeut', (ms.neutral_votes || 0) + ' NEUTRAL');
 
-  // Reasons
+  // Reasons — always update WHY box, never leave static placeholder
   var reasons = ms.reasons || [];
   var rl = document.getElementById('reasonsList');
-  if (rl && reasons.length) {
-    rl.innerHTML = reasons.slice(0,4).map(function(r) {
-      var cls = (r.toLowerCase().indexOf('buy')>=0||r.indexOf('↑')>=0) ? 'bull' : (r.toLowerCase().indexOf('sell')>=0||r.indexOf('↓')>=0) ? 'bear' : '';
-      return '<div class="reason-item ' + cls + '">' + r + '</div>';
-    }).join('');
+  if (rl) {
+    if (reasons.length) {
+      rl.innerHTML = reasons.slice(0,4).map(function(r) {
+        var cls = (r.toLowerCase().indexOf('buy')>=0||r.indexOf('↑')>=0) ? 'bull' : (r.toLowerCase().indexOf('sell')>=0||r.indexOf('↓')>=0) ? 'bear' : '';
+        return '<div class="reason-item ' + cls + '">' + r + '</div>';
+      }).join('');
+    } else if (s.price) {
+      rl.innerHTML = '<div class="reason-item" style="color:var(--dim)">⏳ First analysis running...</div>';
+    }
   }
 
   // CTA size
