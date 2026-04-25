@@ -13105,7 +13105,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>SPOCK — TSLA Intelligence v20260425_2000</title>
+<title>SPOCK — TSLA Intelligence v20260425_2100</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -13949,36 +13949,29 @@ function fmt(v, decimals=2) {
 // ── Main update ──
 function updateUI(s) {
   if (!s) return;
-  // Global safety net — catch any crash and log it
   try {
-    _updateUI_inner(s);
+    _updateUI_safe(s);
   } catch(e) {
-    console.error('[SPOCK] crash:', e.message, e.stack);
-    // Emergency render — show at least the SPOCK decision even if tabs fail
+    console.error('[SPOCK render crash]', e.message, '\n', e.stack);
+    // Emergency render
     try {
       var ms = s.master_signal || {};
       var ae = document.getElementById('spockAction');
-      if (ae && ms.action) {
-        ae.textContent = ms.action;
-        ae.style.color = ms.action.indexOf('BUY')>=0 ? 'var(--buy)' : ms.action.indexOf('SELL')>=0 ? 'var(--sell)' : 'var(--hold)';
-      }
-      var sn = document.getElementById('scoreNum');
-      if (sn && ms.score != null) sn.textContent = (ms.score >= 0 ? '+' : '') + ms.score;
-      var cp = document.getElementById('convPct');
-      if (cp && ms.conviction != null) cp.textContent = ms.conviction + '%';
-      var rb = document.getElementById('riskBadge');
-      if (rb && ms.risk) { rb.textContent = ms.risk; rb.className = 'risk-badge risk-' + ms.risk.replace(' ','_'); }
-      var tp = document.getElementById('topPrice');
-      if (tp && s.price) tp.textContent = '$' + parseFloat(s.price).toFixed(2);
-      var tt = document.getElementById('topTime');
-      if (tt && s.last_updated) tt.textContent = s.last_updated;
-      // Show crash notice in WHY box
+      if (ae && ms.action) { ae.textContent = ms.action; ae.style.color = ms.action.indexOf('BUY')>=0 ? 'var(--buy)' : ms.action.indexOf('SELL')>=0 ? 'var(--sell)' : 'var(--hold)'; }
+      var sn = document.getElementById('scoreNum'); if (sn && ms.score != null) sn.textContent = (ms.score >= 0 ? '+' : '') + ms.score;
+      var cp = document.getElementById('convPct'); if (cp && ms.conviction != null) cp.textContent = ms.conviction + '%';
+      var rb = document.getElementById('riskBadge'); if (rb && ms.risk) { rb.textContent = ms.risk; rb.className = 'risk-badge risk-' + ms.risk.replace(' ','_'); }
+      var tp = document.getElementById('topPrice'); if (tp && s.price) tp.textContent = '$' + parseFloat(s.price).toFixed(2);
+      var tt = document.getElementById('topTime'); if (tt && s.last_updated) tt.textContent = s.last_updated;
       var rl = document.getElementById('reasonsList');
-      if (rl) rl.innerHTML = '<div class="reason-item" style="color:var(--sell)">⚠️ Render error: ' + e.message.slice(0,80) + '</div>';
+      if (rl) rl.innerHTML = '<div class="reason-item" style="color:var(--sell)">⚠️ Render crash: ' + e.message.slice(0,120) + '</div>';
+      // Also show in debug strip
+      var dbgP = document.getElementById('dbg-price'); if (dbgP) dbgP.textContent = s.price || 'null';
+      var dbgA = document.getElementById('dbg-action'); if (dbgA) dbgA.textContent = '💥CRASH:' + e.message.slice(0,40);
     } catch(_) {}
   }
 }
-function _updateUI_inner(s) {
+function _updateUI_safe(s) {
   if (!s) return;
   // Client-side override: if we have real data, clear loading flags regardless of server state
   if (s.price || s.last_updated) { s._loading = false; s.ml_retraining = false; }
@@ -14421,12 +14414,12 @@ function _updateUI_inner(s) {
   var wyNarrEl = document.getElementById('wy-narrative');
   if (wyNarrEl) wyNarrEl.textContent = wy.narrative || '—';
   // Levels
-  setText('wy-sc',           wy.sc_level      ? '$' + wy.sc_level.toFixed(2)     : '—');
-  setText('wy-ar',           wy.ar_level       ? '$' + wy.ar_level.toFixed(2)     : '—');
-  setText('wy-st',           wy.st_level       ? '$' + wy.st_level.toFixed(2)     : '—');
-  setText('wy-spring-level', wy.spring_level   ? '$' + wy.spring_level.toFixed(2) : 'Pending');
-  setText('wy-sos-level',    wy.sos_level      ? '$' + wy.sos_level.toFixed(2)    : 'Pending');
-  setText('wy-cause',        wy.cause_width != null ? wy.cause_width.toFixed(1) + '% range' : '—');
+  setText('wy-sc',           wy.sc_level      != null ? '$' + parseFloat(wy.sc_level).toFixed(2)     : '—');
+  setText('wy-ar',           wy.ar_level      != null ? '$' + parseFloat(wy.ar_level).toFixed(2)     : '—');
+  setText('wy-st',           wy.st_level      != null ? '$' + parseFloat(wy.st_level).toFixed(2)     : '—');
+  setText('wy-spring-level', wy.spring_level  != null ? '$' + parseFloat(wy.spring_level).toFixed(2) : 'Pending');
+  setText('wy-sos-level',    wy.sos_level     != null ? '$' + parseFloat(wy.sos_level).toFixed(2)    : 'Pending');
+  setText('wy-cause',        wy.cause_width   != null ? parseFloat(wy.cause_width).toFixed(1) + '% range' : '—');
   // Status
   setText('wy-schema', wySchema, wySchema === 'ACCUMULATION' ? 'bull' : wySchema === 'DISTRIBUTION' ? 'bear' : '');
   setText('wy-phase',  'Phase ' + wyPhase,
