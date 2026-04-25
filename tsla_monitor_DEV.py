@@ -13105,7 +13105,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>SPOCK — TSLA Intelligence v20260425_2300</title>
+<title>SPOCK — TSLA Intelligence v20260425_2359</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -13952,7 +13952,7 @@ function updateUI(s) {
   try {
     _updateUI_safe(s);
   } catch(e) {
-    console.error('[SPOCK render crash]', e.message, '\n', e.stack);
+    console.error('[SPOCK render crash]', e.message, e.stack);
     // Emergency render
     try {
       var ms = s.master_signal || {};
