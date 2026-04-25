@@ -5383,6 +5383,326 @@ _spock_weights = {      # SPOCK tier weights — self-adjusting
 }
 
 
+def _calculate_wyckoff(price, volume_shelf=None, ticker=None):
+    """
+    Wyckoff Method — Phase & Event Detector.
+
+    Uses daily bars (60-day lookback) to identify:
+      Events: PS, SC, AR, ST, Spring, SOS, LPS
+      Phases: A (stopping) → B (building) → C (spring) → D (emerging) → E (markup)
+      Schema type: ACCUMULATION or DISTRIBUTION
+
+    Returns:
+        dict with phase, events, key levels, score contribution, and narrative
+    Score contribution to SPOCK master signal (Tier 3, ±12 pts):
+        +12  Phase C/D accumulation — Spring fired or SOS confirmed
+        +6   Phase B accumulation — cause building, wait for Spring
+        0    Phase A — trend still stopping, too early
+        -8   Phase B/C distribution
+        -12  Phase D/E distribution — avoid longs
+    """
+    import numpy as np
+    _ticker = ticker or TICKER
+    result = {
+        "phase":          "UNKNOWN",
+        "schema":         "UNKNOWN",   # ACCUMULATION or DISTRIBUTION
+        "events":         [],          # list of detected events with prices
+        "sc_level":       None,        # Selling Climax price
+        "ar_level":       None,        # Automatic Rally price
+        "st_level":       None,        # Secondary Test price
+        "spring_level":   None,        # Spring low price (Phase C)
+        "sos_level":      None,        # Sign of Strength level
+        "creek_level":    None,        # resistance the price must clear (AR high)
+        "spring_fired":   False,
+        "sos_confirmed":  False,
+        "cause_width":    0.0,         # trading range width %
+        "volume_trend":   "FLAT",      # CONTRACTING / EXPANDING / FLAT
+        "spock_score":    0,
+        "narrative":      "",
+        "phase_emoji":    "🔍",
+        "confidence":     0,
+    }
+    try:
+        import yfinance as yf
+
+        # ── Fetch daily bars ──────────────────────────────────────────────────
+        _daily = None
+        try:
+            import schwab_client as _sc_wy
+            if _sc_wy.is_configured() and _sc_wy.get_client():
+                _daily = _sc_wy.get_price_history(_ticker, period_years=0.25, freq_minutes=1440)
+                if _daily is not None and not _daily.empty and len(_daily) > 30:
+                    print(f"  📊 Wyckoff: Schwab daily {len(_daily)} bars", flush=True)
+                else:
+                    _daily = None
+        except Exception:
+            pass
+        if _daily is None:
+            _daily = yf.Ticker(_ticker).history(period="90d", interval="1d")
+        if _daily is None or (hasattr(_daily, "empty") and _daily.empty) or len(_daily) < 20:
+            result["narrative"] = "Insufficient daily data for Wyckoff analysis"
+            return result
+
+        d_closes  = _daily["Close"].astype(float).values
+        d_highs   = _daily["High"].astype(float).values
+        d_lows    = _daily["Low"].astype(float).values
+        d_volumes = _daily["Volume"].astype(float).values
+        n = len(d_closes)
+
+        avg_vol_20 = np.mean(d_volumes[-20:]) if n >= 20 else np.mean(d_volumes)
+
+        # ── Step 1: Find the dominant trend direction (last 60 days) ─────────
+        _trend_start = d_closes[0]
+        _trend_end   = d_closes[-1]
+        _prior_trend = "DOWN" if _trend_end < _trend_start * 0.97 else ("UP" if _trend_end > _trend_start * 1.03 else "FLAT")
+
+        # ── Step 2: Detect SC / BC (Selling/Buying Climax) ───────────────────
+        # For ACCUMULATION (after downtrend): SC = lowest close with volume spike
+        # For DISTRIBUTION (after uptrend):  BC = highest close with volume spike
+        # Scan last 60 bars for the highest-volume bar near an extreme
+        _sc_idx = None
+        _bc_idx = None
+
+        if _prior_trend == "DOWN":
+            result["schema"] = "ACCUMULATION"
+            # SC: look for a bar with volume >= 2x avg AND price near N-day low
+            _low_window = max(10, n - 60)
+            _n_low = np.min(d_lows[_low_window:])
+            for i in range(_low_window, n):
+                _bar_range = d_highs[i] - d_lows[i]
+                _close_pos = (d_closes[i] - d_lows[i]) / _bar_range if _bar_range > 0 else 0.5
+                # SC: high volume, near period low, closes in upper 40% of bar (buyers stepped in)
+                if (d_volumes[i] >= avg_vol_20 * 1.8 and
+                        d_lows[i] <= _n_low * 1.02 and
+                        _close_pos >= 0.35):
+                    if _sc_idx is None or d_volumes[i] > d_volumes[_sc_idx]:
+                        _sc_idx = i
+        elif _prior_trend == "UP":
+            result["schema"] = "DISTRIBUTION"
+            _high_window = max(10, n - 60)
+            _n_high = np.max(d_highs[_high_window:])
+            for i in range(_high_window, n):
+                _bar_range = d_highs[i] - d_lows[i]
+                _close_pos = (d_closes[i] - d_lows[i]) / _bar_range if _bar_range > 0 else 0.5
+                # BC: high volume, near period high, closes in lower 40% of bar (sellers appeared)
+                if (d_volumes[i] >= avg_vol_20 * 1.8 and
+                        d_highs[i] >= _n_high * 0.98 and
+                        _close_pos <= 0.65):
+                    if _bc_idx is None or d_volumes[i] > d_volumes[_bc_idx]:
+                        _bc_idx = i
+        else:
+            result["schema"] = "ACCUMULATION"  # default to watching for accumulation
+            _sc_idx = int(np.argmin(d_lows[-30:]))  # proxy
+
+        events = []
+        climax_idx = _sc_idx if result["schema"] == "ACCUMULATION" else _bc_idx
+
+        if climax_idx is None:
+            # Fallback: use the most extreme bar in last 30 days
+            climax_idx = int(np.argmin(d_lows[-30:])) if result["schema"] == "ACCUMULATION" else int(np.argmax(d_highs[-30:]))
+            climax_idx += max(0, n - 30)
+
+        climax_idx = min(climax_idx, n - 1)
+
+        # ── Step 3: Map Wyckoff events ────────────────────────────────────────
+        if result["schema"] == "ACCUMULATION":
+            sc_price  = float(d_lows[climax_idx])
+            sc_close  = float(d_closes[climax_idx])
+            result["sc_level"] = round(sc_price, 2)
+            events.append({"event": "SC", "price": round(sc_price, 2),
+                           "desc": f"Selling Climax — volume {d_volumes[climax_idx]/avg_vol_20:.1f}x avg"})
+
+            # AR: first significant high AFTER SC — highest close in 5-15 bars after SC
+            _ar_window = d_closes[climax_idx+1 : min(climax_idx+16, n)]
+            if len(_ar_window) >= 2:
+                _ar_rel_idx = int(np.argmax(_ar_window))
+                ar_price = float(d_highs[climax_idx + 1 + _ar_rel_idx])
+                result["ar_level"]    = round(ar_price, 2)
+                result["creek_level"] = round(ar_price, 2)  # creek = AR high to clear
+                events.append({"event": "AR", "price": round(ar_price, 2),
+                               "desc": "Automatic Rally — defines upper range boundary"})
+
+                # Trading range width
+                result["cause_width"] = round((ar_price - sc_price) / sc_price * 100, 1)
+
+                # ST: secondary test — price comes back to SC area on LOWER volume
+                _st_start = climax_idx + _ar_rel_idx + 2
+                _st_window_c = d_closes[_st_start : min(_st_start + 20, n)]
+                _st_window_l = d_lows[_st_start : min(_st_start + 20, n)]
+                _st_window_v = d_volumes[_st_start : min(_st_start + 20, n)]
+                if len(_st_window_l) >= 3:
+                    _st_rel_idx = int(np.argmin(_st_window_l))
+                    st_price    = float(_st_window_l[_st_rel_idx])
+                    st_vol      = float(_st_window_v[_st_rel_idx])
+                    # ST should be near SC but higher and on less volume
+                    if (st_price < ar_price * 0.97 and
+                            st_price >= sc_price * 0.92 and
+                            st_vol < d_volumes[climax_idx] * 0.85):
+                        result["st_level"] = round(st_price, 2)
+                        events.append({"event": "ST", "price": round(st_price, 2),
+                                       "desc": f"Secondary Test — lower volume ({st_vol/avg_vol_20:.1f}x) confirms supply exhausting"})
+
+                        # Spring: price undercuts SC/ST low then recovers quickly
+                        _sp_start = _st_start + _st_rel_idx
+                        _sp_window_l = d_lows[_sp_start : min(_sp_start + 15, n)]
+                        _sp_window_c = d_closes[_sp_start : min(_sp_start + 15, n)]
+                        _sp_window_v = d_volumes[_sp_start : min(_sp_start + 15, n)]
+                        if len(_sp_window_l) >= 2:
+                            _spring_rel = int(np.argmin(_sp_window_l))
+                            spring_low = float(_sp_window_l[_spring_rel])
+                            spring_vol = float(_sp_window_v[_spring_rel])
+                            # Spring: undercuts SC by ≤5%, then closes above on next bar
+                            _next_close = float(_sp_window_c[min(_spring_rel+1, len(_sp_window_c)-1)])
+                            if (spring_low < sc_price * 1.01 and
+                                    _next_close > spring_low * 1.01):
+                                result["spring_level"] = round(spring_low, 2)
+                                result["spring_fired"] = True
+                                events.append({"event": "SPRING", "price": round(spring_low, 2),
+                                               "desc": "Spring — bears shaken out, smart money absorbing"})
+
+                                # SOS: sign of strength — rally through creek (AR level) on volume
+                                _sos_window_c = d_closes[_sp_start + _spring_rel :]
+                                _sos_window_v = d_volumes[_sp_start + _spring_rel :]
+                                for j in range(len(_sos_window_c)):
+                                    if (_sos_window_c[j] > ar_price * 0.99 and
+                                            _sos_window_v[j] >= avg_vol_20 * 1.3):
+                                        result["sos_level"]    = round(float(_sos_window_c[j]), 2)
+                                        result["sos_confirmed"] = True
+                                        events.append({"event": "SOS", "price": round(float(_sos_window_c[j]), 2),
+                                                       "desc": f"Sign of Strength — creek ${ar_price:.0f} cleared on {_sos_window_v[j]/avg_vol_20:.1f}x volume"})
+                                        break
+
+        else:  # DISTRIBUTION
+            bc_price = float(d_highs[climax_idx])
+            result["sc_level"] = round(bc_price, 2)  # reuse field for BC
+            events.append({"event": "BC", "price": round(bc_price, 2),
+                           "desc": f"Buying Climax — volume {d_volumes[climax_idx]/avg_vol_20:.1f}x avg"})
+            # AR (down): first selloff after BC
+            _ar_window = d_closes[climax_idx+1 : min(climax_idx+10, n)]
+            if len(_ar_window) >= 2:
+                _ar_rel_idx = int(np.argmin(_ar_window))
+                ar_price = float(d_lows[climax_idx + 1 + _ar_rel_idx])
+                result["ar_level"]    = round(ar_price, 2)
+                result["cause_width"] = round((bc_price - ar_price) / bc_price * 100, 1)
+                events.append({"event": "AR", "price": round(ar_price, 2),
+                               "desc": "Automatic Reaction — defines lower range (ice)"})
+
+        # ── Step 4: Classify Phase ────────────────────────────────────────────
+        phase   = "A"   # default: stopping action
+        emoji   = "⛔"
+        conf    = 40
+
+        if result["schema"] == "ACCUMULATION":
+            if result["sos_confirmed"]:
+                phase = "D";  emoji = "🚀"; conf = 85
+            elif result["spring_fired"]:
+                phase = "C";  emoji = "🌀"; conf = 75
+            elif result["st_level"] is not None:
+                # Check if we're still in Phase B (oscillating) or moving to C
+                _days_since_st = n - 1 - (climax_idx + len(d_closes[climax_idx:]) - len(d_closes))
+                phase = "B";  emoji = "⚖️";  conf = 65
+            elif result["ar_level"] is not None:
+                phase = "A";  emoji = "⛔"; conf = 50
+            else:
+                phase = "A";  emoji = "❓"; conf = 30
+        else:  # DISTRIBUTION
+            if result["ar_level"] is not None:
+                phase = "B";  emoji = "⚠️"; conf = 60
+            else:
+                phase = "A";  emoji = "⛔"; conf = 40
+
+        result["phase"]        = phase
+        result["phase_emoji"]  = emoji
+        result["confidence"]   = conf
+        result["events"]       = events
+
+        # ── Step 5: Volume trend — contracting = Phase B healthy, expanding = breakout ──
+        if n >= 10:
+            _recent_vol  = np.mean(d_volumes[-5:])
+            _prior_vol   = np.mean(d_volumes[-15:-5]) if n >= 15 else avg_vol_20
+            _vol_ratio   = _recent_vol / _prior_vol if _prior_vol > 0 else 1.0
+            if _vol_ratio < 0.75:
+                result["volume_trend"] = "CONTRACTING"
+            elif _vol_ratio > 1.35:
+                result["volume_trend"] = "EXPANDING"
+            else:
+                result["volume_trend"] = "FLAT"
+
+        # ── Step 6: SPOCK score contribution ─────────────────────────────────
+        score = 0
+        if result["schema"] == "ACCUMULATION":
+            if phase == "D" and result["sos_confirmed"]:
+                score = 12    # markup confirmed — highest conviction BUY setup
+            elif phase == "C" and result["spring_fired"]:
+                score = 10    # spring fired — ideal entry approaching
+            elif phase == "B":
+                score = 4     # building cause — patience, small positive bias
+                if result["volume_trend"] == "CONTRACTING":
+                    score = 6  # contracting volume in Phase B = healthy absorption
+            elif phase == "A":
+                score = 0     # too early — trend still stopping
+            # Penalty if spring target not yet hit and volume expanding (shakeout risk)
+            if not result["spring_fired"] and result["volume_trend"] == "EXPANDING":
+                score = max(0, score - 3)
+        else:  # DISTRIBUTION
+            if phase in ("D", "E"):
+                score = -12
+            elif phase in ("B", "C"):
+                score = -8
+            elif phase == "A":
+                score = -4
+
+        result["spock_score"] = score
+
+        # ── Step 7: Narrative ─────────────────────────────────────────────────
+        sc_str  = f"${result['sc_level']:.0f}" if result['sc_level'] else "?"
+        ar_str  = f"${result['ar_level']:.0f}"  if result['ar_level']  else "?"
+        st_str  = f"${result['st_level']:.0f}"  if result['st_level']  else "—"
+
+        if result["schema"] == "ACCUMULATION":
+            if phase == "D":
+                result["narrative"] = (
+                    f"Phase D ACCUMULATION — SOS confirmed at {result.get('sos_level','?')}. "
+                    f"Markup underway. SC={sc_str}, Creek={ar_str}. Pullbacks to LPS are buy entries."
+                )
+            elif phase == "C":
+                spring_str = f"${result['spring_level']:.0f}" if result['spring_level'] else "pending"
+                result["narrative"] = (
+                    f"Phase C ACCUMULATION — Spring at {spring_str}. Bears shaken out. "
+                    f"Watch for SOS above creek ${result.get('creek_level','?'):.0f}. SC={sc_str}"
+                )
+            elif phase == "B":
+                spring_target = result.get("sc_level", price)
+                result["narrative"] = (
+                    f"Phase B ACCUMULATION — Building cause in ${ar_str}–{sc_str} range. "
+                    f"Volume {'contracting ✅' if result['volume_trend'] == 'CONTRACTING' else result['volume_trend'].lower()}. "
+                    f"Wait for Spring test near {sc_str} before entry."
+                )
+            else:
+                result["narrative"] = (
+                    f"Phase A — Stopping action. SC at {sc_str}, AR at {ar_str}. "
+                    f"Too early to enter — structure still forming."
+                )
+        else:
+            result["narrative"] = (
+                f"Phase {phase} DISTRIBUTION — BC at {sc_str}, AR at {ar_str}. "
+                f"Avoid longs. Watch for UTAD / SOW breakdown."
+            )
+
+        print(f"  📊 Wyckoff: {result['schema']} Phase {phase} {emoji} | "
+              f"SC={sc_str} AR={ar_str} Creek={ar_str} | "
+              f"Spring={'✅' if result['spring_fired'] else '❌'} "
+              f"SOS={'✅' if result['sos_confirmed'] else '❌'} | "
+              f"Score={score:+d}", flush=True)
+
+    except Exception as _we:
+        import traceback
+        print(f"  ⚠️ Wyckoff error: {_we}", flush=True)
+        result["narrative"] = f"Wyckoff error: {_we}"
+
+    return result
+
+
 def calculate_swing_context(closes, highs, lows, price, mm_data):
     """
     Multi-day swing context:
@@ -7220,7 +7540,36 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
         score -= 6; reasons.append(f"Near descending channel resistance ${_swing['channel_top']:.0f}")
         votes["bear"] += 1
 
-    # 11. News sentiment + StockTwits contrarian
+    # 10c. Wyckoff Phase & Event — structural market context (±12 pts, Tier 3)
+    _wy = state.get("wyckoff", {}) if isinstance(state, dict) else {}
+    _wy_score  = int(_wy.get("spock_score", 0) or 0)
+    _wy_phase  = _wy.get("phase", "")
+    _wy_schema = _wy.get("schema", "")
+    _wy_emoji  = _wy.get("phase_emoji", "📊")
+    _wy_spring = _wy.get("spring_fired", False)
+    _wy_sos    = _wy.get("sos_confirmed", False)
+    _wy_conf   = int(_wy.get("confidence", 0) or 0)
+    if _wy_score != 0 and _wy_conf >= 50:
+        score += _wy_score
+        if _wy_schema == "ACCUMULATION":
+            if _wy_sos:
+                reasons.append(f"Wyckoff Phase {_wy_phase} {_wy_emoji} — SOS confirmed, markup underway (+{_wy_score})")
+                votes["bull"] += 1
+            elif _wy_spring:
+                reasons.append(f"Wyckoff Phase {_wy_phase} {_wy_emoji} — Spring fired, entry zone (+{_wy_score})")
+                votes["bull"] += 1
+            elif _wy_phase == "B":
+                reasons.append(f"Wyckoff Phase B ⚖️ — accumulation range, await Spring")
+                votes["neutral"] += 1
+            else:
+                votes["neutral"] += 1
+        else:  # DISTRIBUTION
+            reasons.append(f"Wyckoff Phase {_wy_phase} {_wy_emoji} DISTRIBUTION — avoid longs ({_wy_score})")
+            votes["bear"] += 1
+    else:
+        votes["neutral"] += 1
+
+
     news_score = float(news_data.get("score", 0) or 0) if news_data else 0
     if news_score >= 20:
         score += 5; votes["bull"] += 1
@@ -9092,6 +9441,14 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 except Exception as _swe:
                     state["swing_context"] = {}
 
+                # ── Wyckoff Phase & Event Detection ──────────────────────────
+                try:
+                    _wyckoff = _calculate_wyckoff(price, ticker=TICKER)
+                    state["wyckoff"] = _wyckoff
+                except Exception as _wye:
+                    print(f"  ⚠️ Wyckoff error: {_wye}", flush=True)
+                    state["wyckoff"] = {}
+
                 master = calculate_master_signal(
                     signal      = signal,
                     strength    = strength,
@@ -9618,6 +9975,7 @@ def api_state():
                 "breadth":       state.get("breadth", {}),
                 "vix_flip":      state.get("vix_flip", {}),
                 "swing_context": state.get("swing_context", {}),
+                "wyckoff":       state.get("wyckoff", {}),
                 "alerts_log":    state.get("alerts_log", [])[:20],
                 "spock_accuracy":state.get("spock_accuracy", {}),
                 "ml_ready":      _ml_ready,
@@ -10684,8 +11042,10 @@ def _run_ml_retrain():
         import traceback
         print(f"[ML-RETRAIN] Error: {e}", flush=True)
         traceback.print_exc()
-        _ml_retraining = False   # ← CRITICAL: always reset on exception so flag can't get stuck
-        _ml_ready = bool(_ml_model_cache)  # restore ready state if model was already loaded
+    finally:
+        _ml_retraining = False   # ALWAYS reset — even on crash, so flag can never get permanently stuck
+        _ml_ready = True         # allow alerts even if retrain failed (use existing model)
+        print("[ML-RETRAIN] _ml_retraining reset to False", flush=True)
 
 
 @app.route("/api/ml/retrain")
@@ -13264,6 +13624,7 @@ body {
       <div class="tab active" onclick="switchTab('options')">Options</div>
       <div class="tab" onclick="switchTab('market')">Market</div>
       <div class="tab" onclick="switchTab('data')">Data</div>
+      <div class="tab" onclick="switchTab('wyckoff')">Wyckoff</div>
       <div class="tab" onclick="switchTab('alerts')">Alerts</div>
       <div class="tab" onclick="switchTab('chart')">Chart</div>
     </div>
@@ -13408,6 +13769,67 @@ body {
       </div>
     </div>
 
+    <!-- WYCKOFF TAB -->
+    <div class="tab-content" id="tab-wyckoff">
+      <!-- Phase banner — full width -->
+      <div class="data-card" style="grid-column:1/-1;border-left:4px solid var(--accent);">
+        <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
+          <div style="font-size:2.2rem;" id="wy-emoji">📊</div>
+          <div>
+            <div style="font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;">Wyckoff Schema · Phase</div>
+            <div style="font-size:1.4rem;font-weight:700;color:var(--accent);" id="wy-phase-label">—</div>
+          </div>
+          <div style="margin-left:auto;text-align:right;">
+            <div style="font-size:11px;color:var(--dim);">SPOCK contribution</div>
+            <div style="font-size:1.6rem;font-weight:700;" id="wy-score">—</div>
+          </div>
+        </div>
+        <div style="margin-top:12px;font-size:12px;color:var(--text);line-height:1.6;" id="wy-narrative">—</div>
+      </div>
+
+      <!-- Key levels -->
+      <div class="data-card">
+        <h3>📍 Key Wyckoff Levels</h3>
+        <div class="data-row"><span class="data-row-label">SC / Climax</span><span class="data-row-val" id="wy-sc">—</span></div>
+        <div class="data-row"><span class="data-row-label">AR / Creek</span><span class="data-row-val" id="wy-ar">—</span></div>
+        <div class="data-row"><span class="data-row-label">ST (Secondary Test)</span><span class="data-row-val" id="wy-st">—</span></div>
+        <div class="data-row"><span class="data-row-label">Spring Level</span><span class="data-row-val" id="wy-spring-level">—</span></div>
+        <div class="data-row"><span class="data-row-label">SOS Level</span><span class="data-row-val" id="wy-sos-level">—</span></div>
+        <div class="data-row"><span class="data-row-label">Cause Width</span><span class="data-row-val" id="wy-cause">—</span></div>
+      </div>
+
+      <!-- Phase status -->
+      <div class="data-card">
+        <h3>🔬 Phase Status</h3>
+        <div class="data-row"><span class="data-row-label">Schema</span><span class="data-row-val" id="wy-schema">—</span></div>
+        <div class="data-row"><span class="data-row-label">Current Phase</span><span class="data-row-val" id="wy-phase">—</span></div>
+        <div class="data-row"><span class="data-row-label">Spring Fired</span><span class="data-row-val" id="wy-spring">—</span></div>
+        <div class="data-row"><span class="data-row-label">SOS Confirmed</span><span class="data-row-val" id="wy-sos">—</span></div>
+        <div class="data-row"><span class="data-row-label">Volume Trend</span><span class="data-row-val" id="wy-voltrd">—</span></div>
+        <div class="data-row"><span class="data-row-label">Confidence</span><span class="data-row-val" id="wy-conf">—</span></div>
+      </div>
+
+      <!-- Event log -->
+      <div class="data-card" style="grid-column:1/-1">
+        <h3>📋 Detected Events</h3>
+        <div id="wy-events" style="display:flex;flex-direction:column;gap:6px;font-size:12px;">
+          <span style="color:var(--dim)">—</span>
+        </div>
+      </div>
+
+      <!-- Phase reference guide -->
+      <div class="data-card" style="grid-column:1/-1;opacity:0.75;">
+        <h3>📖 Phase Guide</h3>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;font-size:11px;">
+          <div><span style="color:var(--sell);font-weight:700;">Phase A</span><br>Trend stopping. SC+AR form. Too early to enter.</div>
+          <div><span style="color:var(--hold);font-weight:700;">Phase B</span><br>Cause building. Range-bound. Wait for Spring.</div>
+          <div><span style="color:var(--accent);font-weight:700;">Phase C</span><br>Spring / shakeout. Bears trapped. Best entry zone.</div>
+          <div><span style="color:var(--buy);font-weight:700;">Phase D</span><br>SOS + LPS. Markup starting. Pullbacks = entries.</div>
+          <div><span style="color:#00ff88;font-weight:700;">Phase E</span><br>Full markup. Trail stops. Distribute near resistance.</div>
+        </div>
+      </div>
+    </div>
+
     <!-- ALERTS TAB -->
     <div class="tab-content" id="tab-alerts">
       <div id="alertsList" style="display:flex;flex-direction:column;gap:10px;">
@@ -13548,7 +13970,7 @@ function _updateUI_inner(s) {
   }
 
   // Show loading state while analysis hasn't run yet
-  // Only show if there is genuinely no price data yet — never block on _loading or ml_retraining flags
+  // Only block if genuinely no price data — never key off _loading or ml_retraining flags
   if (!s.price && !s.last_updated) {
     var tEl = document.getElementById('topTicker');
     if (tEl && s.ticker) { tEl.textContent = s.ticker; _currentTicker = s.ticker; }
@@ -13924,6 +14346,69 @@ function _updateUI_inner(s) {
     dhCharm === 'EXTREME' ? 'extreme' : dhCharm === 'HIGH' ? 'warn' : dhCharm === 'ELEVATED' ? 'warn' : '');
   setText('dh-mode', dhMode.split(' — ')[0] || '—',
     dhMode.indexOf('SELL') >= 0 ? 'bear' : dhMode.indexOf('BUY') >= 0 ? 'bull' : dhMode.indexOf('CHAS') >= 0 ? 'extreme' : '');
+
+  // ── Wyckoff tab ──
+  var wy = s.wyckoff || {};
+  var wyPhase  = wy.phase   || '—';
+  var wySchema = wy.schema  || '—';
+  var wyEmoji  = wy.phase_emoji || '📊';
+  var wyScore  = wy.spock_score != null ? wy.spock_score : null;
+  var wyConf   = wy.confidence  || 0;
+  // Phase banner
+  var wyPhaseEl = document.getElementById('wy-phase-label');
+  if (wyPhaseEl) {
+    wyPhaseEl.textContent = wySchema + ' — Phase ' + wyPhase + ' ' + wyEmoji;
+    wyPhaseEl.style.color = (wySchema === 'ACCUMULATION')
+      ? (wyPhase === 'D' || wyPhase === 'E' ? 'var(--buy)' : wyPhase === 'C' ? 'var(--accent)' : 'var(--hold)')
+      : 'var(--sell)';
+  }
+  var wyEmojiEl = document.getElementById('wy-emoji');
+  if (wyEmojiEl) wyEmojiEl.textContent = wyEmoji;
+  var wyScoreEl = document.getElementById('wy-score');
+  if (wyScoreEl) {
+    wyScoreEl.textContent = wyScore != null ? (wyScore >= 0 ? '+' + wyScore : wyScore) + ' pts' : '—';
+    wyScoreEl.style.color = wyScore > 0 ? 'var(--buy)' : wyScore < 0 ? 'var(--sell)' : 'var(--dim)';
+  }
+  var wyNarrEl = document.getElementById('wy-narrative');
+  if (wyNarrEl) wyNarrEl.textContent = wy.narrative || '—';
+  // Levels
+  setText('wy-sc',           wy.sc_level      ? '$' + wy.sc_level.toFixed(2)     : '—');
+  setText('wy-ar',           wy.ar_level       ? '$' + wy.ar_level.toFixed(2)     : '—');
+  setText('wy-st',           wy.st_level       ? '$' + wy.st_level.toFixed(2)     : '—');
+  setText('wy-spring-level', wy.spring_level   ? '$' + wy.spring_level.toFixed(2) : 'Pending');
+  setText('wy-sos-level',    wy.sos_level      ? '$' + wy.sos_level.toFixed(2)    : 'Pending');
+  setText('wy-cause',        wy.cause_width != null ? wy.cause_width.toFixed(1) + '% range' : '—');
+  // Status
+  setText('wy-schema', wySchema, wySchema === 'ACCUMULATION' ? 'bull' : wySchema === 'DISTRIBUTION' ? 'bear' : '');
+  setText('wy-phase',  'Phase ' + wyPhase,
+    wyPhase === 'D' || wyPhase === 'E' ? 'bull' : wyPhase === 'C' ? 'warn' : wyPhase === 'B' ? '' : '');
+  setText('wy-spring', wy.spring_fired ? '✅ FIRED'    : '❌ Pending',
+    wy.spring_fired ? 'bull' : 'dim');
+  setText('wy-sos',    wy.sos_confirmed ? '✅ CONFIRMED' : '❌ Pending',
+    wy.sos_confirmed ? 'bull' : '');
+  setText('wy-voltrd', wy.volume_trend || '—',
+    wy.volume_trend === 'CONTRACTING' ? 'bull' : wy.volume_trend === 'EXPANDING' ? 'warn' : '');
+  setText('wy-conf', wyConf ? wyConf + '%' : '—');
+  // Events
+  var wyEvEl = document.getElementById('wy-events');
+  if (wyEvEl) {
+    var evs = wy.events || [];
+    if (evs.length) {
+      wyEvEl.innerHTML = evs.map(function(ev) {
+        var evColor = ev.event === 'SC' || ev.event === 'BC' ? 'var(--sell)'
+          : ev.event === 'AR' ? 'var(--hold)'
+          : ev.event === 'SPRING' ? 'var(--accent)'
+          : ev.event === 'SOS' ? 'var(--buy)' : 'var(--text)';
+        return '<div style="display:flex;gap:10px;align-items:center;">' +
+          '<span style="color:' + evColor + ';font-weight:700;min-width:55px;">' + ev.event + '</span>' +
+          '<span style="color:var(--buy);min-width:60px;">$' + (ev.price||'?') + '</span>' +
+          '<span style="color:var(--dim);">' + (ev.desc||'') + '</span>' +
+          '</div>';
+      }).join('');
+    } else {
+      wyEvEl.innerHTML = '<span style="color:var(--dim)">No events detected yet</span>';
+    }
+  }
 
   // Alerts tab
   var alerts = s.alerts_log || [];
