@@ -5426,22 +5426,18 @@ def _calculate_wyckoff(price, volume_shelf=None, ticker=None):
         import yfinance as yf
 
         # ── Fetch daily bars ──────────────────────────────────────────────────
+        # NOTE: Always use yfinance for daily bars — Schwab ignores freq_minutes=1440
+        # and returns 5-min bars regardless, which breaks SC/AR/ST detection.
         _daily = None
         try:
-            import schwab_client as _sc_wy
-            if _sc_wy.is_configured() and _sc_wy.get_client():
-                _daily = _sc_wy.get_price_history(_ticker, period_years=0.25, freq_minutes=1440)
-                if _daily is not None and not _daily.empty and len(_daily) > 30:
-                    print(f"  📊 Wyckoff: Schwab daily {len(_daily)} bars", flush=True)
-                else:
-                    _daily = None
-        except Exception:
-            pass
-        if _daily is None:
             _daily = yf.Ticker(_ticker).history(period="90d", interval="1d")
+        except Exception as _yfe:
+            print(f"  ⚠️ Wyckoff yfinance fetch failed: {_yfe}", flush=True)
         if _daily is None or (hasattr(_daily, "empty") and _daily.empty) or len(_daily) < 20:
             result["narrative"] = "Insufficient daily data for Wyckoff analysis"
             return result
+
+        print(f"  📊 Wyckoff: yfinance daily {len(_daily)} bars (90d)", flush=True)
 
         d_closes  = _daily["Close"].astype(float).values
         d_highs   = _daily["High"].astype(float).values
@@ -13077,7 +13073,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>SPOCK — TSLA Intelligence v20260425_1400</title>
+<title>SPOCK — TSLA Intelligence v20260425_1500</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
