@@ -3807,7 +3807,11 @@ def calculate_news_sentiment(articles):
         "high_impact":  high_impact[:5],
         "articles":     articles,
         "last_updated": _now_est(),
-#  Pre-market (4:00–9:30 AM ET), After-hours (4:00–8:00 PM ET),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+#  EXTENDED HOURS TRADING ENGINE
 #  Overnight gap analysis
 #
 #  Why it matters:
@@ -8777,6 +8781,7 @@ def run_analysis(refresh_4h=True, refresh_news=True):
             "macd_history":       macd_history,
             "signal_reasons":     reasons,
             "last_updated": _now_est(),
+            "price_history": [{"date": str(d.date()), "price": round(v, 2)}
                                for d, v in zip(hist.index[-90:], closes.iloc[-90:])],
             "ichimoku_history": ichi.get("history", []),
         })
