@@ -13096,7 +13096,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>SPOCK — TSLA Intelligence v20260425_1600</title>
+<title>SPOCK — TSLA Intelligence v20260425_1700</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -13987,9 +13987,8 @@ function _updateUI_inner(s) {
     });
   }
 
-  // Show loading state while analysis hasn't run yet
-  // Only block if genuinely no price data — never key off _loading or ml_retraining flags
-  if (!s.price && !s.last_updated) {
+  // Show loading state only if genuinely no data at all
+  if (!s.price && !s.last_updated && !s.master_signal) {
     var tEl = document.getElementById('topTicker');
     if (tEl && s.ticker) { tEl.textContent = s.ticker; _currentTicker = s.ticker; }
     var bt = document.getElementById('brandTicker'); if(bt && s.ticker) bt.textContent = s.ticker;
@@ -14008,8 +14007,6 @@ function _updateUI_inner(s) {
     document.querySelectorAll('.qtick').forEach(function(el) {
       el.classList.toggle('active', el.textContent === s.ticker);
     });
-    var banner = document.getElementById('retrainBanner');
-    if (s.ml_retraining && banner) banner.classList.add('active');
     return;
   }
   // Only show retrain banner if genuinely no price data — never blank the WHY box
