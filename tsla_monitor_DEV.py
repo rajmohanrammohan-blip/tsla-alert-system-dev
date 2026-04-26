@@ -12262,7 +12262,12 @@ def check_spock_triggers(algo_alert=None):
 @app.route("/")
 def dashboard():
     from flask import Response
-    return Response(DASHBOARD_HTML, mimetype='text/html')
+    resp = Response(DASHBOARD_HTML, mimetype='text/html')
+    resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    resp.headers['Pragma'] = 'no-cache'
+    resp.headers['Expires'] = '0'
+    resp.headers['Surrogate-Control'] = 'no-store'
+    return resp
 
 
 # ───────────────────────────────────────────────────────────────
