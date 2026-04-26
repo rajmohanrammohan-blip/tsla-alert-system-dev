@@ -13105,7 +13105,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>SPOCK — TSLA Intelligence v20260425_2359</title>
+<title>SPOCK — TSLA Intelligence v20260426_0100</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -13950,69 +13950,78 @@ function fmt(v, decimals=2) {
 function updateUI(s) {
   if (!s) return;
   try {
-    _updateUI_safe(s);
+    // Safe defaults for every nested object — prevents crashes on .action of undefined
+    s.master_signal    = s.master_signal    || {};
+    s.ml_signal        = s.ml_signal        || {};
+    s.mm_data          = s.mm_data          || {};
+    s.uoa_data         = s.uoa_data         || {};
+    s.spy_data         = s.spy_data         || {};
+    s.sizing           = s.sizing           || {};
+    s.poc_data         = s.poc_data         || {};
+    s.vwap_bands       = s.vwap_bands       || {};
+    s.tsla_4h          = s.tsla_4h          || {};
+    s.earnings_context = s.earnings_context || {};
+    s.spock_accuracy   = s.spock_accuracy   || {};
+    s.wyckoff          = s.wyckoff          || {};
+    s.breadth          = s.breadth          || {};
+    s.vix_flip         = s.vix_flip         || {};
+    s.swing_context    = s.swing_context    || {};
+    s.donchian         = s.donchian         || {};
+    s.vol_hawk         = s.vol_hawk         || {};
+    s.trump_monitor    = s.trump_monitor    || {};
+    s.lead_lag         = s.lead_lag         || {};
+    s.ext_data         = s.ext_data         || {};
+    s.darthvader       = s.darthvader       || {};
+
+    // Update debug panel safely
+    var dbgPrice = document.getElementById('dbg-price');
+    if (dbgPrice) dbgPrice.textContent = s.price || '—';
+    var dbgUpdated = document.getElementById('dbg-updated');
+    if (dbgUpdated) dbgUpdated.textContent = s.last_updated || '—';
+    var dbgAction = document.getElementById('dbg-action');
+    if (dbgAction) dbgAction.textContent = s.master_signal.action || '—';
+    var dbgScore = document.getElementById('dbg-score');
+    if (dbgScore) dbgScore.textContent = s.master_signal.score != null ? s.master_signal.score : '—';
+    var dbgReasons = document.getElementById('dbg-reasons');
+    if (dbgReasons) dbgReasons.textContent = (s.master_signal.reasons || []).length;
+    var dbgLoading = document.getElementById('dbg-loading');
+    if (dbgLoading) dbgLoading.textContent = String(s._loading);
+    var dbgRetrain = document.getElementById('dbg-retrain');
+    if (dbgRetrain) dbgRetrain.textContent = String(s.ml_retraining);
+
+    // Client-side override: if we have real data, clear loading flags
+    if (s.price || s.last_updated) { s._loading = false; s.ml_retraining = false; }
+
+    // Skip render only if truly no data at all
+    if (!s.price && !s.last_updated) {
+      var ae0 = document.getElementById('spockAction');
+      if (ae0) { ae0.textContent = 'LOADING…'; ae0.style.color = 'var(--dim)'; }
+      return;
+    }
+
+    window._lastState = s;
+    _updateUI_inner(s);
+
   } catch(e) {
-    console.error('[SPOCK render crash]', e.message, e.stack);
-    // Emergency render
+    console.error('[SPOCK] updateUI crash:', e.message, e.stack);
     try {
-      var ms = s.master_signal || {};
-      var ae = document.getElementById('spockAction');
-      if (ae && ms.action) { ae.textContent = ms.action; ae.style.color = ms.action.indexOf('BUY')>=0 ? 'var(--buy)' : ms.action.indexOf('SELL')>=0 ? 'var(--sell)' : 'var(--hold)'; }
-      var sn = document.getElementById('scoreNum'); if (sn && ms.score != null) sn.textContent = (ms.score >= 0 ? '+' : '') + ms.score;
-      var cp = document.getElementById('convPct'); if (cp && ms.conviction != null) cp.textContent = ms.conviction + '%';
-      var rb = document.getElementById('riskBadge'); if (rb && ms.risk) { rb.textContent = ms.risk; rb.className = 'risk-badge risk-' + ms.risk.replace(' ','_'); }
-      var tp = document.getElementById('topPrice'); if (tp && s.price) tp.textContent = '$' + parseFloat(s.price).toFixed(2);
-      var tt = document.getElementById('topTime'); if (tt && s.last_updated) tt.textContent = s.last_updated;
+      var p = document.getElementById('topPrice');
+      if (p && s.price) p.textContent = '$' + parseFloat(s.price).toFixed(2);
+      var a = document.getElementById('spockAction');
+      var act = (s.master_signal || {}).action || '';
+      if (a && act) {
+        a.textContent = act;
+        a.style.color = act.indexOf('BUY')>=0 ? 'var(--buy)' : act.indexOf('SELL')>=0 ? 'var(--sell)' : 'var(--hold)';
+      }
       var rl = document.getElementById('reasonsList');
-      if (rl) rl.innerHTML = '<div class="reason-item" style="color:var(--sell)">⚠️ Render crash: ' + e.message.slice(0,120) + '</div>';
-      // Also show in debug strip
-      var dbgP = document.getElementById('dbg-price'); if (dbgP) dbgP.textContent = s.price || 'null';
-      var dbgA = document.getElementById('dbg-action'); if (dbgA) dbgA.textContent = '💥CRASH:' + e.message.slice(0,40);
+      if (rl) rl.innerHTML = '<div class="reason-item" style="color:var(--sell)">Render crash: ' + e.message.slice(0,120) + '</div>';
+      var dbgA2 = document.getElementById('dbg-action');
+      if (dbgA2) dbgA2.textContent = 'CRASH:' + e.message.slice(0,40);
     } catch(_) {}
   }
 }
-function _updateUI_safe(s) {
+function _updateUI_inner(s) {
   if (!s) return;
-  // Client-side override: if we have real data, clear loading flags regardless of server state
-  if (s.price || s.last_updated) { s._loading = false; s.ml_retraining = false; }
-  window._lastState = s; // cache for chart redraw on tab switch
-
-  // Debug strip — always update so we can see raw API values
-  try {
-    var ms0 = s.master_signal || {};
-    document.getElementById('dbg-price').textContent   = s.price || 'null';
-    document.getElementById('dbg-updated').textContent = s.last_updated || 'null';
-    document.getElementById('dbg-action').textContent  = ms0.action || 'null';
-    document.getElementById('dbg-score').textContent   = ms0.score != null ? ms0.score : 'null';
-    document.getElementById('dbg-reasons').textContent = (ms0.reasons||[]).length;
-    document.getElementById('dbg-loading').textContent = s._loading;
-    document.getElementById('dbg-retrain').textContent = s.ml_retraining;
-  } catch(_) {}
-
-  // Debug: log first response to help diagnose loading issues
-  if (!window._firstLoad) {
-    window._firstLoad = true;
-    console.log('[SPOCK] First state received:', {
-      ticker: s.ticker, price: s.price,
-      signal: s.master_signal && s.master_signal.action,
-      updated: s.last_updated,
-      loading: s._loading,
-      keys: Object.keys(s).length + ' keys',
-      hasUOA: !!s.uoa_data,
-      hasMM: !!s.mm_data,
-      hasVH: !!s.vol_hawk,
-      hasDC: !!s.donchian,
-      hasTM: !!s.trump_monitor,
-      hasLL: !!s.lead_lag,
-    });
-    // Verify the most critical elements exist
-    var criticalIds = ['spockAction','scoreNum','convPct','topPrice','topTicker'];
-    criticalIds.forEach(function(id) {
-      if (!document.getElementById(id)) {
-        console.error('[SPOCK] MISSING ELEMENT: #' + id);
-      }
-    });
-  }
 
   // Show loading state only if genuinely no data at all
   if (!s.price && !s.last_updated && !s.master_signal) {
