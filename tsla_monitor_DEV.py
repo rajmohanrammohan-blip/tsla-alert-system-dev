@@ -5391,6 +5391,150 @@ _spock_weights = {      # SPOCK tier weights — self-adjusting
 }
 
 
+def calculate_daily_sr(closes_daily, highs_daily, lows_daily,
+                        volumes_daily, price, mm_data):
+    """
+    Compute key daily support/resistance from:
+    1. High Volume Nodes (30-day volume profile)
+    2. Swing highs/lows (5-bar pivots)
+    3. Gap levels (daily gaps ≥1%)
+    4. Options levels (MaxPain, walls, GEX flip)
+    """
+    import numpy as np
+    result = {
+        "levels": [], "strong_support": [], "support": [],
+        "resistance": [], "strong_resistance": [],
+        "nearest_support": None, "nearest_resistance": None,
+        "current_zone": None,
+    }
+    try:
+        levels = []
+        n = len(closes_daily)
+        # Use full 2yr history — 504 trading days captures all major S/R
+        lookback = min(504, n)
+
+        # ── 1. High Volume Nodes ──────────────────────────────────────
+        # Weight recent volume more heavily (last 90 days = 2x weight)
+        price_vol = {}
+        for i in range(-lookback, 0):
+            h = float(highs_daily.iloc[i])
+            l = float(lows_daily.iloc[i])
+            v = float(volumes_daily.iloc[i])
+            # Recent bars get 2x weight — fresher levels matter more
+            weight = 2.0 if i >= -90 else 1.0
+            steps = max(int(h - l), 1)
+            for s in range(steps):
+                bucket = round(l + (s / steps) * (h - l))
+                price_vol[bucket] = price_vol.get(bucket, 0) + (v / steps) * weight
+        if price_vol:
+            avg_vol = np.mean(list(price_vol.values()))
+            for lvl, vol in price_vol.items():
+                if vol > avg_vol * 2.5:
+                    strength = "STRONG" if vol > avg_vol * 4 else "NORMAL"
+                    levels.append({"price": float(lvl), "type": "HVN",
+                                   "strength": strength,
+                                   "label": f"High Vol Node ${lvl}",
+                                   "vol_mult": round(vol / avg_vol, 1)})
+
+        # ── 2. Swing Highs/Lows (5-bar pivot, full 2yr history) ──────
+        # Tag recent pivots (last 90 days) as STRONG — they're the freshest memory
+        for i in range(2, min(n - 2, lookback)):
+            idx = -lookback + i
+            h = float(highs_daily.iloc[idx])
+            l = float(lows_daily.iloc[idx])
+            try:
+                date_str = str(closes_daily.index[idx].date())
+            except Exception:
+                date_str = ""
+            days_ago = lookback - i
+            is_recent = days_ago <= 90
+            is_swing_high = all(h >= float(highs_daily.iloc[idx + j]) for j in [-2, -1, 1, 2])
+            is_swing_low  = all(l <= float(lows_daily.iloc[idx + j])  for j in [-2, -1, 1, 2])
+            if is_swing_high:
+                levels.append({"price": round(h, 2), "type": "SWING_HIGH",
+                                "strength": "STRONG" if is_recent else "NORMAL",
+                                "label": f"Swing High ${h:.0f} ({date_str})",
+                                "vol_mult": 1.0})
+            if is_swing_low:
+                levels.append({"price": round(l, 2), "type": "SWING_LOW",
+                                "strength": "STRONG" if is_recent else "NORMAL",
+                                "label": f"Swing Low ${l:.0f} ({date_str})",
+                                "vol_mult": 1.0})
+
+        # ── 3. Gap Levels (2yr, significant gaps ≥2%) ────────────────
+        for i in range(1, min(n, lookback)):
+            prev_close = float(closes_daily.iloc[-i - 1])
+            curr_open  = float(closes_daily.iloc[-i])
+            gap_pct = (curr_open - prev_close) / prev_close * 100
+            if abs(gap_pct) >= 2.0:  # 2% threshold — only major gaps over 2yr
+                gap_price = round((prev_close + curr_open) / 2, 2)
+                levels.append({"price": gap_price,
+                                "type": "GAP_UP" if gap_pct > 0 else "GAP_DOWN",
+                                "strength": "STRONG" if abs(gap_pct) >= 4 else "NORMAL",
+                                "label": f"Gap {'↑' if gap_pct > 0 else '↓'} {gap_pct:+.1f}% at ${gap_price:.0f}",
+                                "vol_mult": abs(gap_pct)})
+
+        # ── 4. Options levels ─────────────────────────────────────────
+        for lvl_price, lvl_type, label in [
+            (mm_data.get("max_pain"),       "MAX_PAIN",  "Max Pain"),
+            (mm_data.get("call_wall"),      "CALL_WALL", "Call Wall"),
+            (mm_data.get("put_wall"),       "PUT_WALL",  "Put Wall"),
+            (mm_data.get("gex_flip_level"), "GEX_FLIP",  "GEX Flip"),
+        ]:
+            if lvl_price:
+                levels.append({"price": float(lvl_price), "type": lvl_type,
+                                "strength": "STRONG",
+                                "label": f"{label} ${lvl_price:.0f}",
+                                "vol_mult": 1.0})
+
+        # ── Cluster nearby levels (within $2) ─────────────────────────
+        levels.sort(key=lambda x: x["price"])
+        clustered = []
+        for lvl in levels:
+            if clustered and abs(lvl["price"] - clustered[-1]["price"]) <= 2.0:
+                prev = clustered[-1]
+                if lvl["strength"] == "STRONG":
+                    prev["strength"] = "STRONG"
+                prev["price"] = round((prev["price"] + lvl["price"]) / 2, 2)
+                prev["label"] = prev["label"] + " + " + lvl["type"]
+                prev["vol_mult"] = max(prev["vol_mult"], lvl["vol_mult"])
+            else:
+                clustered.append(dict(lvl))
+
+        # ── Classify support / resistance ─────────────────────────────
+        support    = sorted([l for l in clustered if l["price"] < price * 0.998], key=lambda x: -x["price"])
+        resistance = sorted([l for l in clustered if l["price"] > price * 1.002], key=lambda x:  x["price"])
+
+        result["levels"]            = clustered
+        result["support"]           = [l for l in support    if l["strength"] == "NORMAL"][:4]
+        result["strong_support"]    = [l for l in support    if l["strength"] == "STRONG"][:4]
+        result["resistance"]        = [l for l in resistance if l["strength"] == "NORMAL"][:4]
+        result["strong_resistance"] = [l for l in resistance if l["strength"] == "STRONG"][:4]
+        result["nearest_support"]   = support[0]["price"]    if support    else None
+        result["nearest_resistance"]= resistance[0]["price"] if resistance else None
+
+        # ── Zone classification ───────────────────────────────────────
+        if result["nearest_support"] and result["nearest_resistance"]:
+            dist_sup = (price - result["nearest_support"])   / price * 100
+            dist_res = (result["nearest_resistance"] - price) / price * 100
+            if dist_sup < 0.5:
+                result["current_zone"] = "AT_SUPPORT"
+            elif dist_res < 0.5:
+                result["current_zone"] = "AT_RESISTANCE"
+            elif dist_sup < dist_res:
+                result["current_zone"] = "NEAR_SUPPORT"
+            else:
+                result["current_zone"] = "NEAR_RESISTANCE"
+
+        sup_str = " | ".join(f"${l['price']:.0f}" for l in (result["strong_support"] + result["support"])[:3])
+        res_str = " | ".join(f"${l['price']:.0f}" for l in (result["strong_resistance"] + result["resistance"])[:3])
+        print(f"  📊 Daily S/R: Support={sup_str} | Resistance={res_str} | Zone:{result['current_zone']}", flush=True)
+
+    except Exception as _sre:
+        print(f"  ⚠️ Daily S/R error: {_sre}", flush=True)
+    return result
+
+
 def _calculate_wyckoff(price, volume_shelf=None, ticker=None):
     """
     Wyckoff Method — Phase & Event Detector.
@@ -9477,6 +9621,45 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                     print(f"  ⚠️ Wyckoff error: {_wye}", flush=True)
                     state["wyckoff"] = {}
 
+                # ── Daily S/R Levels ──────────────────────────────────────────
+                # Use 2yr of 5-min Schwab bars resampled to daily — gives ~504
+                # trading days, capturing all major institutional S/R levels.
+                try:
+                    # Reuse the main hist (already fetched, 2yr 5-min) → resample daily
+                    import pandas as _pd_sr
+                    if hist is not None and not hist.empty and len(hist) > 100:
+                        try:
+                            import pytz as _pytz_sr
+                            _sr_idx = hist.index
+                            if _sr_idx.tz is None:
+                                _sr_idx = _sr_idx.tz_localize("UTC")
+                            _sr_df = hist.copy()
+                            _sr_df.index = _sr_idx.tz_convert("America/New_York")
+                        except Exception:
+                            _sr_df = hist.copy()
+                        _daily_hist = _sr_df.resample("1D").agg({
+                            "Open":   "first", "High": "max",
+                            "Low":    "min",   "Close": "last",
+                            "Volume": "sum",
+                        }).dropna(subset=["Close"])
+                        _daily_hist = _daily_hist[_daily_hist["Volume"] > 0]
+                        print(f"  📊 Daily S/R: using {len(_daily_hist)} daily bars (2yr resample)", flush=True)
+                    else:
+                        _daily_hist, _ = _schwab_or_yf(TICKER, period_years=2,
+                                                        freq_minutes=1440,
+                                                        yf_period="2y", yf_interval="1d")
+                    if _daily_hist is not None and not _daily_hist.empty:
+                        state["daily_sr"] = calculate_daily_sr(
+                            _daily_hist["Close"], _daily_hist["High"],
+                            _daily_hist["Low"],   _daily_hist["Volume"],
+                            price, mm_data
+                        )
+                    else:
+                        state["daily_sr"] = {}
+                except Exception as _sre:
+                    print(f"  ⚠️ Daily S/R error: {_sre}", flush=True)
+                    state["daily_sr"] = {}
+
                 master = calculate_master_signal(
                     signal      = signal,
                     strength    = strength,
@@ -10004,6 +10187,7 @@ def api_state():
                 "vix_flip":      state.get("vix_flip", {}),
                 "swing_context": state.get("swing_context", {}),
                 "wyckoff":       state.get("wyckoff", {}),
+                "daily_sr":      state.get("daily_sr", {}),
                 "alerts_log":    state.get("alerts_log", [])[:20],
                 "spock_accuracy":state.get("spock_accuracy", {}),
                 "ml_ready":      _ml_ready,
@@ -13110,7 +13294,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>SPOCK — TSLA Intelligence v20260426_0100</title>
+<title>SPOCK — TSLA Intelligence v20260426_0300</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -13740,7 +13924,26 @@ body {
 
     <!-- DATA TAB -->
     <div class="tab-content" id="tab-data">
-      <div class="data-card">
+      <!-- Daily S/R card — full width -->
+      <div class="data-card" style="grid-column:1/-1">
+        <h3>📊 Daily Support &amp; Resistance</h3>
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px;padding:10px 14px;background:var(--bg3);border-radius:6px;flex-wrap:wrap;">
+          <span style="font-size:11px;color:var(--dim);">CURRENT ZONE</span>
+          <span id="sr-zone" style="font-weight:700;font-size:13px;">—</span>
+          <span style="font-size:11px;color:var(--dim);margin-left:auto;">Nearest Support: <span id="sr-near-sup" style="color:var(--buy);font-weight:700;">—</span></span>
+          <span style="font-size:11px;color:var(--dim);">Nearest Resistance: <span id="sr-near-res" style="color:var(--sell);font-weight:700;">—</span></span>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+          <div>
+            <div style="font-size:10px;color:var(--buy);letter-spacing:0.1em;margin-bottom:8px;">▲ SUPPORT LEVELS</div>
+            <div id="sr-support-list" style="display:flex;flex-direction:column;gap:6px;font-size:12px;"></div>
+          </div>
+          <div>
+            <div style="font-size:10px;color:var(--sell);letter-spacing:0.1em;margin-bottom:8px;">▼ RESISTANCE LEVELS</div>
+            <div id="sr-resistance-list" style="display:flex;flex-direction:column;gap:6px;font-size:12px;"></div>
+          </div>
+        </div>
+      </div>
         <h3>Volume Profile</h3>
         <div class="data-row"><span class="data-row-label">POC</span><span class="data-row-val" id="poc-val">—</span></div>
         <div class="data-row"><span class="data-row-label">VAH</span><span class="data-row-val" id="vah-val">—</span></div>
@@ -13968,6 +14171,7 @@ function updateUI(s) {
     s.earnings_context = s.earnings_context || {};
     s.spock_accuracy   = s.spock_accuracy   || {};
     s.wyckoff          = s.wyckoff          || {};
+    s.daily_sr         = s.daily_sr         || {};
     s.breadth          = s.breadth          || {};
     s.vix_flip         = s.vix_flip         || {};
     s.swing_context    = s.swing_context    || {};
@@ -14402,6 +14606,41 @@ function _updateUI_inner(s) {
     dhCharm === 'EXTREME' ? 'extreme' : dhCharm === 'HIGH' ? 'warn' : dhCharm === 'ELEVATED' ? 'warn' : '');
   setText('dh-mode', dhMode.split(' — ')[0] || '—',
     dhMode.indexOf('SELL') >= 0 ? 'bear' : dhMode.indexOf('BUY') >= 0 ? 'bull' : dhMode.indexOf('CHAS') >= 0 ? 'extreme' : '');
+
+  // ── Daily S/R tab ──
+  var sr = s.daily_sr || {};
+  var srZone = sr.current_zone || '—';
+  setText('sr-zone', srZone,
+    srZone === 'AT_SUPPORT' ? 'bull' : srZone === 'AT_RESISTANCE' ? 'bear' :
+    srZone === 'NEAR_SUPPORT' ? 'bull' : srZone === 'NEAR_RESISTANCE' ? 'warn' : '');
+  setText('sr-near-sup', sr.nearest_support  != null ? '$' + parseFloat(sr.nearest_support).toFixed(0)  : '—');
+  setText('sr-near-res', sr.nearest_resistance != null ? '$' + parseFloat(sr.nearest_resistance).toFixed(0) : '—');
+  var supList = document.getElementById('sr-support-list');
+  if (supList) {
+    var allSup = (sr.strong_support || []).concat(sr.support || []);
+    supList.innerHTML = allSup.slice(0, 5).map(function(l) {
+      var isStrong = l.strength === 'STRONG';
+      var dist = s.price ? ((parseFloat(s.price) - l.price) / parseFloat(s.price) * 100).toFixed(1) : '?';
+      return '<div style="display:flex;justify-content:space-between;padding:7px 10px;background:var(--bg3);border-radius:4px;border-left:3px solid ' + (isStrong ? 'var(--buy)' : 'rgba(0,255,136,0.3)') + ';gap:8px;">' +
+        '<span style="font-weight:700;color:' + (isStrong ? 'var(--buy)' : 'var(--text)') + '">$' + parseFloat(l.price).toFixed(0) + (isStrong ? ' ⚡' : '') + '</span>' +
+        '<span style="color:var(--dim);font-size:10px;">' + (l.type || '').replace(/_/g, ' ') + '</span>' +
+        '<span style="color:var(--dim);">-' + dist + '%</span>' +
+        '</div>';
+    }).join('') || '<div style="color:var(--dim)">No levels</div>';
+  }
+  var resList = document.getElementById('sr-resistance-list');
+  if (resList) {
+    var allRes = (sr.strong_resistance || []).concat(sr.resistance || []);
+    resList.innerHTML = allRes.slice(0, 5).map(function(l) {
+      var isStrong = l.strength === 'STRONG';
+      var dist = s.price ? ((l.price - parseFloat(s.price)) / parseFloat(s.price) * 100).toFixed(1) : '?';
+      return '<div style="display:flex;justify-content:space-between;padding:7px 10px;background:var(--bg3);border-radius:4px;border-left:3px solid ' + (isStrong ? 'var(--sell)' : 'rgba(255,51,85,0.3)') + ';gap:8px;">' +
+        '<span style="font-weight:700;color:' + (isStrong ? 'var(--sell)' : 'var(--text)') + '">$' + parseFloat(l.price).toFixed(0) + (isStrong ? ' ⚡' : '') + '</span>' +
+        '<span style="color:var(--dim);font-size:10px;">' + (l.type || '').replace(/_/g, ' ') + '</span>' +
+        '<span style="color:var(--dim);">+' + dist + '%</span>' +
+        '</div>';
+    }).join('') || '<div style="color:var(--dim)">No levels</div>';
+  }
 
   // ── Wyckoff tab ──
   var wy = s.wyckoff || {};
