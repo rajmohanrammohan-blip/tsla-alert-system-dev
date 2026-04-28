@@ -1102,15 +1102,48 @@ def calculate_spy_analysis(tsla_closes, tsla_price):
         qqq_closes = qqq_hist["Close"] if not qqq_hist.empty else None
         vix_closes = vix_hist["Close"] if not vix_hist.empty else None
         tlt_closes = tlt_hist["Close"] if not tlt_hist.empty else None
+
+        # ── Live real-time quotes for SPY/QQQ — override stale daily close ──
+        # Daily bars only update at market close. During pre-market and intraday
+        # Schwab returns yesterday's close. We need live quotes for macro accuracy.
+        _spy_live_price = None
+        _qqq_live_price = None
+        try:
+            import schwab_client as _sc_macro
+            if _sc_macro.is_configured():
+                _spy_qt = _sc_macro.get_quote("SPY")
+                if _spy_qt and _spy_qt.get("price", 0) > 0:
+                    _spy_live_price = float(_spy_qt["price"])
+                    _spy_live_chg   = float(_spy_qt.get("change_pct", 0))
+                    print(f"  📡 SPY live: ${_spy_live_price:.2f} ({_spy_live_chg:+.2f}%)", flush=True)
+                _qqq_qt = _sc_macro.get_quote("QQQ")
+                if _qqq_qt and _qqq_qt.get("price", 0) > 0:
+                    _qqq_live_price = float(_qqq_qt["price"])
+                    _qqq_live_chg   = float(_qqq_qt.get("change_pct", 0))
+                    print(f"  📡 QQQ live: ${_qqq_live_price:.2f} ({_qqq_live_chg:+.2f}%)", flush=True)
+        except Exception as _macro_qt_err:
+            pass  # fall back to daily close
+
         spy_price  = round(float(spy_closes.iloc[-1]), 2)
-        result["spy_price"] = spy_price
-        spy_chg = round((float(spy_closes.iloc[-1]) / float(spy_closes.iloc[-2]) - 1) * 100, 2) if len(spy_closes) > 1 else 0
+        # Override with live quote if available (pre-market / intraday accuracy)
+        if _spy_live_price and _spy_live_price > 0:
+            spy_price = round(_spy_live_price, 2)
+            spy_chg   = _spy_live_chg  # use Schwab's own change_pct (vs prev close)
+        else:
+            spy_chg = round((float(spy_closes.iloc[-1]) / float(spy_closes.iloc[-2]) - 1) * 100, 2) if len(spy_closes) > 1 else 0
+        result["spy_price"]      = spy_price
         result["spy_change_pct"] = spy_chg
 
         if qqq_closes is not None and len(qqq_closes) > 14:
             qqq_price = float(qqq_closes.iloc[-1])
-            result["qqq_price"]      = round(qqq_price, 2)
-            result["qqq_change_pct"] = round((qqq_price / float(qqq_closes.iloc[-2]) - 1) * 100, 2)
+            # Override with live quote if available
+            if _qqq_live_price and _qqq_live_price > 0:
+                qqq_price = _qqq_live_price
+                result["qqq_price"]      = round(qqq_price, 2)
+                result["qqq_change_pct"] = _qqq_live_chg
+            else:
+                result["qqq_price"]      = round(qqq_price, 2)
+                result["qqq_change_pct"] = round((qqq_price / float(qqq_closes.iloc[-2]) - 1) * 100, 2)
             # QQQ RSI
             _qd = qqq_closes.diff()
             _qg = _qd.where(_qd > 0, 0).rolling(14).mean()
@@ -13433,7 +13466,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>SPOCK — TSLA Intelligence v20260426_0400</title>
+<title>SPOCK — TSLA Intelligence v20260428_1300</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
