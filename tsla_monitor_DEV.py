@@ -5201,7 +5201,7 @@ def send_whatsapp(message, alert_key="default"):
                   _now.hour < 20)  # include pre/post market
     # Gap/crash alerts use gap data (always fresh) — don't suppress them on stale price
     _gap_alert_keys = {"premarket_crash", "afterhours_crash", "gex_flip_warning",
-                       "earnings_gap", "gap_down", "gap_up"}
+                       "gex_flip_reclaim", "earnings_gap", "gap_down", "gap_up"}
     _price_stale = (_price_age is None or _price_age > 600) and not _in_market
     if _price_stale and alert_key not in _gap_alert_keys:
         print(f"  ⚠️ Alert price may be stale (age={_price_age}s, outside market) — skipping alert", flush=True)
@@ -7415,7 +7415,50 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
     elif _gex_flip > 0 and _gf_dist <= 6.0:
         score -= 5; votes["neutral"] += 1
 
-    # Vanna — bullish when positive (VIX dropping fuels call buying)
+    # ── REVERSAL DETECTORS (new) ─────────────────────────────────────────────
+
+    # Fix 1: GEX flip RECLAIM — price was below flip last cycle, now above it
+    # This is the highest-conviction reversal signal: dealers flip back to long
+    # gamma and stabilize aggressively. Today's $363→$378 move was this.
+    global _prev_cycle_above_flip, _prev_cycle_gex_flip
+    _currently_above_flip = _gex_flip > 0 and price > _gex_flip
+    if (_prev_cycle_above_flip is not None and
+            not _prev_cycle_above_flip and _currently_above_flip):
+        score += 20
+        reasons.append(f"🔄 GEX flip RECLAIM ${_gex_flip:.0f} — dealers back to long gamma, stabilizing ↑")
+        votes["bull"] += 2
+        print(f"  🔄 GEX FLIP RECLAIM detected at ${price:.2f} (flip=${_gex_flip:.1f})", flush=True)
+
+    # Fix 2: VAL touch + reversal — price tagged Value Area Low then recovered
+    # Institutions defend VAL aggressively — it's where unfilled buy orders sit
+    _poc_data   = state.get("poc_data", {}) if isinstance(state, dict) else {}
+    _val        = float(_poc_data.get("val", 0) or 0)
+    _vah        = float(_poc_data.get("vah", 0) or 0)
+    _prev_price = float(_prev_cycle_price) if _prev_cycle_price else price
+    if _val > 0:
+        _val_dist_pct = abs(price - _val) / _val * 100
+        _prev_was_at_val = abs(_prev_price - _val) / _val < 0.8  # prev cycle was within 0.8% of VAL
+        if _prev_was_at_val and price > _val and price > _prev_price:
+            # Price touched VAL last cycle and is now recovering above it
+            score += 15
+            reasons.append(f"📈 VAL reclaim ${_val:.0f} — institutional support held, buyers confirmed")
+            votes["bull"] += 1
+            print(f"  📈 VAL RECLAIM: prev=${_prev_price:.2f} at VAL=${_val:.2f}, now=${price:.2f}", flush=True)
+        elif _val_dist_pct < 0.5 and price > _prev_price:
+            # Currently AT VAL with positive momentum
+            score += 10
+            reasons.append(f"📊 AT Value Area Low ${_val:.0f} — watching for hold/bounce")
+            votes["bull"] += 1
+
+    # Fix 3: Local Wyckoff Spring — 15-day micro-structure
+    # Run a tight window Wyckoff scan to catch post-earnings Springs
+    # that the 2yr scan misses (it sees SC=$337 vs local SC=$352)
+    _wy_local = state.get("wyckoff_local", {}) if isinstance(state, dict) else {}
+    if _wy_local.get("spring_fired") and not _wy_local.get("sos_confirmed"):
+        spring_lvl = _wy_local.get("spring_level", 0)
+        score += 14
+        reasons.append(f"🌀 Local Spring ${spring_lvl:.0f} — bears trapped, smart money absorbing")
+        votes["bull"] += 1
     if _vanna_bias > 50:
         score += 5; votes["bull"] += 1
         reasons.append(f"Vanna flow bullish ({_vanna_bias:+.0f}M) — low VIX fueling call demand")
@@ -8868,6 +8911,27 @@ def run_analysis(refresh_4h=True, refresh_news=True):
             except Exception:
                 pass
 
+            # ── GEX flip RECLAIM alert ────────────────────────────────────
+            try:
+                global _prev_cycle_above_flip
+                _gfl_r  = mm_data.get("gex_flip_level")
+                _curr_above = _gfl_r and price > float(_gfl_r)
+                if (_prev_cycle_above_flip is not None and
+                        not _prev_cycle_above_flip and _curr_above):
+                    _nl = "\n"
+                    _send_whatsapp_alert(
+                        f"🔄 TSLA *GEX FLIP RECLAIM*{_nl}"
+                        f"━━━━━━━━━━━━━━━━━━━━━━{_nl}"
+                        f"Price *${price:.2f}* reclaimed GEX flip *${_gfl_r:.1f}*{_nl}"
+                        f"Dealers back to LONG GAMMA — stabilizing behavior{_nl}"
+                        f"This is a high-conviction reversal signal ↑{_nl}"
+                        f"MaxPain: ${mm_data.get('max_pain','?')} | GEX: +${mm_data.get('gex_total',0):.0f}M",
+                        alert_key="gex_flip_reclaim"
+                    )
+                    print(f"  🔄 GEX FLIP RECLAIM ALERT sent — ${price:.2f} reclaimed ${_gfl_r:.1f}", flush=True)
+            except Exception:
+                pass
+
         except Exception as _vwap_err:
             state["vwap_bands"] = {}
 
@@ -9621,6 +9685,65 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                     print(f"  ⚠️ Wyckoff error: {_wye}", flush=True)
                     state["wyckoff"] = {}
 
+                # ── Local Wyckoff (15-day micro-structure for Springs) ────────
+                try:
+                    _wy_local = _calculate_wyckoff(price, ticker=TICKER)
+                    # Override: re-run with tighter 15-day window by passing
+                    # a custom period — monkey-patch via a short resample
+                    import pandas as _pd_wyl
+                    import schwab_client as _sc_wyl
+                    if _sc_wyl.is_configured() and _sc_wyl.get_client():
+                        _raw_wyl = _sc_wyl.get_price_history(TICKER, period_years=0.08, freq_minutes=5)
+                        if _raw_wyl is not None and not _raw_wyl.empty and len(_raw_wyl) > 50:
+                            try:
+                                import pytz as _ptz_wyl
+                                _idx_wyl = _raw_wyl.index
+                                if _idx_wyl.tz is None:
+                                    _idx_wyl = _idx_wyl.tz_localize("UTC")
+                                _raw_wyl.index = _idx_wyl.tz_convert("America/New_York")
+                            except Exception:
+                                pass
+                            _d_wyl = _raw_wyl.resample("1D").agg({
+                                "Open":"first","High":"max","Low":"min",
+                                "Close":"last","Volume":"sum"
+                            }).dropna(subset=["Close"])
+                            _d_wyl = _d_wyl[_d_wyl["Volume"] > 0]
+                            if len(_d_wyl) >= 5:
+                                # Run mini Wyckoff on last 15 days only
+                                import numpy as _np_wyl
+                                _d15 = _d_wyl.tail(15)
+                                _c15 = _d15["Close"].astype(float).values
+                                _h15 = _d15["High"].astype(float).values
+                                _l15 = _d15["Low"].astype(float).values
+                                _v15 = _d15["Volume"].astype(float).values
+                                _avg_v = _np_wyl.mean(_v15)
+                                _sc_idx = int(_np_wyl.argmin(_l15))
+                                _sc_price = float(_l15[_sc_idx])
+                                _spring_fired = False
+                                _spring_level = None
+                                # Spring: new low below SC that immediately recovers
+                                for _si in range(_sc_idx+1, len(_l15)):
+                                    if (_l15[_si] < _sc_price * 1.005 and
+                                            _si+1 < len(_c15) and
+                                            _c15[_si+1] > _l15[_si] * 1.005):
+                                        _spring_fired = True
+                                        _spring_level = round(float(_l15[_si]), 2)
+                                        break
+                                _wy_local = {
+                                    "phase": "C" if _spring_fired else "B",
+                                    "schema": "ACCUMULATION",
+                                    "spring_fired": _spring_fired,
+                                    "spring_level": _spring_level,
+                                    "sc_level": round(_sc_price, 2),
+                                    "sos_confirmed": False,
+                                    "window": "15d",
+                                }
+                                if _spring_fired:
+                                    print(f"  🌀 Local Spring detected at ${_spring_level} (SC=${_sc_price:.2f}, 15d window)", flush=True)
+                    state["wyckoff_local"] = _wy_local
+                except Exception as _wyle:
+                    state["wyckoff_local"] = {}
+
                 # ── Daily S/R Levels ──────────────────────────────────────────
                 # Use 2yr of 5-min Schwab bars resampled to daily — gives ~504
                 # trading days, capturing all major institutional S/R levels.
@@ -10105,6 +10228,15 @@ def monitor_loop():
             _cache_news["data"] = state.get("news_data", {})
 
         print(f"[LOOP] cycle {cycle} done, sleeping {CHECK_INTERVAL}s", flush=True)
+
+        # Update cross-cycle reversal tracking
+        global _prev_cycle_price, _prev_cycle_gex_flip, _prev_cycle_above_flip
+        _prev_cycle_price    = state.get("price")
+        _mm                  = state.get("mm_data", {})
+        _prev_cycle_gex_flip = _mm.get("gex_flip_level")
+        if _prev_cycle_price and _prev_cycle_gex_flip:
+            _prev_cycle_above_flip = float(_prev_cycle_price) > float(_prev_cycle_gex_flip)
+
         time.sleep(CHECK_INTERVAL)
 
 
@@ -10187,6 +10319,7 @@ def api_state():
                 "vix_flip":      state.get("vix_flip", {}),
                 "swing_context": state.get("swing_context", {}),
                 "wyckoff":       state.get("wyckoff", {}),
+                "wyckoff_local": state.get("wyckoff_local", {}),
                 "daily_sr":      state.get("daily_sr", {}),
                 "alerts_log":    state.get("alerts_log", [])[:20],
                 "spock_accuracy":state.get("spock_accuracy", {}),
@@ -12048,6 +12181,12 @@ _ml_ready         = False
 _ml_retraining    = False
 _ml_corrective_labels = []   # injected by self-learning when outcomes are wrong
 
+# ── Cross-cycle tracking for reversal detection ─────────────────────────────
+_prev_cycle_price    = None   # price from last completed cycle
+_prev_cycle_gex_flip = None   # GEX flip level from last cycle
+_prev_cycle_above_flip = None # was price above GEX flip last cycle?
+
+
 def _load_ml_model():
     global _ml_model_cache
     if _ml_model_cache is not None: return _ml_model_cache
@@ -13294,7 +13433,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>SPOCK — TSLA Intelligence v20260426_0300</title>
+<title>SPOCK — TSLA Intelligence v20260426_0400</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
