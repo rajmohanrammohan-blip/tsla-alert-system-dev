@@ -6159,10 +6159,16 @@ def calculate_donchian(highs, lows, closes, period=20):
             signal = "LOWER_HALF"
 
         # Breakout: today's close exceeds yesterday's upper/lower
+        # Require meaningful move (>0.3%) AND 2 consecutive closes to avoid
+        # gap-open misfires where first bar temporarily breaches the band
         prev_upper = float(highs.iloc[-period-1:-1].max()) if len(highs) > period else upper
         prev_lower = float(lows.iloc[-period-1:-1].min())  if len(lows)  > period else lower
-        breakout_up   = price > prev_upper
-        breakout_down = price < prev_lower
+        _gap_threshold = 0.003  # 0.3% minimum move to confirm breakout
+        _prev2_close   = float(closes.iloc[-2]) if len(closes) > 1 else price
+        breakout_up   = (price > prev_upper * (1 + _gap_threshold) and
+                         _prev2_close > prev_upper)  # 2 consecutive closes above
+        breakout_down = (price < prev_lower * (1 - _gap_threshold) and
+                         _prev2_close < prev_lower)  # 2 consecutive closes below
 
         return {
             "upper":         round(upper, 2),
@@ -9354,7 +9360,6 @@ def run_analysis(refresh_4h=True, refresh_news=True):
 
         if signal != "HOLD" and signal != last_signal:
             # ── Direction lock — same direction needs 2% move to resend ──
-            global _last_alert_direction, _last_alert_price_level
             _is_buy_dir  = "BUY"  in signal
             _is_sell_dir = "SELL" in signal
             _same_dir    = ((_is_buy_dir  and _last_alert_direction == "BUY") or
