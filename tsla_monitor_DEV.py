@@ -655,19 +655,32 @@ def generate_signal(indicators, price):
         score -= 10; reasons.append(f"Monte Carlo: {mc_prob}% slight downside edge ▼")
 
     # ── Factor Model (AQR / BlackRock Systematic momentum) ──
+    # During strong momentum (5%+ recent move + macro tailwind), the AQR factor
+    # uses 12-month returns which are stale during post-earnings regime changes.
     factor_sig = indicators.get("factor_signal", "NEUTRAL")
     factor_map = {"STRONG_BUY": 20, "BUY": 12, "NEUTRAL": 0, "SELL": -12, "STRONG_SELL": -20}
     fscore = factor_map.get(factor_sig, 0)
-    if fscore != 0:
+    _ret_48b = abs(float(indicators.get("ret_48b", 0) or 0))
+    _macro_sc = float(spy_data.get("macro_score", 0) or 0)
+    _strong_momentum = _ret_48b > 0.05 and _macro_sc >= 15
+    if fscore < 0 and _strong_momentum:
+        fscore = fscore // 2  # halve bearish weight during momentum regime
+        reasons.append(f"AQR Factor {factor_sig} (halved — momentum regime, 12m returns stale)")
+    elif fscore != 0:
         score += fscore
         reasons.append(f"AQR Factor Model: {factor_sig} ({'+' if fscore>0 else ''}{fscore})")
+    score += fscore if (fscore < 0 and _strong_momentum) else 0
 
     # ── Smart Money Index (institutional flow vs retail) ──
     smi_sig = indicators.get("smi_signal", "NEUTRAL")
     if smi_sig == "ACCUMULATING":
         score += 18; reasons.append("Smart Money Index: institutions ACCUMULATING ▲")
     elif smi_sig == "DISTRIBUTING":
-        score -= 18; reasons.append("Smart Money Index: institutions DISTRIBUTING ▼")
+        if _strong_momentum and score > 20:
+            # SMI DISTRIBUTING is a lagging artifact during strong upward momentum
+            reasons.append("SMI DISTRIBUTING muted — momentum regime active (post-earnings lag)")
+        else:
+            score -= 18; reasons.append("Smart Money Index: institutions DISTRIBUTING ▼")
 
     # ════════════════════════════════════════════════════
     # MARKET MAKER SCORING — Options flow, GEX, Max Pain
@@ -5234,7 +5247,7 @@ def send_whatsapp(message, alert_key="default"):
                   _now.hour < 20)  # include pre/post market
     # Gap/crash alerts use gap data (always fresh) — don't suppress them on stale price
     _gap_alert_keys = {"premarket_crash", "afterhours_crash", "gex_flip_warning",
-                       "gex_flip_reclaim", "earnings_gap", "gap_down", "gap_up"}
+                       "gex_flip_reclaim", "wyckoff_sos", "earnings_gap", "gap_down", "gap_up"}
     _price_stale = (_price_age is None or _price_age > 600) and not _in_market
     if _price_stale and alert_key not in _gap_alert_keys:
         print(f"  ⚠️ Alert price may be stale (age={_price_age}s, outside market) — skipping alert", flush=True)
@@ -5263,8 +5276,12 @@ def send_whatsapp(message, alert_key="default"):
     _cur_p = state.get("price", 0) or 0
     if _last_alert_price > 0 and _cur_p > 0:
         _delta_pct = abs(_cur_p - _last_alert_price) / _last_alert_price * 100
-        if _delta_pct < 0.5 and last and (datetime.now() - last).total_seconds() < 1800:
-            print(f"⏳ Alert deduplicated ({alert_key}) — price only moved {_delta_pct:.2f}% (need 0.5%)")
+        # During active strong trends (score ≥60), raise threshold to 1.5% to reduce noise
+        _master_now = state.get("master_signal", {}) or {}
+        _active_trend = abs(_master_now.get("score", 0) or 0) >= 60
+        _dedup_threshold = 1.5 if _active_trend else 0.5
+        if _delta_pct < _dedup_threshold and last and (datetime.now() - last).total_seconds() < 1800:
+            print(f"⏳ Alert deduplicated ({alert_key}) — price moved {_delta_pct:.2f}% (need {_dedup_threshold}%)")
             return
     state[f"_last_alert_price_{alert_key}"] = _cur_p
     try:
@@ -7554,7 +7571,12 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
     elif entry_score >= 50:
         score += 5; votes["bull"] += 1
     if exit_score >= 70:
-        score -= 10; reasons.append(f"Exit score HIGH ({exit_score}/100) — consider scaling out")
+        _gex_pin = float(mm_data.get("gex_total", 0) or 0) > 500
+        if _gex_pin:
+            score -= 3  # muted — strong positive GEX means dealers suppress volatility
+            reasons.append(f"Exit score {exit_score} muted — GEX +{mm_data.get('gex_total',0):.0f}M pinning")
+        else:
+            score -= 10; reasons.append(f"Exit score HIGH ({exit_score}/100) — consider scaling out")
         votes["bear"] += 1
     elif exit_score >= 55:
         score -= 3  # small penalty — don't add bear vote at 55, it's just mild caution
@@ -8008,7 +8030,7 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
     }
 
 def run_analysis(refresh_4h=True, refresh_news=True):
-    global last_signal
+    global last_signal, _last_alert_direction, _last_alert_price_level
     print(f"\n[ANALYSIS] {TICKER} @ {datetime.now().strftime('%H:%M:%S')}...", flush=True)
     poc_data = state.get("poc_data", {})  # init early — computed later, use last known until then
     try:
@@ -8965,6 +8987,35 @@ def run_analysis(refresh_4h=True, refresh_news=True):
             except Exception:
                 pass
 
+            # ── Wyckoff Creek/SOS alert ───────────────────────────────────
+            # Fire when price closes above the Creek level on meaningful volume
+            try:
+                _wy_now    = state.get("wyckoff", {}) or {}
+                _creek     = float(_wy_now.get("creek_level", 0) or 0)
+                _wy_prev   = state.get("_prev_wyckoff", {}) or {}
+                _prev_close_below_creek = (_prev_cycle_price and _creek > 0 and
+                                           float(_prev_cycle_price) < _creek * 0.998)
+                _curr_above_creek = price > _creek * 1.002
+                _vol_hawk_now = state.get("vol_hawk", {}) or {}
+                _vol_ratio = float(_vol_hawk_now.get("vol_ratio", 0) or 0)
+                if (_creek > 0 and _prev_close_below_creek and _curr_above_creek and
+                        _vol_ratio >= 1.5):
+                    _nl = "\n"
+                    _send_whatsapp_alert(
+                        f"🚀 TSLA *WYCKOFF SOS — CREEK CLEARED*{_nl}"
+                        f"━━━━━━━━━━━━━━━━━━━━━━{_nl}"
+                        f"Price *${price:.2f}* broke above Creek *${_creek:.0f}*{_nl}"
+                        f"Volume: *{_vol_ratio:.1f}x* average — institutional confirmation{_nl}"
+                        f"📖 Wyckoff Phase D — MARKUP beginning{_nl}"
+                        f"🎯 Next targets: ${_creek*1.02:.0f} → ${_creek*1.05:.0f}{_nl}"
+                        f"GEX: +{mm_data.get('gex_total',0):.0f}M | Score: +{master.get('score',0)}",
+                        alert_key="wyckoff_sos"
+                    )
+                    print(f"  🚀 WYCKOFF SOS ALERT — Creek ${_creek:.0f} cleared at ${price:.2f}", flush=True)
+                state["_prev_wyckoff"] = _wy_now
+            except Exception:
+                pass
+
         except Exception as _vwap_err:
             state["vwap_bands"] = {}
 
@@ -9219,9 +9270,19 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                     signal = "HOLD"
 
             # Bootstrap suppression — no alerts on cycle 1 synthetic conviction
-            if not _bootstrap_ok and signal in ("BUY", "SELL", "STRONG BUY", "STRONG SELL"):
+            # EXCEPT: bypass for STRONG BUY/SELL with score ≥70 and conviction ≥65%
+            _spock_conv_now = master.get("conviction", 0) or 0
+            _spock_score_now = master.get("score", 0) or 0
+            _bypass_bootstrap = (
+                signal in ("STRONG BUY", "STRONG SELL") and
+                _spock_conv_now >= 65 and
+                abs(_spock_score_now) >= 70
+            )
+            if not _bootstrap_ok and not _bypass_bootstrap and signal in ("BUY", "SELL", "STRONG BUY", "STRONG SELL"):
                 print(f"  ⚠️ {signal} suppressed — bootstrap cycle {_cycle_num}/3, need real data first", flush=True)
                 signal = "HOLD"
+            elif not _bootstrap_ok and _bypass_bootstrap:
+                print(f"  ✅ Bootstrap bypassed — {signal} score={_spock_score_now} conv={_spock_conv_now}% qualifies", flush=True)
 
             # Post-earnings suppression — wait 15min after earnings for dust to settle
             _earn_ctx_now = state.get("earnings_context", {})
@@ -9283,8 +9344,30 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                     print(f"  ⚠️ SELL suppressed — BUY fired {_buy_age_min:.0f}min ago, price only moved ${_price_moved:.2f} (need ${_atr:.2f})", flush=True)
                     signal = "HOLD"
 
+            # Hard gate: never send SELL when UOA is STRONGLY BULLISH with $300M+ calls
+            _uoa_flow_now = uoa_data.get("net_flow", "")
+            _uoa_call_prem = float(uoa_data.get("total_call_premium", 0) or 0)
+            _uoa_strongly_bull = "STRONGLY BULLISH" in _uoa_flow_now and _uoa_call_prem > 300_000_000
+            if signal in ("SELL", "STRONG SELL") and _uoa_strongly_bull:
+                print(f"  ⛔ SELL overridden — UOA STRONGLY BULLISH ${_uoa_call_prem/1e6:.0f}M calls", flush=True)
+                signal = "HOLD"
+
         if signal != "HOLD" and signal != last_signal:
-            emoji  = "🟢" if signal == "BUY" else "🔴"
+            # ── Direction lock — same direction needs 2% move to resend ──
+            global _last_alert_direction, _last_alert_price_level
+            _is_buy_dir  = "BUY"  in signal
+            _is_sell_dir = "SELL" in signal
+            _same_dir    = ((_is_buy_dir  and _last_alert_direction == "BUY") or
+                            (_is_sell_dir and _last_alert_direction == "SELL"))
+            _dir_moved   = (_last_alert_price_level <= 0 or
+                abs(price - _last_alert_price_level) / max(_last_alert_price_level, 1) >= 0.02)
+            if _same_dir and not _dir_moved:
+                _moved_pct = abs(price - _last_alert_price_level) / max(_last_alert_price_level,1)*100
+                print(f"  ⏳ {signal} suppressed — same direction, only {_moved_pct:.1f}% move (need 2%)", flush=True)
+                signal = "HOLD"
+
+        if signal != "HOLD" and signal != last_signal:
+            emoji  = "🟢" if "BUY" in signal else "🔴"
             top3   = " | ".join(reasons[:3])
             gex_s  = f"{mm_data.get('gex_total', 0):+.0f}M"
             vix    = spy_data.get("vix", "?")
@@ -9330,6 +9413,10 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 f"📌 *Why:*\n  {top3}"
             )
             log_alert(wa_msg, alert_key=f"signal_{signal}")
+
+            # Update direction lock
+            _last_alert_direction   = "BUY" if "BUY" in signal else "SELL"
+            _last_alert_price_level = price
             state["alerts_log"].insert(0, {
                 "time": state["last_updated"], "signal": signal,
                 "price": price, "strength": strength, "reason": top3,
@@ -10051,7 +10138,24 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 f"📌 *Exit Reasons:*\n" +
                 "\n".join(f"  • {r}" for r in top_exit)
             )
-            log_alert(wa_msg, alert_key="exit_alert")
+            # Master arbiter — suppress exit alert if STRONG BUY active (60%+ conv, <2h ago)
+            # OR if UOA is STRONGLY BULLISH. Only send if price dropped 2%+ from buy signal.
+            _master_sig_e  = state.get("master_signal", {}) or {}
+            _master_conv_e = float(_master_sig_e.get("conviction", 0) or 0)
+            _last_buy_ts_e = _last_wa_send.get("signal_BUY") or _last_wa_send.get("signal_STRONG BUY")
+            _strong_buy_e  = (
+                "BUY" in (_master_sig_e.get("action","")) and
+                _master_conv_e >= 60 and
+                _last_buy_ts_e is not None and
+                (datetime.now() - _last_buy_ts_e).total_seconds() < 7200
+            )
+            _last_buy_px_e   = float(state.get("_last_buy_price", 0) or 0)
+            _dropped_e       = _last_buy_px_e > 0 and (price - _last_buy_px_e) / _last_buy_px_e < -0.02
+            _uoa_bull_exit_e = "STRONGLY BULLISH" in uoa_data.get("net_flow", "")
+            if (_strong_buy_e and not _dropped_e) or _uoa_bull_exit_e:
+                print(f"  ⛔ Exit alert suppressed — {'STRONG BUY active' if _strong_buy_e else 'UOA STRONGLY BULLISH'} (conv={_master_conv_e:.0f}%)", flush=True)
+            else:
+                log_alert(wa_msg, alert_key="exit_alert")
             state["alerts_log"].insert(0, {
                 "time":     state["last_updated"],
                 "signal":   "🚨 EXIT ALERT",
@@ -12219,6 +12323,10 @@ _prev_cycle_price    = None   # price from last completed cycle
 _prev_cycle_gex_flip = None   # GEX flip level from last cycle
 _prev_cycle_above_flip = None # was price above GEX flip last cycle?
 
+# ── Alert direction lock — prevent same-direction alert spam ─────────────────
+_last_alert_direction   = None  # "BUY" or "SELL"
+_last_alert_price_level = 0.0   # price when last directional alert fired
+
 
 def _load_ml_model():
     global _ml_model_cache
@@ -13466,7 +13574,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>SPOCK — TSLA Intelligence v20260428_1300</title>
+<title>SPOCK — TSLA Intelligence v20260428_1600</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
