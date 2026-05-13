@@ -5247,7 +5247,8 @@ def send_whatsapp(message, alert_key="default"):
                   _now.hour < 20)  # include pre/post market
     # Gap/crash alerts use gap data (always fresh) — don't suppress them on stale price
     _gap_alert_keys = {"premarket_crash", "afterhours_crash", "gex_flip_warning",
-                       "gex_flip_reclaim", "wyckoff_sos", "earnings_gap", "gap_down", "gap_up"}
+                       "gex_flip_reclaim", "wyckoff_sos", "alpha_trend_change",
+                       "earnings_gap", "gap_down", "gap_up"}
     _price_stale = (_price_age is None or _price_age > 600) and not _in_market
     if _price_stale and alert_key not in _gap_alert_keys:
         print(f"  ⚠️ Alert price may be stale (age={_price_age}s, outside market) — skipping alert", flush=True)
@@ -6028,7 +6029,163 @@ def calculate_swing_context(closes, highs, lows, price, mm_data):
     return result
 
 
-def calculate_market_breadth(spy_data):
+def calculate_pcr_analysis(mm_data, state_ref=None):
+    """
+    Enhanced Put/Call Ratio Analysis.
+
+    Beyond raw P/C ratio, this computes:
+    1. PCR trend (rising = more puts = bearish sentiment building)
+    2. Extreme readings as contrarian signals (PCR>1.5 = fear peak = contrarian BUY)
+    3. Volume PCR vs OI PCR distinction
+    4. 20-period rolling PCR average for context
+    5. PCR momentum (accelerating or decelerating)
+
+    PCR Interpretation:
+      PCR > 1.5  = extreme bearishness → contrarian STRONG BUY (+15)
+      PCR > 1.2  = elevated put buying → contrarian BUY (+8)
+      PCR 0.8-1.2= neutral zone (normal)
+      PCR < 0.7  = complacency / call heavy → contrarian warning (-8)
+      PCR < 0.5  = extreme complacency → contrarian SELL (-15)
+
+    PCR Trend:
+      Rising PCR (fear building) = bearish sentiment — but contrarian bullish if extreme
+      Falling PCR (fear easing)  = risk-on signal
+
+    Returns:
+      pcr_score: SPOCK contribution ±15 pts
+      signal:    CONTRARIAN_BUY / CAUTION / NEUTRAL / CONTRARIAN_SELL
+    """
+    result = {
+        "pcr_now":       None,
+        "pcr_oi":        None,         # OI-based PCR (slower, shows positioning)
+        "pcr_vol":       None,         # Volume-based PCR (faster, shows today's flow)
+        "pcr_avg_20":    None,         # 20-period rolling average
+        "pcr_trend":     "NEUTRAL",    # RISING / FALLING / FLAT
+        "pcr_momentum":  0,            # rate of change
+        "extreme":       False,        # PCR at extreme reading
+        "signal":        "NEUTRAL",
+        "spock_score":   0,
+        "contrarian":    False,
+        "color":         "var(--dim)",
+        "detail":        "",
+    }
+    try:
+        # Get current P/C ratio from mm_data
+        pc_now   = float(mm_data.get("pc_ratio", 0) or 0)
+        if pc_now <= 0:
+            return result
+
+        result["pcr_now"] = round(pc_now, 3)
+
+        # OI-based PCR (from options chain totals)
+        call_oi  = float(mm_data.get("total_call_oi", 0) or 0)
+        put_oi   = float(mm_data.get("total_put_oi",  0) or 0)
+        if call_oi > 0 and put_oi > 0:
+            result["pcr_oi"] = round(put_oi / call_oi, 3)
+
+        # Volume-based PCR (from UOA premium flow)
+        # Use premium ratio as proxy for volume PCR — call premium flow = directional
+        call_prem = float(mm_data.get("_uoa_call_prem", 0) or 0)
+        put_prem  = float(mm_data.get("_uoa_put_prem",  0) or 0)
+        if call_prem > 0 and put_prem > 0:
+            result["pcr_vol"] = round(put_prem / call_prem, 3)
+
+        # PCR history for trend/average (stored in state across cycles)
+        _pcr_history = []
+        if state_ref is not None:
+            _pcr_history = list(state_ref.get("_pcr_history", []))
+        _pcr_history.append(pc_now)
+        _pcr_history = _pcr_history[-20:]  # keep 20 cycles = ~100 min
+        if state_ref is not None:
+            state_ref["_pcr_history"] = _pcr_history
+
+        if len(_pcr_history) >= 3:
+            result["pcr_avg_20"] = round(sum(_pcr_history) / len(_pcr_history), 3)
+            # Trend: compare recent 3 vs earlier 3
+            recent_avg = sum(_pcr_history[-3:]) / 3
+            prior_avg  = sum(_pcr_history[-6:-3]) / 3 if len(_pcr_history) >= 6 else recent_avg
+            delta = recent_avg - prior_avg
+            result["pcr_momentum"] = round(delta, 3)
+            if delta > 0.05:
+                result["pcr_trend"] = "RISING"   # more puts being bought = fear building
+            elif delta < -0.05:
+                result["pcr_trend"] = "FALLING"  # puts declining = fear easing
+            else:
+                result["pcr_trend"] = "FLAT"
+
+        # ── Signal classification ────────────────────────────────────
+        # Contrarian logic: extreme put buying = max fear = market likely to bottom
+        if pc_now >= 1.5:
+            # Extreme bearishness — contrarian BUY (fear is peaking)
+            result.update({
+                "signal":      "CONTRARIAN_STRONG_BUY",
+                "spock_score": 15,
+                "extreme":     True,
+                "contrarian":  True,
+                "color":       "var(--buy)",
+                "detail":      f"PCR {pc_now:.2f} — extreme fear, smart money BUY (contrarian)",
+            })
+        elif pc_now >= 1.2:
+            result.update({
+                "signal":      "CONTRARIAN_BUY",
+                "spock_score": 8,
+                "contrarian":  True,
+                "color":       "var(--buy)",
+                "detail":      f"PCR {pc_now:.2f} — elevated put buying, contrarian lean bullish",
+            })
+        elif pc_now <= 0.5:
+            # Extreme complacency — contrarian SELL (everyone bullish = top near)
+            result.update({
+                "signal":      "CONTRARIAN_STRONG_SELL",
+                "spock_score": -15,
+                "extreme":     True,
+                "contrarian":  True,
+                "color":       "var(--sell)",
+                "detail":      f"PCR {pc_now:.2f} — extreme complacency, contrarian SELL signal",
+            })
+        elif pc_now <= 0.7:
+            result.update({
+                "signal":      "CONTRARIAN_CAUTION",
+                "spock_score": -8,
+                "contrarian":  True,
+                "color":       "var(--hold)",
+                "detail":      f"PCR {pc_now:.2f} — calls dominating, sentiment too bullish",
+            })
+        else:
+            # 0.7–1.2 = neutral zone, small adjustments from trend
+            if result["pcr_trend"] == "FALLING":
+                result.update({
+                    "signal": "MILDLY_BULLISH", "spock_score": 4,
+                    "detail": f"PCR {pc_now:.2f} — fear easing, risk-on signal",
+                })
+            elif result["pcr_trend"] == "RISING":
+                result.update({
+                    "signal": "MILDLY_BEARISH", "spock_score": -4,
+                    "detail": f"PCR {pc_now:.2f} — put buying increasing, caution",
+                })
+            else:
+                result.update({"signal": "NEUTRAL", "spock_score": 0,
+                               "detail": f"PCR {pc_now:.2f} — neutral zone"})
+
+        # OI vs Volume divergence — smart signal
+        if result["pcr_oi"] and result["pcr_vol"]:
+            oi_v_div = result["pcr_vol"] - result["pcr_oi"]
+            if oi_v_div > 0.3:
+                # Volume PCR >> OI PCR = fresh put buying today vs existing positioning
+                result["detail"] += f" | Vol PCR({result['pcr_vol']:.2f}) > OI PCR({result['pcr_oi']:.2f}) — fresh fear"
+                result["spock_score"] -= 3  # slight extra bearish lean
+            elif oi_v_div < -0.3:
+                # Volume PCR << OI PCR = puts being closed, call buying today
+                result["detail"] += f" | Vol PCR({result['pcr_vol']:.2f}) < OI PCR({result['pcr_oi']:.2f}) — puts unwinding"
+                result["spock_score"] += 3
+
+        result["spock_score"] = max(-15, min(15, result["spock_score"]))
+        print(f"  📊 PCR: {pc_now:.3f} | {result['signal']} | trend={result['pcr_trend']} | "
+              f"score={result['spock_score']:+d}", flush=True)
+
+    except Exception as _pcr_err:
+        print(f"  ⚠️ PCR analysis error: {_pcr_err}", flush=True)
+    return result
     """
     Fetch VIX term structure (VIX vs VIX3M) and market breadth.
     VIX backwardation = panic, weight mean-reversion signals higher.
@@ -6183,6 +6340,135 @@ def calculate_donchian(highs, lows, closes, period=20):
         }
     except Exception:
         return {}
+
+
+def calculate_alpha_trend(closes, highs, lows, period=14, coefficient=3):
+    """
+    Alpha Trend — ATR-based dynamic trend detection.
+    Created by Kıvanç Özbilgiç. Superior to moving averages because the
+    band width adapts to volatility, eliminating whipsaws in choppy markets.
+
+    Logic:
+    - Calculate ATR(period)
+    - UpBand  = Low  - coefficient × ATR  (support in uptrend)
+    - DownBand= High + coefficient × ATR  (resistance in downtrend)
+    - Trend flips when price crosses the active band
+    - Once in BULLISH: trail UpBand upward (never lower it)
+    - Once in BEARISH: trail DownBand downward (never raise it)
+
+    SPOCK score contribution (Tier 3.5, ±12 pts):
+      +12  BULLISH trend change  (just crossed above — high conviction)
+      +6   BULLISH continuation
+      -12  BEARISH trend change  (just crossed below)
+      -6   BEARISH continuation
+      0    NEUTRAL / insufficient data
+    """
+    import numpy as np
+    result = {
+        "trend":         "NEUTRAL",
+        "trend_changed": False,
+        "up_band":       None,
+        "down_band":     None,
+        "active_band":   None,
+        "signal":        "NEUTRAL",
+        "spock_score":   0,
+        "price":         None,
+        "atr":           None,
+        "color":         "var(--dim)",
+    }
+    try:
+        n = len(closes)
+        if n < period + 5:
+            return result
+
+        c = closes.values.astype(float)
+        h = highs.values.astype(float)
+        l = lows.values.astype(float)
+
+        # ── ATR calculation ─────────────────────────────────────────────
+        tr = np.maximum(h[1:] - l[1:],
+             np.maximum(np.abs(h[1:] - c[:-1]),
+                        np.abs(l[1:] - c[:-1])))
+        # Wilder's smoothed ATR (same as TradingView default)
+        atr = np.zeros(len(tr))
+        atr[period-1] = tr[:period].mean()
+        alpha = 1.0 / period
+        for i in range(period, len(tr)):
+            atr[i] = atr[i-1] * (1 - alpha) + tr[i] * alpha
+
+        # ── Band calculation ─────────────────────────────────────────────
+        # Align with closes (tr has n-1 elements)
+        ub_raw = l[1:] - coefficient * atr   # support band (uptrend)
+        db_raw = h[1:] + coefficient * atr   # resistance band (downtrend)
+
+        # Trailing: UpBand only moves up, DownBand only moves down
+        up_band  = ub_raw.copy()
+        dn_band  = db_raw.copy()
+        for i in range(1, len(up_band)):
+            if c[i] > up_band[i-1]:
+                up_band[i] = max(up_band[i], up_band[i-1])
+            if c[i] < dn_band[i-1]:
+                dn_band[i] = min(dn_band[i], dn_band[i-1])
+
+        # ── Trend state machine ─────────────────────────────────────────
+        trend = np.zeros(len(up_band), dtype=int)  # 1=BULL, -1=BEAR
+        # Initial trend from first bar
+        trend[0] = 1 if c[1] > dn_band[0] else -1
+        for i in range(1, len(trend)):
+            if trend[i-1] == -1 and c[i+1] > dn_band[i]:
+                trend[i] = 1   # flip to BULLISH
+            elif trend[i-1] == 1 and c[i+1] < up_band[i]:
+                trend[i] = -1  # flip to BEARISH
+            else:
+                trend[i] = trend[i-1]  # continuation
+
+        # ── Current state ───────────────────────────────────────────────
+        cur_trend  = trend[-1]
+        prev_trend = trend[-2]
+        trend_changed = (cur_trend != prev_trend)
+        price = float(c[-1])
+        atr_now = float(atr[-1]) if atr[-1] > 0 else 0
+
+        active_band = float(up_band[-1]) if cur_trend == 1 else float(dn_band[-1])
+
+        # ── Signal ──────────────────────────────────────────────────────
+        if cur_trend == 1:
+            signal = "BULLISH"
+            color  = "var(--buy)"
+            if trend_changed:
+                spock_score = 12   # fresh crossover — strongest signal
+            else:
+                spock_score = 6    # continuation
+        elif cur_trend == -1:
+            signal = "BEARISH"
+            color  = "var(--sell)"
+            if trend_changed:
+                spock_score = -12
+            else:
+                spock_score = -6
+        else:
+            signal = "NEUTRAL"; color = "var(--dim)"; spock_score = 0
+
+        result.update({
+            "trend":         signal,
+            "trend_changed": bool(trend_changed),
+            "up_band":       round(float(up_band[-1]), 2),
+            "down_band":     round(float(dn_band[-1]), 2),
+            "active_band":   round(active_band, 2),
+            "signal":        signal,
+            "spock_score":   spock_score,
+            "price":         round(price, 2),
+            "atr":           round(atr_now, 3),
+            "color":         color,
+            "coefficient":   coefficient,
+            "period":        period,
+        })
+        print(f"  📈 AlphaTrend: {signal}{'🔄' if trend_changed else ''} | "
+              f"Band=${active_band:.2f} | ATR={atr_now:.2f} | Score={spock_score:+d}", flush=True)
+
+    except Exception as _at_err:
+        print(f"  ⚠️ AlphaTrend error: {_at_err}", flush=True)
+    return result
 
 
 def calculate_vwap_bands_daily(closes, highs, lows, volumes):
@@ -7845,8 +8131,46 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
     else:
         votes["neutral"] += 1
 
+    # 10d. Alpha Trend — ATR-based dynamic trend signal (±12 pts, Tier 3.5)
+    # Eliminates whipsaws via volatility-adaptive bands. Trend change = strong signal.
+    _at = state.get("alpha_trend", {}) if isinstance(state, dict) else {}
+    _at_score   = int(_at.get("spock_score", 0) or 0)
+    _at_signal  = _at.get("signal", "NEUTRAL")
+    _at_changed = _at.get("trend_changed", False)
+    if _at_score != 0:
+        score += _at_score
+        if _at_signal == "BULLISH":
+            _at_label = f"🟢 AlphaTrend BULLISH{'🔄 NEW' if _at_changed else ''} — trend confirmed, band at ${_at.get('active_band','?')}"
+            reasons.append(_at_label)
+            votes["bull"] += (2 if _at_changed else 1)
+        elif _at_signal == "BEARISH":
+            _at_label = f"🔴 AlphaTrend BEARISH{'🔄 NEW' if _at_changed else ''} — trend flipped, band at ${_at.get('active_band','?')}"
+            reasons.append(_at_label)
+            votes["bear"] += (2 if _at_changed else 1)
+    else:
+        votes["neutral"] += 1
 
-    news_score = float(news_data.get("score", 0) or 0) if news_data else 0
+    # 10e. PCR Enhanced Analysis — contrarian signals from put/call extremes (±15 pts)
+    # PCR > 1.5 = extreme fear = contrarian BUY. PCR < 0.5 = complacency = contrarian SELL.
+    _pcr = state.get("pcr_analysis", {}) if isinstance(state, dict) else {}
+    _pcr_score  = int(_pcr.get("spock_score", 0) or 0)
+    _pcr_signal = _pcr.get("signal", "NEUTRAL")
+    _pcr_now    = _pcr.get("pcr_now")
+    _pcr_trend  = _pcr.get("pcr_trend", "FLAT")
+    if _pcr_score != 0 and _pcr_now:
+        score += _pcr_score
+        if _pcr_signal.startswith("CONTRARIAN_BUY"):
+            reasons.append(f"PCR {_pcr_now:.2f} 🐻→🐂 — extreme put buying = contrarian BUY (fear peak) ▲")
+            votes["bull"] += 1
+        elif _pcr_signal.startswith("CONTRARIAN_SELL"):
+            reasons.append(f"PCR {_pcr_now:.2f} — extreme complacency = contrarian SELL ▼")
+            votes["bear"] += 1
+        elif _pcr_signal == "MILDLY_BULLISH":
+            votes["bull"] += 1
+        elif _pcr_signal == "MILDLY_BEARISH":
+            votes["bear"] += 1
+    elif _pcr_now:
+        votes["neutral"] += 1
     if news_score >= 20:
         score += 5; votes["bull"] += 1
     elif news_score <= -20:
@@ -8876,6 +9200,43 @@ def run_analysis(refresh_4h=True, refresh_news=True):
             except Exception as _dc_err:
                 state["donchian"] = {}
 
+            # ── Alpha Trend ──────────────────────────────────────────────
+            try:
+                alpha_trend = calculate_alpha_trend(closes, highs, lows, period=14, coefficient=3)
+                state["alpha_trend"] = alpha_trend
+                if alpha_trend.get("trend") != "NEUTRAL":
+                    _at_changed = alpha_trend.get("trend_changed", False)
+                    _at_band    = alpha_trend.get("active_band", "?")
+                    # Fire WhatsApp on trend change (high conviction signal)
+                    if _at_changed:
+                        _at_dir = alpha_trend.get("trend", "")
+                        _nl = "\n"
+                        log_alert(
+                            f"{'📈' if _at_dir == 'BULLISH' else '📉'} TSLA *ALPHA TREND {_at_dir}*{_nl}"
+                            f"━━━━━━━━━━━━━━━━━━━━━━{_nl}"
+                            f"Price *${price:.2f}* crossed the Alpha Trend band{_nl}"
+                            f"Active band: *${_at_band:.2f}* | ATR: {alpha_trend.get('atr',0):.2f}{_nl}"
+                            f"{'🟢 Trend flipped BULLISH — momentum buy signal' if _at_dir == 'BULLISH' else '🔴 Trend flipped BEARISH — protect positions'}{_nl}"
+                            f"GEX: {mm_data.get('gex_total',0):+.0f}M | Score: {state.get('master_signal',{}).get('score',0):+d}",
+                            alert_key="alpha_trend_change"
+                        )
+            except Exception as _at_err:
+                state["alpha_trend"] = {}
+                print(f"  ⚠️ Alpha Trend error: {_at_err}", flush=True)
+
+            # ── PCR Enhanced Analysis ────────────────────────────────────
+            try:
+                # Pass call/put premium into mm_data for PCR vol computation
+                _uoa_cp = uoa_data.get("total_call_premium", 0) or 0
+                _uoa_pp = uoa_data.get("total_put_premium",  0) or 0
+                mm_data["_uoa_call_prem"] = _uoa_cp
+                mm_data["_uoa_put_prem"]  = _uoa_pp
+                pcr_analysis = calculate_pcr_analysis(mm_data, state_ref=state)
+                state["pcr_analysis"] = pcr_analysis
+            except Exception as _pcr_e:
+                state["pcr_analysis"] = {}
+                print(f"  ⚠️ PCR analysis error: {_pcr_e}", flush=True)
+
             # ── Volume Hawk — multi-tier spike detection ──
             try:
                 _vol_now   = float(volumes.iloc[-1])
@@ -9765,6 +10126,17 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 "theta_decay":     _theta_atm,
                 "vega_exposure":   _vega_atm,
                 "iv_skew":         _iv_skew,
+                # ── Alpha Trend features ──────────────────────────────────
+                "at_bullish":      1 if state.get("alpha_trend", {}).get("signal") == "BULLISH" else 0,
+                "at_bearish":      1 if state.get("alpha_trend", {}).get("signal") == "BEARISH" else 0,
+                "at_changed":      1 if state.get("alpha_trend", {}).get("trend_changed") else 0,
+                "at_score":        float(state.get("alpha_trend", {}).get("spock_score", 0) or 0) / 12,
+                # ── PCR Enhanced features ─────────────────────────────────
+                "pcr_extreme":     1 if state.get("pcr_analysis", {}).get("extreme") else 0,
+                "pcr_contrarian":  1 if state.get("pcr_analysis", {}).get("contrarian") else 0,
+                "pcr_rising":      1 if state.get("pcr_analysis", {}).get("pcr_trend") == "RISING" else 0,
+                "pcr_falling":     1 if state.get("pcr_analysis", {}).get("pcr_trend") == "FALLING" else 0,
+                "pcr_score_norm":  float(state.get("pcr_analysis", {}).get("spock_score", 0) or 0) / 15,
             }
             ml_signal = _get_ml_signal(_ml_features) or {"signal":"HOLD","confidence":0,"probability":0.5,"available":False,"error":""}
             state["ml_signal"]         = ml_signal
@@ -10463,6 +10835,8 @@ def api_state():
                 "wyckoff":       state.get("wyckoff", {}),
                 "wyckoff_local": state.get("wyckoff_local", {}),
                 "daily_sr":      state.get("daily_sr", {}),
+                "alpha_trend":   state.get("alpha_trend", {}),
+                "pcr_analysis":  state.get("pcr_analysis", {}),
                 "alerts_log":    state.get("alerts_log", [])[:20],
                 "spock_accuracy":state.get("spock_accuracy", {}),
                 "ml_ready":      _ml_ready,
@@ -11339,6 +11713,10 @@ def _run_ml_retrain():
             "spy_mtf_ob","spy_mtf_os",
             "qqq_rsi_4h","qqq_ob_4h",
             "mtf_both_ob","mtf_both_os",
+            # Alpha Trend
+            "at_bullish","at_bearish","at_changed","at_score",
+            # PCR Enhanced
+            "pcr_extreme","pcr_contrarian","pcr_rising","pcr_falling","pcr_score_norm",
         ]
 
         assert len(feat_cols)==X.shape[1], f"Mismatch {len(feat_cols)} vs {X.shape[1]}"
@@ -13579,7 +13957,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>SPOCK — TSLA Intelligence v20260428_1600</title>
+<title>SPOCK — TSLA Intelligence v20260513_1200</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -14258,6 +14636,27 @@ body {
         <div class="data-row"><span class="data-row-label">Breakout</span><span class="data-row-val" id="dc-breakout">—</span></div>
       </div>
       <div class="data-card">
+        <h3>📈 Alpha Trend (ATR-14)</h3>
+        <div style="padding:10px 14px;border-radius:6px;margin-bottom:12px;text-align:center;" id="at-banner" style="background:var(--bg3);">
+          <div style="font-size:1.5rem;font-weight:700;" id="at-trend">—</div>
+          <div style="font-size:10px;color:var(--dim);margin-top:2px;" id="at-changed-label">—</div>
+        </div>
+        <div class="data-row"><span class="data-row-label">Active Band</span><span class="data-row-val" id="at-band">—</span></div>
+        <div class="data-row"><span class="data-row-label">ATR</span><span class="data-row-val" id="at-atr">—</span></div>
+        <div class="data-row"><span class="data-row-label">SPOCK Score</span><span class="data-row-val" id="at-score">—</span></div>
+        <div class="data-row"><span class="data-row-label">Trend Changed</span><span class="data-row-val" id="at-changed">—</span></div>
+      </div>
+      <div class="data-card">
+        <h3>📊 PCR Analysis (Put/Call)</h3>
+        <div class="data-row"><span class="data-row-label">PCR (OI-based)</span><span class="data-row-val" id="pcr-oi">—</span></div>
+        <div class="data-row"><span class="data-row-label">PCR (Volume)</span><span class="data-row-val" id="pcr-vol">—</span></div>
+        <div class="data-row"><span class="data-row-label">20-Cycle Avg</span><span class="data-row-val" id="pcr-avg">—</span></div>
+        <div class="data-row"><span class="data-row-label">PCR Trend</span><span class="data-row-val" id="pcr-trend">—</span></div>
+        <div class="data-row"><span class="data-row-label">Signal</span><span class="data-row-val" id="pcr-signal">—</span></div>
+        <div class="data-row"><span class="data-row-label">SPOCK Score</span><span class="data-row-val" id="pcr-score">—</span></div>
+        <div style="margin-top:10px;padding:8px 12px;background:var(--bg3);border-radius:4px;font-size:11px;color:var(--dim);" id="pcr-detail">—</div>
+      </div>
+      <div class="data-card">
         <h3>🦅 Volume Hawk</h3>
         <div class="data-row"><span class="data-row-label">Current Vol</span><span class="data-row-val" id="vh-current">—</span></div>
         <div class="data-row"><span class="data-row-label">vs 20-bar Avg</span><span class="data-row-val" id="vh-ratio">—</span></div>
@@ -14800,6 +15199,44 @@ function _updateUI_inner(s) {
   setText('dc-width',  dc.width_pct != null ? dc.width_pct + '% range' : '—');
   var dcBk = dc.breakout_up ? '🚀 BREAKOUT UP' : dc.breakout_down ? '💥 BREAK DOWN' : 'None';
   setText('dc-breakout', dcBk, dc.breakout_up ? 'bull' : dc.breakout_down ? 'bear' : '');
+
+  // Alpha Trend
+  var at = s.alpha_trend || {};
+  var atTrend   = at.signal || '—';
+  var atChanged = at.trend_changed;
+  var atBanner  = document.getElementById('at-banner');
+  var atTrendEl = document.getElementById('at-trend');
+  var atChgLbl  = document.getElementById('at-changed-label');
+  if (atTrendEl) {
+    atTrendEl.textContent = atTrend;
+    atTrendEl.style.color = atTrend === 'BULLISH' ? 'var(--buy)' : atTrend === 'BEARISH' ? 'var(--sell)' : 'var(--dim)';
+  }
+  if (atBanner) {
+    atBanner.style.background = atTrend === 'BULLISH' ? 'rgba(0,255,136,0.08)' : atTrend === 'BEARISH' ? 'rgba(255,51,85,0.08)' : 'var(--bg3)';
+    atBanner.style.border     = '1px solid ' + (atTrend === 'BULLISH' ? 'rgba(0,255,136,0.3)' : atTrend === 'BEARISH' ? 'rgba(255,51,85,0.3)' : 'var(--border)');
+  }
+  if (atChgLbl) atChgLbl.textContent = atChanged ? '🔄 TREND JUST CHANGED — HIGH CONVICTION' : 'Continuing trend';
+  setText('at-band', at.active_band ? '$' + at.active_band : '—', atTrend === 'BULLISH' ? 'bull' : atTrend === 'BEARISH' ? 'bear' : '');
+  setText('at-atr',  at.atr ? at.atr.toFixed(3) : '—');
+  var atScore = at.spock_score || 0;
+  setText('at-score', atScore ? (atScore >= 0 ? '+' : '') + atScore + ' pts' : '—', atScore > 0 ? 'bull' : atScore < 0 ? 'bear' : '');
+  setText('at-changed', atChanged ? '✅ YES — alert fired' : 'No', atChanged ? (atTrend === 'BULLISH' ? 'bull' : 'bear') : '');
+
+  // PCR Analysis
+  var pcr = s.pcr_analysis || {};
+  var pcrSig = pcr.signal || '—';
+  setText('pcr-oi',     pcr.pcr_oi  ? pcr.pcr_oi.toFixed(3)  : (pcr.pcr_now ? pcr.pcr_now.toFixed(3) : '—'));
+  setText('pcr-vol',    pcr.pcr_vol ? pcr.pcr_vol.toFixed(3) : '—');
+  setText('pcr-avg',    pcr.pcr_avg_20 ? pcr.pcr_avg_20.toFixed(3) : '—');
+  setText('pcr-trend',  pcr.pcr_trend || '—',
+    pcr.pcr_trend === 'RISING' ? 'bear' : pcr.pcr_trend === 'FALLING' ? 'bull' : '');
+  setText('pcr-signal', pcrSig,
+    pcrSig.startsWith('CONTRARIAN_BUY') ? 'bull' : pcrSig.startsWith('CONTRARIAN_SELL') ? 'bear' : pcrSig === 'MILDLY_BULLISH' ? 'bull' : pcrSig === 'MILDLY_BEARISH' ? 'warn' : '');
+  var pcrScore = pcr.spock_score || 0;
+  setText('pcr-score',  pcrScore ? (pcrScore >= 0 ? '+' : '') + pcrScore + ' pts' : '—',
+    pcrScore > 0 ? 'bull' : pcrScore < 0 ? 'bear' : '');
+  var pcrDetailEl = document.getElementById('pcr-detail');
+  if (pcrDetailEl) pcrDetailEl.textContent = pcr.detail || '—';
 
   // Volume Hawk
   var vh = s.vol_hawk || {};
@@ -15480,7 +15917,11 @@ def start_background_threads():
             "qqq_rsi_4h","qqq_ob_4h",
             "mtf_both_ob","mtf_both_os",
             # POC / Volume Profile
-            "poc_dist","above_poc","in_value_area","above_vah","below_val"
+            "poc_dist","above_poc","in_value_area","above_vah","below_val",
+            # Alpha Trend
+            "at_bullish","at_bearish","at_changed","at_score",
+            # PCR Enhanced
+            "pcr_extreme","pcr_contrarian","pcr_rising","pcr_falling","pcr_score_norm",
         ]
     try:
         pkg = _load_ml_model()
