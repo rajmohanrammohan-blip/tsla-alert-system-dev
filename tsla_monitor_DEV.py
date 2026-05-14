@@ -661,7 +661,7 @@ def generate_signal(indicators, price):
     factor_map = {"STRONG_BUY": 20, "BUY": 12, "NEUTRAL": 0, "SELL": -12, "STRONG_SELL": -20}
     fscore = factor_map.get(factor_sig, 0)
     _ret_48b = abs(float(indicators.get("ret_48b", 0) or 0))
-    _macro_sc = float(spy_data.get("macro_score", 0) or 0)
+    _macro_sc = float(indicators.get("macro_score", 0) or indicators.get("spy_macro_score", 0) or 0)
     _strong_momentum = _ret_48b > 0.05 and _macro_sc >= 15
     if fscore < 0 and _strong_momentum:
         fscore = fscore // 2  # halve bearish weight during momentum regime
@@ -13957,7 +13957,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>SPOCK — TSLA Intelligence v20260513_1200</title>
+<title>SPOCK — TSLA Intelligence v20260513_1300</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
