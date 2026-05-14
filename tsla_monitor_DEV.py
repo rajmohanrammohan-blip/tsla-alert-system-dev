@@ -8171,6 +8171,8 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
             votes["bear"] += 1
     elif _pcr_now:
         votes["neutral"] += 1
+
+    news_score = float(news_data.get("score", 0) or 0) if news_data else 0
     if news_score >= 20:
         score += 5; votes["bull"] += 1
     elif news_score <= -20:
@@ -10402,7 +10404,10 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 if master.get('reasons'):
                     print(f"  🖖 Top reasons: {' | '.join(master['reasons'][:2])}", flush=True)
             except Exception as _me:
+                import traceback as _tb_ms
                 print(f"  ⚠️ Master signal error: {_me}", flush=True)
+                for _ml in _tb_ms.format_exc().split("\n")[-8:-1]:
+                    if _ml.strip(): print(f"     {_ml.strip()}", flush=True)
                 state["master_signal"] = {"action":"HOLD","score":0,"conviction":0,
                                           "risk":"MEDIUM","color":"#00e5ff","reasons":[]}
             _regime_str = ml_signal.get('regime', '')
@@ -13957,7 +13962,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>SPOCK — TSLA Intelligence v20260513_1300</title>
+<title>SPOCK — TSLA Intelligence v20260514_0930</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
