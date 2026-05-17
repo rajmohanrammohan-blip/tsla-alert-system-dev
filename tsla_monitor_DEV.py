@@ -6088,34 +6088,37 @@ def calculate_delta_skew_bias(schwab_opts, current_price):
             result["error"] = "Empty calls/puts"
             return result
 
-        # ── Step 1: Find ATM call (strike nearest to current price, Δ 0.35–0.65) ─
-        # Use same front-month expiry for both sides
+        # ── Step 1: Find ATM call (Δ closest to 0.50) ─────────────────
+        # Use front-month expiry for both sides
         front_expiry = schwab_opts.get("expiries", [None])[0] if schwab_opts.get("expiries") else None
         if front_expiry:
             calls = [c for c in calls if c.get("expiry") == front_expiry or not c.get("expiry")]
             puts  = [p for p in puts  if p.get("expiry") == front_expiry or not p.get("expiry")]
 
-        # ATM call: MUST be within 3% of current price — strike proximity is primary
-        # delta is secondary (may be missing from Schwab response)
+        # ATM call: when Schwab returns delta, use delta as PRIMARY selector.
+        # Delta closest to 0.50 = true ATM, regardless of moneyness.
+        # Strike sanity gate: within 10% of spot (prevent extreme misses).
         atm_call = None
         best_atm_dist = float("inf")
-        for c in calls:
-            strike    = float(c.get("strike", 0) or 0)
-            price_opt = float(c.get("mid", 0) or c.get("last", 0) or 0)
-            if price_opt <= 0 or strike <= 0:
-                continue
-            # Hard gate: strike within 3% of spot price
-            if abs(strike - current_price) > current_price * 0.03:
-                continue
-            delta      = abs(float(c.get("delta", 0) or 0))
-            strike_dist = abs(strike - current_price)
-            delta_dist  = abs(delta - 0.50) if delta > 0 else 0.15
-            dist = strike_dist + delta_dist * 3
-            if dist < best_atm_dist:
-                best_atm_dist = dist
-                atm_call = c
-        # Fallback: widen to 5% if nothing found (e.g. thin market, wide strikes)
+
+        # Pass A: delta available → delta proximity to 0.50 is primary
+        _calls_with_delta = [
+            c for c in calls
+            if abs(float(c.get("delta", 0) or 0)) >= 0.05
+            and float(c.get("mid", 0) or c.get("last", 0) or 0) > 0
+            and current_price * 0.90 <= float(c.get("strike", 0) or 0) <= current_price * 1.10
+        ]
+        if _calls_with_delta:
+            for c in _calls_with_delta:
+                delta = abs(float(c.get("delta", 0) or 0))
+                dist  = abs(delta - 0.50)
+                if dist < best_atm_dist:
+                    best_atm_dist = dist
+                    atm_call = c
+
+        # Pass B: no delta returned → nearest strike within 5% of spot
         if not atm_call:
+            best_atm_dist = float("inf")
             for c in calls:
                 strike    = float(c.get("strike", 0) or 0)
                 price_opt = float(c.get("mid", 0) or c.get("last", 0) or 0)
@@ -14566,7 +14569,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>SPOCK — TSLA Intelligence v20260517_1400</title>
+<title>SPOCK — TSLA Intelligence v20260517_1500</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
