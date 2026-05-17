@@ -6088,78 +6088,121 @@ def calculate_delta_skew_bias(schwab_opts, current_price):
             result["error"] = "Empty calls/puts"
             return result
 
-        # ── Step 1: Find ATM call (Δ closest to 0.50) ─────────────────────
+        # ── Step 1: Find ATM call (strike nearest to current price, Δ 0.35–0.65) ─
         # Use same front-month expiry for both sides
         front_expiry = schwab_opts.get("expiries", [None])[0] if schwab_opts.get("expiries") else None
         if front_expiry:
             calls = [c for c in calls if c.get("expiry") == front_expiry or not c.get("expiry")]
             puts  = [p for p in puts  if p.get("expiry") == front_expiry or not p.get("expiry")]
 
-        # ATM call: strike nearest to current price with delta 0.40–0.60
+        # ATM call: MUST be within 3% of current price — strike proximity is primary
+        # delta is secondary (may be missing from Schwab response)
         atm_call = None
         best_atm_dist = float("inf")
         for c in calls:
-            strike = float(c.get("strike", 0) or 0)
-            delta  = abs(float(c.get("delta", 0) or 0))
+            strike    = float(c.get("strike", 0) or 0)
             price_opt = float(c.get("mid", 0) or c.get("last", 0) or 0)
-            if delta <= 0 or price_opt <= 0:
+            if price_opt <= 0 or strike <= 0:
                 continue
-            # Want delta ~0.50, strike near current price
-            dist = abs(strike - current_price) + abs(delta - 0.50) * current_price * 2
+            # Hard gate: strike within 3% of spot price
+            if abs(strike - current_price) > current_price * 0.03:
+                continue
+            delta      = abs(float(c.get("delta", 0) or 0))
+            strike_dist = abs(strike - current_price)
+            delta_dist  = abs(delta - 0.50) if delta > 0 else 0.15
+            dist = strike_dist + delta_dist * 3
             if dist < best_atm_dist:
                 best_atm_dist = dist
                 atm_call = c
+        # Fallback: widen to 5% if nothing found (e.g. thin market, wide strikes)
+        if not atm_call:
+            for c in calls:
+                strike    = float(c.get("strike", 0) or 0)
+                price_opt = float(c.get("mid", 0) or c.get("last", 0) or 0)
+                if price_opt <= 0 or strike <= 0:
+                    continue
+                if abs(strike - current_price) > current_price * 0.05:
+                    continue
+                dist = abs(strike - current_price)
+                if dist < best_atm_dist:
+                    best_atm_dist = dist
+                    atm_call = c
 
         if not atm_call:
             result["error"] = "No ATM call found"
             return result
 
-        atm_strike    = float(atm_call.get("strike", 0))
+        atm_strike     = float(atm_call.get("strike", 0))
         atm_call_price = float(atm_call.get("mid", 0) or atm_call.get("last", 0) or 0)
-        atm_call_delta = abs(float(atm_call.get("delta", 0.50) or 0.50))
-        if atm_call_delta < 0.01 or atm_call_price <= 0:
-            result["error"] = "ATM call delta/price invalid"
+        _raw_delta     = abs(float(atm_call.get("delta", 0) or 0))
+        if _raw_delta < 0.01:
+            # Schwab didn't return delta — approximate from moneyness
+            # For calls: delta ≈ 0.5 + (price - strike) / (price * 0.10)
+            # Clamp to [0.30, 0.70] for ATM region
+            _moneyness = (current_price - atm_strike) / (current_price * 0.10)
+            _raw_delta = max(0.30, min(0.70, 0.50 + _moneyness * 0.15))
+        atm_call_delta = _raw_delta
+        if atm_call_price <= 0:
+            result["error"] = "ATM call price invalid"
             return result
 
-        # ── Step 2: Find ITM put (Δ 0.75–0.98, same expiry) ─────────────
-        # ITM put delta should be meaningfully higher than ATM — typically 0.80–0.95
-        # This is the "fear side" — if market expected to fall, puts get expensive
+        # ── Step 2: Find ITM put ─────────────────────────────────────────
+        # ITM put = strike ABOVE current price.  Target Δ ~0.95 (deep ITM).
+        # Schwab often omits delta for puts → use strike-based fallback.
         itm_put = None
         best_itm_score = float("inf")
+
+        # Pass 1: Schwab returned delta, find closest to Δ0.95 with strike > price
         for p in puts:
-            strike = float(p.get("strike", 0) or 0)
-            delta  = abs(float(p.get("delta", 0) or 0))
+            strike    = float(p.get("strike", 0) or 0)
+            delta     = abs(float(p.get("delta", 0) or 0))
             price_opt = float(p.get("mid", 0) or p.get("last", 0) or 0)
             if delta <= 0 or price_opt <= 0:
                 continue
-            # Want delta 0.75–0.98, strike above current price (ITM put = strike > price)
-            if delta < 0.70 or delta > 0.99:
+            if delta < 0.80 or delta > 0.99:     # must be deep ITM range
                 continue
-            if strike <= current_price * 0.98:  # must be ITM (strike > price for put)
+            if strike <= current_price:           # put must be ITM → strike > spot
                 continue
-            dist = abs(delta - 0.85)  # target ~0.85 delta for comparison
+            dist = abs(delta - 0.95)              # target Δ0.95
             if dist < best_itm_score:
                 best_itm_score = dist
                 itm_put = p
 
-        # Fallback: if Schwab doesn't return delta for puts, use deep ITM strike proxy
+        # Pass 2: No delta available — use strike ~5-8% above current price
+        # At Δ0.95, the put is deeply ITM — typically 4–8% above spot
         if not itm_put:
-            # Use put with strike ~3-5% above current price as ITM proxy
-            target_strike = current_price * 1.03
-            itm_put_candidates = sorted(
-                [p for p in puts if float(p.get("strike",0) or 0) >= current_price * 1.01
-                 and float(p.get("mid",0) or p.get("last",0) or 0) > 0],
-                key=lambda p: abs(float(p.get("strike",0)) - target_strike)
+            target_strike = current_price * 1.06   # ~6% above = deep ITM proxy
+            _itm_candidates = sorted(
+                [p for p in puts
+                 if float(p.get("strike", 0) or 0) > current_price
+                 and float(p.get("mid", 0) or p.get("last", 0) or 0) > 0],
+                key=lambda p: abs(float(p.get("strike", 0)) - target_strike)
             )
-            if itm_put_candidates:
-                itm_put = itm_put_candidates[0]
-                # Approximate delta using Black-Scholes proxy
+            if _itm_candidates:
+                itm_put = dict(_itm_candidates[0])
                 _s = float(itm_put.get("strike", current_price))
+                # Approximate delta at this depth
                 _pct_itm = (_s - current_price) / current_price
-                # ITM put delta ≈ 0.5 + 0.5*pct_itm*10 (rough linear approx)
-                _approx_delta = min(0.97, max(0.60, 0.5 + _pct_itm * 8))
-                itm_put = dict(itm_put)
-                itm_put["delta"] = -_approx_delta  # puts have negative delta
+                _approx_delta = min(0.98, max(0.80, 0.50 + _pct_itm * 7.5))
+                itm_put["delta"] = -_approx_delta
+                itm_put["_delta_approx"] = True
+
+        # Pass 3: No ITM strikes exist → deepest available put as proxy
+        if not itm_put:
+            _otm_candidates = sorted(
+                [p for p in puts
+                 if float(p.get("mid", 0) or p.get("last", 0) or 0) > 0],
+                key=lambda p: float(p.get("strike", 0)),
+                reverse=True
+            )
+            if _otm_candidates:
+                itm_put = dict(_otm_candidates[0])
+                _s = float(itm_put.get("strike", current_price))
+                _pct = (_s - current_price) / current_price
+                _approx_delta = min(0.97, max(0.35, 0.50 + _pct * 7.5))
+                itm_put["delta"] = -_approx_delta
+                itm_put["_delta_approx"] = True
+                itm_put["_proxy"] = True
 
         if not itm_put:
             result["error"] = "No ITM put found"
@@ -6167,7 +6210,7 @@ def calculate_delta_skew_bias(schwab_opts, current_price):
 
         itm_put_strike = float(itm_put.get("strike", 0))
         itm_put_price  = float(itm_put.get("mid", 0) or itm_put.get("last", 0) or 0)
-        itm_put_delta  = abs(float(itm_put.get("delta", 0.85) or 0.85))
+        itm_put_delta  = abs(float(itm_put.get("delta", 0.95) or 0.95))
         if itm_put_delta < 0.01 or itm_put_price <= 0:
             result["error"] = "ITM put delta/price invalid"
             return result
@@ -6230,12 +6273,15 @@ def calculate_delta_skew_bias(schwab_opts, current_price):
             "color":           color,
             "detail":          detail,
             "expiry":          front_expiry,
+            "delta_approx":    bool(itm_put.get("_delta_approx") if itm_put else False),
+            "put_proxy":       bool(itm_put.get("_proxy") if itm_put else False),
         })
 
         direction = "↓ PUT HEAVY" if skew_ratio > 1.15 else ("↑ CALL HEAVY" if skew_ratio < 0.85 else "⟷ BALANCED")
-        print(f"  📐 Delta Skew: ratio={skew_ratio:.3f} {direction} | "
-              f"ATM call Δ{atm_call_delta:.2f}=${atm_call_price:.2f}→${normalized_call:.2f} | "
-              f"ITM put Δ{itm_put_delta:.2f}=${itm_put_price:.2f}→${normalized_put:.2f} | "
+        _approx_note = " [Δ approx]" if result.get("delta_approx") else ""
+        print(f"  📐 Delta Skew [{front_expiry or 'unknown'}]: ratio={skew_ratio:.3f} {direction} | "
+              f"ATM call K${atm_strike} Δ{atm_call_delta:.2f}=${atm_call_price:.2f}→${normalized_call:.2f} | "
+              f"ITM put K${itm_put_strike} Δ{itm_put_delta:.2f}${_approx_note}=${itm_put_price:.2f}→${normalized_put:.2f} | "
               f"Score={score:+d}", flush=True)
 
     except Exception as _dse:
@@ -14520,7 +14566,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>SPOCK — TSLA Intelligence v20260517_1200</title>
+<title>SPOCK — TSLA Intelligence v20260517_1400</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -15255,7 +15301,7 @@ body {
           <span class="data-row-val" id="ds-norm-call">—</span>
         </div>
         <div class="data-row">
-          <span class="data-row-label">ITM Put</span>
+          <span class="data-row-label">ITM Put (Δ~0.95)</span>
           <span class="data-row-val" id="ds-itm-put">—</span>
         </div>
         <div class="data-row">
@@ -15271,9 +15317,8 @@ body {
           <span class="data-row-val" id="ds-score">—</span>
         </div>
         <div style="margin-top:10px;padding:8px 12px;background:var(--bg3);border-radius:4px;font-size:11px;color:var(--dim);" id="ds-detail">—</div>
+        <div style="margin-top:6px;font-size:10px;color:var(--dim);text-align:right;" id="ds-expiry-note">expiry —</div>
       </div>
-      <div class="data-card">
-        <h3>🎯 BB Squeeze Strategy (1h)</h3>
         <div style="padding:10px 14px;border-radius:6px;margin-bottom:12px;text-align:center;border:1px solid var(--border);" id="bb-banner">
           <div style="font-size:1.3rem;font-weight:700;letter-spacing:1px;" id="bb-state">—</div>
           <div style="font-size:10px;color:var(--dim);margin-top:3px;" id="bb-state-sub">awaiting data</div>
@@ -15930,6 +15975,14 @@ function _updateUI_inner(s) {
     dsScore > 0 ? 'bull' : dsScore < 0 ? 'bear' : '');
   var dsDetailEl = document.getElementById('ds-detail');
   if (dsDetailEl) dsDetailEl.textContent = ds.detail || ds.error || '—';
+  var dsExpNote = document.getElementById('ds-expiry-note');
+  if (dsExpNote) {
+    var _approxNote = ds.delta_approx ? ' · Δ estimated' : '';
+    var _proxyNote  = ds.put_proxy    ? ' · put OTM proxy' : '';
+    dsExpNote.textContent = ds.expiry
+      ? 'expiry ' + ds.expiry + _approxNote + _proxyNote
+      : 'expiry unknown' + _approxNote;
+  }
 
   // ── BB Squeeze Breakout ──────────────────────────────────────────────
   var bb = s.bb_squeeze || {};
