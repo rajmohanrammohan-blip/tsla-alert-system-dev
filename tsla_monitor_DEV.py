@@ -6029,6 +6029,222 @@ def calculate_swing_context(closes, highs, lows, price, mm_data):
     return result
 
 
+def calculate_delta_skew_bias(schwab_opts, current_price):
+    """
+    Delta-Weighted Skew Bias — detects institutional directional positioning
+    by comparing normalized option prices across the delta spectrum.
+
+    Core logic (user's insight):
+    ─────────────────────────────
+    Fair value rule: delta × price should be EQUAL for all strikes on same expiry.
+    i.e. ATM call (Δ0.50 × $2.00 = $1.00) == ITM put (Δ0.95 × $6.00 = $5.70)?
+    → They're NOT equal → the gap is the skew signal.
+
+    Normalized price = option_price / delta  (= delta-1 equivalent cost)
+    
+    If normalized_put > normalized_call:
+        Puts are EXPENSIVE relative to calls
+        Institutions paying up for downside protection
+        → BEARISH bias
+
+    If normalized_call > normalized_put:
+        Calls are EXPENSIVE relative to puts  
+        Institutions chasing upside / covering shorts
+        → BULLISH bias
+
+    Skew ratio = normalized_put / normalized_call
+        > 1.15  → BEARISH  (-6 to -10 pts)
+        0.90–1.15 → NEUTRAL
+        < 0.85  → BULLISH  (+6 to +10 pts)
+
+    SPOCK score: ±10 pts (Tier 2.5 — between GEX and swing context)
+    """
+    result = {
+        "skew_ratio":         None,   # normalized_put / normalized_call
+        "normalized_call":    None,   # ATM call price / delta
+        "normalized_put":     None,   # ITM put price / delta
+        "atm_call_price":     None,
+        "atm_call_delta":     None,
+        "itm_put_price":      None,
+        "itm_put_delta":      None,
+        "atm_strike":         None,
+        "itm_put_strike":     None,
+        "bias":               "NEUTRAL",
+        "signal":             "NEUTRAL",
+        "spock_score":        0,
+        "color":              "var(--dim)",
+        "detail":             "",
+        "expiry":             None,
+        "error":              None,
+    }
+    try:
+        if not schwab_opts or not schwab_opts.get("calls") or not schwab_opts.get("puts"):
+            result["error"] = "No options data"
+            return result
+
+        calls = [c for c in schwab_opts["calls"] if isinstance(c, dict)]
+        puts  = [p for p in schwab_opts["puts"]  if isinstance(p, dict)]
+        if not calls or not puts:
+            result["error"] = "Empty calls/puts"
+            return result
+
+        # ── Step 1: Find ATM call (Δ closest to 0.50) ─────────────────────
+        # Use same front-month expiry for both sides
+        front_expiry = schwab_opts.get("expiries", [None])[0] if schwab_opts.get("expiries") else None
+        if front_expiry:
+            calls = [c for c in calls if c.get("expiry") == front_expiry or not c.get("expiry")]
+            puts  = [p for p in puts  if p.get("expiry") == front_expiry or not p.get("expiry")]
+
+        # ATM call: strike nearest to current price with delta 0.40–0.60
+        atm_call = None
+        best_atm_dist = float("inf")
+        for c in calls:
+            strike = float(c.get("strike", 0) or 0)
+            delta  = abs(float(c.get("delta", 0) or 0))
+            price_opt = float(c.get("mid", 0) or c.get("last", 0) or 0)
+            if delta <= 0 or price_opt <= 0:
+                continue
+            # Want delta ~0.50, strike near current price
+            dist = abs(strike - current_price) + abs(delta - 0.50) * current_price * 2
+            if dist < best_atm_dist:
+                best_atm_dist = dist
+                atm_call = c
+
+        if not atm_call:
+            result["error"] = "No ATM call found"
+            return result
+
+        atm_strike    = float(atm_call.get("strike", 0))
+        atm_call_price = float(atm_call.get("mid", 0) or atm_call.get("last", 0) or 0)
+        atm_call_delta = abs(float(atm_call.get("delta", 0.50) or 0.50))
+        if atm_call_delta < 0.01 or atm_call_price <= 0:
+            result["error"] = "ATM call delta/price invalid"
+            return result
+
+        # ── Step 2: Find ITM put (Δ 0.75–0.98, same expiry) ─────────────
+        # ITM put delta should be meaningfully higher than ATM — typically 0.80–0.95
+        # This is the "fear side" — if market expected to fall, puts get expensive
+        itm_put = None
+        best_itm_score = float("inf")
+        for p in puts:
+            strike = float(p.get("strike", 0) or 0)
+            delta  = abs(float(p.get("delta", 0) or 0))
+            price_opt = float(p.get("mid", 0) or p.get("last", 0) or 0)
+            if delta <= 0 or price_opt <= 0:
+                continue
+            # Want delta 0.75–0.98, strike above current price (ITM put = strike > price)
+            if delta < 0.70 or delta > 0.99:
+                continue
+            if strike <= current_price * 0.98:  # must be ITM (strike > price for put)
+                continue
+            dist = abs(delta - 0.85)  # target ~0.85 delta for comparison
+            if dist < best_itm_score:
+                best_itm_score = dist
+                itm_put = p
+
+        # Fallback: if Schwab doesn't return delta for puts, use deep ITM strike proxy
+        if not itm_put:
+            # Use put with strike ~3-5% above current price as ITM proxy
+            target_strike = current_price * 1.03
+            itm_put_candidates = sorted(
+                [p for p in puts if float(p.get("strike",0) or 0) >= current_price * 1.01
+                 and float(p.get("mid",0) or p.get("last",0) or 0) > 0],
+                key=lambda p: abs(float(p.get("strike",0)) - target_strike)
+            )
+            if itm_put_candidates:
+                itm_put = itm_put_candidates[0]
+                # Approximate delta using Black-Scholes proxy
+                _s = float(itm_put.get("strike", current_price))
+                _pct_itm = (_s - current_price) / current_price
+                # ITM put delta ≈ 0.5 + 0.5*pct_itm*10 (rough linear approx)
+                _approx_delta = min(0.97, max(0.60, 0.5 + _pct_itm * 8))
+                itm_put = dict(itm_put)
+                itm_put["delta"] = -_approx_delta  # puts have negative delta
+
+        if not itm_put:
+            result["error"] = "No ITM put found"
+            return result
+
+        itm_put_strike = float(itm_put.get("strike", 0))
+        itm_put_price  = float(itm_put.get("mid", 0) or itm_put.get("last", 0) or 0)
+        itm_put_delta  = abs(float(itm_put.get("delta", 0.85) or 0.85))
+        if itm_put_delta < 0.01 or itm_put_price <= 0:
+            result["error"] = "ITM put delta/price invalid"
+            return result
+
+        # ── Step 3: Delta-normalize both prices ───────────────────────────
+        # normalized = price / delta  →  "what would this cost at Δ1.0?"
+        normalized_call = atm_call_price / atm_call_delta
+        normalized_put  = itm_put_price  / itm_put_delta
+
+        # ── Step 4: Skew ratio — the directional bias signal ─────────────
+        skew_ratio = normalized_put / normalized_call
+
+        # ── Step 5: Score ─────────────────────────────────────────────────
+        # skew_ratio > 1.0 = puts are expensive = bearish fear priced in
+        # skew_ratio < 1.0 = calls are expensive = bullish demand priced in
+        if skew_ratio >= 1.25:
+            # Strong bearish skew — market paying serious premium for put protection
+            score = -10
+            bias  = "STRONGLY BEARISH"
+            color = "var(--sell)"
+            detail = (f"Put skew {skew_ratio:.2f}× — market paying {skew_ratio:.2f}× more for "
+                      f"downside (norm put ${normalized_put:.2f} vs call ${normalized_call:.2f})")
+        elif skew_ratio >= 1.15:
+            score = -6
+            bias  = "BEARISH"
+            color = "var(--sell)"
+            detail = (f"Put skew {skew_ratio:.2f}× — elevated put premium, bearish institutional lean")
+        elif skew_ratio <= 0.80:
+            # Strong bullish skew — calls disproportionately expensive
+            score = 10
+            bias  = "STRONGLY BULLISH"
+            color = "var(--buy)"
+            detail = (f"Call skew {skew_ratio:.2f}× — market paying more for upside "
+                      f"(norm call ${normalized_call:.2f} vs put ${normalized_put:.2f})")
+        elif skew_ratio <= 0.90:
+            score = 6
+            bias  = "BULLISH"
+            color = "var(--buy)"
+            detail = (f"Call skew {skew_ratio:.2f}× — calls premium over puts, bullish lean")
+        else:
+            score = 0
+            bias  = "NEUTRAL"
+            color = "var(--dim)"
+            detail = (f"Skew {skew_ratio:.2f}× — balanced, no directional edge "
+                      f"(put ${normalized_put:.2f} vs call ${normalized_call:.2f} delta-normalized)")
+
+        result.update({
+            "skew_ratio":      round(skew_ratio, 3),
+            "normalized_call": round(normalized_call, 3),
+            "normalized_put":  round(normalized_put, 3),
+            "atm_call_price":  round(atm_call_price, 2),
+            "atm_call_delta":  round(atm_call_delta, 3),
+            "itm_put_price":   round(itm_put_price, 2),
+            "itm_put_delta":   round(itm_put_delta, 3),
+            "atm_strike":      round(atm_strike, 2),
+            "itm_put_strike":  round(itm_put_strike, 2),
+            "bias":            bias,
+            "signal":          bias,
+            "spock_score":     score,
+            "color":           color,
+            "detail":          detail,
+            "expiry":          front_expiry,
+        })
+
+        direction = "↓ PUT HEAVY" if skew_ratio > 1.15 else ("↑ CALL HEAVY" if skew_ratio < 0.85 else "⟷ BALANCED")
+        print(f"  📐 Delta Skew: ratio={skew_ratio:.3f} {direction} | "
+              f"ATM call Δ{atm_call_delta:.2f}=${atm_call_price:.2f}→${normalized_call:.2f} | "
+              f"ITM put Δ{itm_put_delta:.2f}=${itm_put_price:.2f}→${normalized_put:.2f} | "
+              f"Score={score:+d}", flush=True)
+
+    except Exception as _dse:
+        result["error"] = str(_dse)[:60]
+        print(f"  ⚠️ Delta Skew error: {_dse}", flush=True)
+
+    return result
+
+
 def calculate_pcr_analysis(mm_data, state_ref=None):
     """
     Enhanced Put/Call Ratio Analysis.
@@ -6340,6 +6556,231 @@ def calculate_donchian(highs, lows, closes, period=20):
         }
     except Exception:
         return {}
+
+
+def calculate_bb_squeeze_breakout(closes, highs, lows, period=20, std_mult=2.0, atr_period=14, squeeze_lookback=20):
+    """
+    Bollinger Band Squeeze → Breakout Entry/Exit Strategy (1h timeframe)
+
+    The 6-condition logic (user-defined):
+    ─────────────────────────────────────
+    ENTRY conditions (all must be true):
+      1. SQUEEZE: BB width is at or near its lowest in `squeeze_lookback` bars
+                  (bands have been coiling = energy compressing)
+      2. DIRECTION: price above midline → LONG bias
+                    price below midline → SHORT bias
+      3. EXPANSION: True Range > ATR(14) — confirms volatility is expanding NOW
+      4. UPPER BB RISING: upper[i] > upper[i-1] — upside momentum confirmed
+      5. LOWER BB FALLING: lower[i] < lower[i-1] — full band expansion (not one-sided)
+
+    EXIT condition:
+      6. UPPER BB FLATTENS: upper[i] ≈ upper[i-1] (change < 0.05% of price)
+                            → momentum exhausted → exit long
+
+    States returned:
+      SQUEEZING     — bands compressing, watch for breakout
+      BREAKOUT_UP   — all 5 entry conditions met, price above mid → BUY
+      BREAKOUT_DOWN — all 5 entry conditions met, price below mid → SELL
+      EXPANDING     — bands widening but conditions not fully met
+      EXIT_SIGNAL   — upper band has flattened → close long positions
+      NEUTRAL       — no actionable state
+
+    SPOCK score (entry/exit timing layer):
+      BREAKOUT_UP:    +18 pts
+      SQUEEZING:      +6  pts (bias toward long if GEX/UOA bullish)
+      BREAKOUT_DOWN:  -18 pts
+      EXIT_SIGNAL:    -10 pts (exit the long, don't necessarily go short)
+      EXPANDING/NEUTRAL: 0 pts
+    """
+    import numpy as np
+
+    result = {
+        "state":            "NEUTRAL",
+        "signal":           "NEUTRAL",
+        "spock_score":      0,
+        "squeeze":          False,
+        "squeeze_pct":      None,    # how tight vs lookback (0=tightest ever, 1=widest)
+        "bb_width":         None,    # current BB width as % of price
+        "bb_width_min":     None,    # min BB width over lookback
+        "upper":            None,
+        "mid":              None,
+        "lower":            None,
+        "upper_rising":     False,
+        "lower_falling":    False,
+        "above_mid":        False,
+        "tr_gt_atr":        False,
+        "atr":              None,
+        "tr_now":           None,
+        "exit_signal":      False,
+        "upper_flat":       False,
+        "conditions_met":   0,       # how many of 5 entry conditions are met
+        "color":            "var(--dim)",
+        "detail":           "",
+    }
+
+    try:
+        n = len(closes)
+        min_bars = max(period, atr_period, squeeze_lookback) + 5
+        if n < min_bars:
+            result["detail"] = f"Insufficient bars ({n} < {min_bars})"
+            return result
+
+        c = np.array(closes.values, dtype=float)
+        h = np.array(highs.values,  dtype=float)
+        l = np.array(lows.values,   dtype=float)
+
+        # ── Bollinger Bands ─────────────────────────────────────────────
+        # Rolling mean and std (period=20)
+        bb_mid   = np.array([c[i-period:i].mean() for i in range(period, n+1)])
+        bb_std   = np.array([c[i-period:i].std(ddof=0) for i in range(period, n+1)])
+        bb_upper = bb_mid + std_mult * bb_std
+        bb_lower = bb_mid - std_mult * bb_std
+        bb_width = (bb_upper - bb_lower) / bb_mid  # normalised width
+
+        # Current values (last bar) and previous bar
+        cur_upper = bb_upper[-1];  prev_upper = bb_upper[-2]
+        cur_lower = bb_lower[-1];  prev_lower = bb_lower[-2]
+        cur_mid   = bb_mid[-1]
+        cur_width = bb_width[-1]
+        cur_price = c[-1]
+
+        # ── Condition 1: SQUEEZE ─────────────────────────────────────────
+        # Width is within bottom 20% of its lookback range = compressed
+        lookback_widths = bb_width[-squeeze_lookback:]
+        w_min = lookback_widths.min()
+        w_max = lookback_widths.max()
+        w_range = w_max - w_min if w_max > w_min else 1e-9
+        squeeze_pct = (cur_width - w_min) / w_range   # 0 = tightest, 1 = widest
+        is_squeeze = squeeze_pct <= 0.25               # bottom quartile = squeezing
+
+        # ── Condition 2: DIRECTION (price vs midline) ───────────────────
+        above_mid = cur_price > cur_mid
+
+        # ── Condition 3: TRUE RANGE > ATR ───────────────────────────────
+        # TR = max(H-L, |H-Cprev|, |L-Cprev|)
+        tr = np.maximum(h[1:] - l[1:],
+             np.maximum(np.abs(h[1:] - c[:-1]),
+                        np.abs(l[1:] - c[:-1])))
+        # Wilder ATR
+        atr_arr = np.zeros(len(tr))
+        atr_arr[atr_period-1] = tr[:atr_period].mean()
+        alpha = 1.0 / atr_period
+        for i in range(atr_period, len(tr)):
+            atr_arr[i] = atr_arr[i-1] * (1 - alpha) + tr[i] * alpha
+        cur_atr = float(atr_arr[-1])
+        cur_tr  = float(tr[-1])
+        tr_expanding = cur_tr > cur_atr   # volatility expanding NOW
+
+        # ── Condition 4: UPPER BB RISING ────────────────────────────────
+        upper_rising = cur_upper > prev_upper
+
+        # ── Condition 5: LOWER BB FALLING ───────────────────────────────
+        lower_falling = cur_lower < prev_lower
+
+        # ── Condition 6: EXIT — upper BB flattening ─────────────────────
+        flat_threshold = cur_price * 0.0005   # 0.05% of price = "flat enough"
+        upper_flat = abs(cur_upper - prev_upper) < flat_threshold
+        # Also detect deceleration: rate of change is shrinking
+        if len(bb_upper) >= 3:
+            upper_roc_now  = cur_upper  - prev_upper
+            upper_roc_prev = prev_upper - bb_upper[-3]
+            upper_decelerating = (upper_roc_now < upper_roc_prev * 0.3
+                                  and upper_roc_now >= 0)   # still rising but slowing fast
+        else:
+            upper_decelerating = False
+
+        exit_signal = upper_flat or upper_decelerating
+
+        # ── Count conditions met ─────────────────────────────────────────
+        conds = [is_squeeze, tr_expanding, upper_rising, lower_falling]
+        conditions_met = sum(conds) + (1 if is_squeeze else 0)  # squeeze counts double
+        # Full entry = all 5 conditions (squeeze + direction + TR>ATR + upper rising + lower falling)
+        full_entry_bull = is_squeeze and above_mid     and tr_expanding and upper_rising and lower_falling
+        full_entry_bear = is_squeeze and (not above_mid) and tr_expanding and upper_rising and lower_falling
+
+        # ── Determine state ──────────────────────────────────────────────
+        if full_entry_bull:
+            state    = "BREAKOUT_UP"
+            score    = 18
+            color    = "var(--buy)"
+            detail   = (f"BB Squeeze breakout ↑ — all 5 conditions met | "
+                        f"Price ${cur_price:.2f} > mid ${cur_mid:.2f} | "
+                        f"TR {cur_tr:.2f} > ATR {cur_atr:.2f} | "
+                        f"Bands expanding")
+        elif full_entry_bear:
+            state    = "BREAKOUT_DOWN"
+            score    = -18
+            color    = "var(--sell)"
+            detail   = (f"BB Squeeze breakout ↓ — all 5 conditions met | "
+                        f"Price ${cur_price:.2f} < mid ${cur_mid:.2f} | "
+                        f"TR {cur_tr:.2f} > ATR {cur_atr:.2f} | "
+                        f"Bands expanding")
+        elif exit_signal and upper_rising:
+            # Upper band had been rising but is now flattening — momentum exhausted
+            state    = "EXIT_SIGNAL"
+            score    = -10
+            color    = "var(--hold)"
+            detail   = (f"Upper BB flattening — momentum exhausted | "
+                        f"Upper ${cur_upper:.2f} vs prev ${prev_upper:.2f} | Exit long")
+        elif is_squeeze:
+            # Coiling but not yet breaking — watch mode
+            state    = "SQUEEZING"
+            score    = 4 if above_mid else -4   # lean toward direction
+            color    = "var(--hold)"
+            detail   = (f"BB Squeeze {squeeze_pct:.0%} compressed | "
+                        f"Width {cur_width*100:.2f}% | Awaiting breakout | "
+                        f"{'Price above mid — bullish lean' if above_mid else 'Price below mid — bearish lean'}")
+        elif upper_rising and lower_falling and tr_expanding:
+            # Expanding but no prior squeeze — lower conviction
+            state    = "EXPANDING"
+            score    = 5 if above_mid else -5
+            color    = "var(--dim)"
+            detail   = (f"BB Expanding (no squeeze entry) | "
+                        f"TR {cur_tr:.2f} > ATR {cur_atr:.2f} | "
+                        f"{'Bullish' if above_mid else 'Bearish'} direction")
+        else:
+            state    = "NEUTRAL"
+            score    = 0
+            color    = "var(--dim)"
+            detail   = (f"BB neutral | Width {cur_width*100:.2f}% | "
+                        f"{'Above' if above_mid else 'Below'} mid ${cur_mid:.2f}")
+
+        _emoji = {"BREAKOUT_UP":"🚀","BREAKOUT_DOWN":"💥","SQUEEZING":"🔄",
+                  "EXPANDING":"📊","EXIT_SIGNAL":"🚪","NEUTRAL":"—"}.get(state, "—")
+        print(f"  📊 BB Squeeze: {_emoji} {state} | Width:{cur_width*100:.2f}% "
+              f"(squeeze:{squeeze_pct:.0%}) | TR:{cur_tr:.2f} vs ATR:{cur_atr:.2f} | "
+              f"Upper{'↑' if upper_rising else '→'} Lower{'↓' if lower_falling else '→'} | "
+              f"Score:{score:+d}", flush=True)
+
+        result.update({
+            "state":          state,
+            "signal":         state,
+            "spock_score":    score,
+            "squeeze":        bool(is_squeeze),
+            "squeeze_pct":    round(float(squeeze_pct), 3),
+            "bb_width":       round(float(cur_width * 100), 3),
+            "bb_width_min":   round(float(w_min * 100), 3),
+            "upper":          round(float(cur_upper), 2),
+            "mid":            round(float(cur_mid), 2),
+            "lower":          round(float(cur_lower), 2),
+            "upper_rising":   bool(upper_rising),
+            "lower_falling":  bool(lower_falling),
+            "above_mid":      bool(above_mid),
+            "tr_gt_atr":      bool(tr_expanding),
+            "atr":            round(cur_atr, 3),
+            "tr_now":         round(cur_tr, 3),
+            "exit_signal":    bool(exit_signal),
+            "upper_flat":     bool(upper_flat),
+            "conditions_met": conditions_met,
+            "color":          color,
+            "detail":         detail,
+        })
+
+    except Exception as _bb_err:
+        result["detail"] = f"Error: {str(_bb_err)[:60]}"
+        print(f"  ⚠️ BB Squeeze error: {_bb_err}", flush=True)
+
+    return result
 
 
 def calculate_alpha_trend(closes, highs, lows, period=14, coefficient=3):
@@ -8172,6 +8613,56 @@ def calculate_master_signal(signal, strength, ml_signal, mm_data, uoa_data,
     elif _pcr_now:
         votes["neutral"] += 1
 
+    # 10f. Delta-Weighted Skew Bias (±10 pts, Tier 2.5)
+    # Normalizes call/put prices by delta to detect institutional directional lean.
+    # Expensive puts = bearish hedge. Expensive calls = bullish demand.
+    _ds = state.get("delta_skew", {}) if isinstance(state, dict) else {}
+    _ds_score  = int(_ds.get("spock_score", 0) or 0)
+    _ds_bias   = _ds.get("bias", "NEUTRAL")
+    _ds_ratio  = _ds.get("skew_ratio")
+    if _ds_score != 0 and _ds_ratio:
+        score += _ds_score
+        if "BULLISH" in _ds_bias:
+            reasons.append(f"📐 Delta skew {_ds_ratio:.2f}× — calls expensive vs puts, upside demand ↑")
+            votes["bull"] += 1
+        elif "BEARISH" in _ds_bias:
+            reasons.append(f"📐 Delta skew {_ds_ratio:.2f}× — puts expensive vs calls, downside fear ↓")
+            votes["bear"] += 1
+    elif _ds_ratio:
+        votes["neutral"] += 1  # NEUTRAL skew — no directional edge
+
+    # 10g. BB Squeeze Breakout Strategy (±18 pts, Tier 3 entry/exit timing)
+    # 1h Bollinger Band squeeze → expansion signal. Most precise entry timing in SPOCK.
+    # All 5 conditions: squeeze + direction + TR>ATR + upper rising + lower falling.
+    _bb = state.get("bb_squeeze", {}) if isinstance(state, dict) else {}
+    _bb_score = int(_bb.get("spock_score", 0) or 0)
+    _bb_state = _bb.get("state", "NEUTRAL")
+    _bb_squeeze_active = _bb.get("squeeze", False)
+    if _bb_score != 0:
+        score += _bb_score
+        if _bb_state == "BREAKOUT_UP":
+            reasons.append(f"🚀 BB Squeeze BREAKOUT UP — all 5 conditions met (1h) ▲▲")
+            votes["bull"] += 2    # strong signal — 2 votes
+        elif _bb_state == "BREAKOUT_DOWN":
+            reasons.append(f"💥 BB Squeeze BREAKOUT DOWN — all 5 conditions met (1h) ▼▼")
+            votes["bear"] += 2
+        elif _bb_state == "EXIT_SIGNAL":
+            reasons.append(f"🚪 BB upper band flattening — momentum exhausted, exit long")
+            votes["bear"] += 1
+        elif _bb_state == "SQUEEZING":
+            if _bb_score > 0:
+                reasons.append(f"🔄 BB Squeezing (compressed) — bullish lean, watch for breakout")
+                votes["bull"] += 1
+            else:
+                reasons.append(f"🔄 BB Squeezing (compressed) — bearish lean, watch for breakdown")
+                votes["bear"] += 1
+        elif _bb_state == "EXPANDING":
+            votes["bull" if _bb_score > 0 else "bear"] += 1
+    elif _bb_squeeze_active:
+        # Squeeze detected but no directional signal yet — note it
+        reasons.append(f"🔄 BB Squeezing — energy coiling, breakout imminent (watch 1h)")
+        votes["neutral"] += 1
+
     news_score = float(news_data.get("score", 0) or 0) if news_data else 0
     if news_score >= 20:
         score += 5; votes["bull"] += 1
@@ -9239,6 +9730,16 @@ def run_analysis(refresh_4h=True, refresh_news=True):
                 state["pcr_analysis"] = {}
                 print(f"  ⚠️ PCR analysis error: {_pcr_e}", flush=True)
 
+            # ── Delta Skew Bias ──────────────────────────────────────────
+            # Compares delta-normalized call vs put prices to detect
+            # institutional directional positioning via options skew.
+            try:
+                delta_skew = calculate_delta_skew_bias(_schwab_opts, price)
+                state["delta_skew"] = delta_skew
+            except Exception as _dse2:
+                state["delta_skew"] = {}
+                print(f"  ⚠️ Delta skew error: {_dse2}", flush=True)
+
             # ── Volume Hawk — multi-tier spike detection ──
             try:
                 _vol_now   = float(volumes.iloc[-1])
@@ -9474,6 +9975,61 @@ def run_analysis(refresh_4h=True, refresh_news=True):
             tsla_4h_data = state.get("tsla_4h", {})
             print(f"  📊 TSLA 4h: [cached] RSI={tsla_4h_data.get('rsi_4h','?')} "
                   f"Trend={tsla_4h_data.get('trend_4h','?')}", flush=True)
+
+        # ── BB Squeeze Breakout Strategy (1h bars) ──────────────────────
+        # Resample the main 5-min Schwab hist to 1h OHLCV bars.
+        # Using the already-loaded 2yr dataset — no extra API call needed.
+        try:
+            if hist is not None and not hist.empty and len(hist) > 50:
+                try:
+                    import pytz as _pytz_bb
+                    _bb_idx = hist.index
+                    if _bb_idx.tz is None:
+                        _bb_idx = _bb_idx.tz_localize("UTC")
+                    _bb_df = hist.copy()
+                    _bb_df.index = _bb_idx.tz_convert("America/New_York")
+                except Exception:
+                    _bb_df = hist.copy()
+                _bb_1h = _bb_df.resample("1h").agg({
+                    "Open":  "first",
+                    "High":  "max",
+                    "Low":   "min",
+                    "Close": "last",
+                    "Volume":"sum"
+                }).dropna(subset=["Close"])
+                if len(_bb_1h) >= 40:
+                    _bb_result = calculate_bb_squeeze_breakout(
+                        closes        = _bb_1h["Close"].astype(float),
+                        highs         = _bb_1h["High"].astype(float),
+                        lows          = _bb_1h["Low"].astype(float),
+                        period        = 20,
+                        std_mult      = 2.0,
+                        atr_period    = 14,
+                        squeeze_lookback = 20,
+                    )
+                    state["bb_squeeze"] = _bb_result
+                    # Fire WhatsApp on breakout signal
+                    _bb_state = _bb_result.get("state", "")
+                    if _bb_state in ("BREAKOUT_UP", "BREAKOUT_DOWN", "EXIT_SIGNAL"):
+                        _nl = "\n"
+                        _bb_emoji = "🚀" if _bb_state == "BREAKOUT_UP" else ("💥" if _bb_state == "BREAKOUT_DOWN" else "🚪")
+                        log_alert(
+                            f"{_bb_emoji} BB SQUEEZE {_bb_state}{_nl}"
+                            f"━━━━━━━━━━━━━━━━━━━━━━{_nl}"
+                            f"Price *${price:.2f}* | {_bb_result.get('detail','')}{_nl}"
+                            f"BB: Upper ${_bb_result.get('upper','?')} | Mid ${_bb_result.get('mid','?')} | Lower ${_bb_result.get('lower','?')}{_nl}"
+                            f"TR {_bb_result.get('tr_now','?')} vs ATR {_bb_result.get('atr','?')}{_nl}"
+                            f"Width {_bb_result.get('bb_width','?')}% (squeeze:{_bb_result.get('squeeze_pct',0):.0%} compressed)",
+                            alert_key=f"bb_squeeze_{_bb_state.lower()}"
+                        )
+                else:
+                    state["bb_squeeze"] = {"state": "NEUTRAL", "spock_score": 0,
+                                           "detail": f"Not enough 1h bars ({len(_bb_1h)})"}
+            else:
+                state["bb_squeeze"] = {}
+        except Exception as _bb_e:
+            state["bb_squeeze"] = {}
+            print(f"  ⚠️ BB Squeeze error: {_bb_e}", flush=True)
 
         # ── DarthVader 1.0 — Institutional Intelligence ──────────
         dv_result = {}  # default if calculate_darthvader throws
@@ -10842,6 +11398,8 @@ def api_state():
                 "daily_sr":      state.get("daily_sr", {}),
                 "alpha_trend":   state.get("alpha_trend", {}),
                 "pcr_analysis":  state.get("pcr_analysis", {}),
+                "delta_skew":    state.get("delta_skew", {}),
+                "bb_squeeze":    state.get("bb_squeeze", {}),
                 "alerts_log":    state.get("alerts_log", [])[:20],
                 "spock_accuracy":state.get("spock_accuracy", {}),
                 "ml_ready":      _ml_ready,
@@ -13962,7 +14520,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>SPOCK — TSLA Intelligence v20260514_0930</title>
+<title>SPOCK — TSLA Intelligence v20260517_1200</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -14328,6 +14886,8 @@ body {
 
 /* ── PULSE ANIMATION for live price ── */
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+@keyframes bbPulse { 0%,100%{opacity:1;transform:scaleX(1)} 50%{opacity:0.6;transform:scaleX(0.85)} }
+@keyframes bbSlideIn { from{opacity:0;transform:translateY(-8px)} to{opacity:1;transform:none} }
 .live-dot {
   width: 7px; height: 7px;
   border-radius: 50%;
@@ -14475,6 +15035,25 @@ body {
           If blank after 60s, check Railway logs for errors.
         </div>
       </div>
+    </div>
+
+    <!-- BB Squeeze Flash — hidden until signal fires -->
+    <div id="bb-flash" style="display:none;margin:10px 0;border-radius:8px;
+         padding:10px 14px;border:1px solid var(--border);
+         background:var(--bg3);position:relative;overflow:hidden;">
+      <!-- animated shimmer bar across top -->
+      <div id="bb-flash-bar" style="position:absolute;top:0;left:0;right:0;height:3px;
+           background:var(--buy);border-radius:8px 8px 0 0;
+           animation:bbPulse 1.6s ease-in-out infinite;"></div>
+      <div style="display:flex;align-items:center;justify-content:space-between;">
+        <div>
+          <div style="font-size:9px;letter-spacing:1.5px;color:var(--dim);margin-bottom:3px;">BOLLINGER SIGNAL</div>
+          <div id="bb-flash-state" style="font-size:1rem;font-weight:700;letter-spacing:0.5px;">—</div>
+        </div>
+        <div id="bb-flash-score" style="font-size:1.4rem;font-weight:800;"></div>
+      </div>
+      <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap;" id="bb-flash-conds"></div>
+      <div style="margin-top:6px;font-size:10px;color:var(--dim);line-height:1.4;" id="bb-flash-detail">—</div>
     </div>
 
     <!-- Meta: size + target -->
@@ -14660,6 +15239,72 @@ body {
         <div class="data-row"><span class="data-row-label">Signal</span><span class="data-row-val" id="pcr-signal">—</span></div>
         <div class="data-row"><span class="data-row-label">SPOCK Score</span><span class="data-row-val" id="pcr-score">—</span></div>
         <div style="margin-top:10px;padding:8px 12px;background:var(--bg3);border-radius:4px;font-size:11px;color:var(--dim);" id="pcr-detail">—</div>
+      </div>
+      <div class="data-card">
+        <h3>⚖️ Delta Skew Bias</h3>
+        <div style="padding:10px 14px;border-radius:6px;margin-bottom:12px;text-align:center;border:1px solid var(--border);" id="ds-banner">
+          <div style="font-size:1.3rem;font-weight:700;" id="ds-bias">—</div>
+          <div style="font-size:11px;color:var(--dim);margin-top:4px;" id="ds-ratio-label">skew ratio —</div>
+        </div>
+        <div class="data-row">
+          <span class="data-row-label">ATM Call</span>
+          <span class="data-row-val" id="ds-atm-call">—</span>
+        </div>
+        <div class="data-row">
+          <span class="data-row-label">ATM Call Δ-norm</span>
+          <span class="data-row-val" id="ds-norm-call">—</span>
+        </div>
+        <div class="data-row">
+          <span class="data-row-label">ITM Put</span>
+          <span class="data-row-val" id="ds-itm-put">—</span>
+        </div>
+        <div class="data-row">
+          <span class="data-row-label">ITM Put Δ-norm</span>
+          <span class="data-row-val" id="ds-norm-put">—</span>
+        </div>
+        <div class="data-row">
+          <span class="data-row-label">Skew Ratio</span>
+          <span class="data-row-val" id="ds-ratio">—</span>
+        </div>
+        <div class="data-row">
+          <span class="data-row-label">SPOCK Score</span>
+          <span class="data-row-val" id="ds-score">—</span>
+        </div>
+        <div style="margin-top:10px;padding:8px 12px;background:var(--bg3);border-radius:4px;font-size:11px;color:var(--dim);" id="ds-detail">—</div>
+      </div>
+      <div class="data-card">
+        <h3>🎯 BB Squeeze Strategy (1h)</h3>
+        <div style="padding:10px 14px;border-radius:6px;margin-bottom:12px;text-align:center;border:1px solid var(--border);" id="bb-banner">
+          <div style="font-size:1.3rem;font-weight:700;letter-spacing:1px;" id="bb-state">—</div>
+          <div style="font-size:10px;color:var(--dim);margin-top:3px;" id="bb-state-sub">awaiting data</div>
+        </div>
+        <div class="data-row"><span class="data-row-label">Squeeze Active</span><span class="data-row-val" id="bb-squeeze">—</span></div>
+        <div class="data-row"><span class="data-row-label">Squeeze %ile</span><span class="data-row-val" id="bb-squeeze-pct">—</span></div>
+        <div class="data-row"><span class="data-row-label">BB Width</span><span class="data-row-val" id="bb-width">—</span></div>
+        <div class="data-row"><span class="data-row-label">Upper Band</span><span class="data-row-val" id="bb-upper">—</span></div>
+        <div class="data-row"><span class="data-row-label">Midline</span><span class="data-row-val" id="bb-mid">—</span></div>
+        <div class="data-row"><span class="data-row-label">Lower Band</span><span class="data-row-val" id="bb-lower">—</span></div>
+        <div style="margin-top:8px;padding:6px 10px;background:var(--bg3);border-radius:4px;">
+          <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+            <span style="font-size:11px;color:var(--dim);">① Squeeze</span><span id="bb-c1" style="font-size:11px;">—</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+            <span style="font-size:11px;color:var(--dim);">② Above Mid</span><span id="bb-c2" style="font-size:11px;">—</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+            <span style="font-size:11px;color:var(--dim);">③ TR &gt; ATR</span><span id="bb-c3" style="font-size:11px;">—</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+            <span style="font-size:11px;color:var(--dim);">④ Upper Rising</span><span id="bb-c4" style="font-size:11px;">—</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;">
+            <span style="font-size:11px;color:var(--dim);">⑤ Lower Falling</span><span id="bb-c5" style="font-size:11px;">—</span>
+          </div>
+        </div>
+        <div class="data-row" style="margin-top:8px;"><span class="data-row-label">TR / ATR</span><span class="data-row-val" id="bb-tr-atr">—</span></div>
+        <div class="data-row"><span class="data-row-label">Exit Signal</span><span class="data-row-val" id="bb-exit">—</span></div>
+        <div class="data-row"><span class="data-row-label">SPOCK Score</span><span class="data-row-val" id="bb-score">—</span></div>
+        <div style="margin-top:10px;padding:8px 12px;background:var(--bg3);border-radius:4px;font-size:11px;color:var(--dim);" id="bb-detail">—</div>
       </div>
       <div class="data-card">
         <h3>🦅 Volume Hawk</h3>
@@ -15242,6 +15887,177 @@ function _updateUI_inner(s) {
     pcrScore > 0 ? 'bull' : pcrScore < 0 ? 'bear' : '');
   var pcrDetailEl = document.getElementById('pcr-detail');
   if (pcrDetailEl) pcrDetailEl.textContent = pcr.detail || '—';
+
+  // ── Delta Skew Bias ──────────────────────────────────────────────────
+  var ds = s.delta_skew || {};
+  var dsBias  = ds.bias  || '—';
+  var dsRatio = ds.skew_ratio;
+  var dsBanner = document.getElementById('ds-banner');
+  var dsBiasEl = document.getElementById('ds-bias');
+  var dsRatioLbl = document.getElementById('ds-ratio-label');
+  if (dsBiasEl) {
+    dsBiasEl.textContent = dsBias;
+    var _dsBullish = dsBias.includes('BULLISH');
+    var _dsBearish = dsBias.includes('BEARISH');
+    dsBiasEl.style.color = _dsBullish ? 'var(--buy)' : _dsBearish ? 'var(--sell)' : 'var(--dim)';
+  }
+  if (dsBanner) {
+    dsBanner.style.background = dsBias.includes('BULLISH') ? 'rgba(0,255,136,0.08)'
+                               : dsBias.includes('BEARISH') ? 'rgba(255,51,85,0.08)'
+                               : 'var(--bg3)';
+    dsBanner.style.borderColor = dsBias.includes('BULLISH') ? 'rgba(0,255,136,0.3)'
+                                : dsBias.includes('BEARISH') ? 'rgba(255,51,85,0.3)'
+                                : 'var(--border)';
+  }
+  if (dsRatioLbl && dsRatio) {
+    var _dsSide = dsRatio > 1.0 ? '↓ puts more expensive' : dsRatio < 1.0 ? '↑ calls more expensive' : '⟷ balanced';
+    dsRatioLbl.textContent = 'skew ratio ' + dsRatio.toFixed(3) + ' — ' + _dsSide;
+  }
+  // ATM call: "Δ0.50 @ $2.00 (strike $445)"
+  if (ds.atm_call_price) {
+    setText('ds-atm-call', 'Δ' + (ds.atm_call_delta||0).toFixed(2) + ' @ $' + ds.atm_call_price + ' (K$' + ds.atm_strike + ')');
+    setText('ds-norm-call', '$' + (ds.normalized_call||0).toFixed(2) + ' per Δ1');
+  }
+  if (ds.itm_put_price) {
+    setText('ds-itm-put', 'Δ' + (ds.itm_put_delta||0).toFixed(2) + ' @ $' + ds.itm_put_price + ' (K$' + ds.itm_put_strike + ')');
+    setText('ds-norm-put', '$' + (ds.normalized_put||0).toFixed(2) + ' per Δ1',
+      dsRatio && dsRatio > 1.10 ? 'bear' : dsRatio && dsRatio < 0.90 ? '' : '');
+  }
+  if (dsRatio) setText('ds-ratio', dsRatio.toFixed(3) + '×',
+    dsRatio > 1.15 ? 'bear' : dsRatio < 0.85 ? 'bull' : '');
+  var dsScore = ds.spock_score || 0;
+  setText('ds-score', dsScore ? (dsScore >= 0 ? '+' : '') + dsScore + ' pts' : '—',
+    dsScore > 0 ? 'bull' : dsScore < 0 ? 'bear' : '');
+  var dsDetailEl = document.getElementById('ds-detail');
+  if (dsDetailEl) dsDetailEl.textContent = ds.detail || ds.error || '—';
+
+  // ── BB Squeeze Breakout ──────────────────────────────────────────────
+  var bb = s.bb_squeeze || {};
+  var bbState = bb.state || '—';
+  var bbScore = bb.spock_score || 0;
+  var bbColors = {
+    BREAKOUT_UP:   {bg:'rgba(0,255,136,0.12)', border:'rgba(0,255,136,0.4)', fg:'var(--buy)'},
+    BREAKOUT_DOWN: {bg:'rgba(255,51,85,0.12)', border:'rgba(255,51,85,0.4)',  fg:'var(--sell)'},
+    EXIT_SIGNAL:   {bg:'rgba(255,170,0,0.10)', border:'rgba(255,170,0,0.4)', fg:'var(--hold)'},
+    SQUEEZING:     {bg:'rgba(0,200,255,0.08)', border:'rgba(0,200,255,0.3)', fg:'#00c8ff'},
+    EXPANDING:     {bg:'var(--bg3)',           border:'var(--border)',        fg:'var(--dim)'},
+    NEUTRAL:       {bg:'var(--bg3)',           border:'var(--border)',        fg:'var(--dim)'},
+  };
+  var _bbc = bbColors[bbState] || bbColors.NEUTRAL;
+  var bbBanner = document.getElementById('bb-banner');
+  var bbStateEl = document.getElementById('bb-state');
+  var bbStateSub = document.getElementById('bb-state-sub');
+  if (bbBanner) { bbBanner.style.background = _bbc.bg; bbBanner.style.borderColor = _bbc.border; }
+  if (bbStateEl) { bbStateEl.textContent = bbState.replace(/_/g,' '); bbStateEl.style.color = _bbc.fg; }
+  if (bbStateSub) {
+    var _cMet = bb.conditions_met || 0;
+    bbStateSub.textContent = bbState === 'BREAKOUT_UP' ? '✅ All 5 conditions — BUY signal'
+      : bbState === 'BREAKOUT_DOWN' ? '✅ All 5 conditions — SELL signal'
+      : bbState === 'EXIT_SIGNAL'   ? '⚠️ Upper band flattening — exit long'
+      : bbState === 'SQUEEZING'     ? '🔄 Bands coiling — breakout pending'
+      : '—';
+  }
+  // Condition checklist
+  function _ck(v) { return v ? '<span style="color:var(--buy)">✓</span>' : '<span style="color:var(--sell)">✗</span>'; }
+  var c1 = document.getElementById('bb-c1'); if(c1) c1.innerHTML = _ck(bb.squeeze) + (bb.squeeze ? ' YES' : ' NO');
+  var c2 = document.getElementById('bb-c2'); if(c2) c2.innerHTML = _ck(bb.above_mid) + (bb.above_mid ? ' BULL' : ' BEAR');
+  var c3 = document.getElementById('bb-c3'); if(c3) c3.innerHTML = _ck(bb.tr_gt_atr);
+  var c4 = document.getElementById('bb-c4'); if(c4) c4.innerHTML = _ck(bb.upper_rising) + (bb.upper_rising ? ' ↑' : ' →');
+  var c5 = document.getElementById('bb-c5'); if(c5) c5.innerHTML = _ck(bb.lower_falling) + (bb.lower_falling ? ' ↓' : ' →');
+  setText('bb-squeeze',     bb.squeeze ? '🔴 YES — coiling' : (bb.squeeze===false ? 'NO' : '—'),
+                            bb.squeeze ? 'bull' : '');
+  setText('bb-squeeze-pct', bb.squeeze_pct != null ? (bb.squeeze_pct*100).toFixed(0)+'th %ile compressed' : '—',
+                            bb.squeeze_pct != null && bb.squeeze_pct <= 0.25 ? 'bull' : '');
+  setText('bb-width', bb.bb_width != null ? bb.bb_width.toFixed(2)+'%' : '—');
+  setText('bb-upper', bb.upper ? '$'+bb.upper + (bb.upper_rising ? ' ↑' : ' →') : '—',
+                      bb.upper_rising ? 'bull' : '');
+  setText('bb-mid',   bb.mid   ? '$'+bb.mid   + (bb.above_mid ? ' ← price above' : ' ← price below') : '—',
+                      bb.above_mid ? 'bull' : 'bear');
+  setText('bb-lower', bb.lower ? '$'+bb.lower + (bb.lower_falling ? ' ↓' : ' →') : '—',
+                      bb.lower_falling ? 'bull' : '');
+  if (bb.tr_now && bb.atr) {
+    setText('bb-tr-atr', bb.tr_now.toFixed(2) + ' / ' + bb.atr.toFixed(2) +
+                         (bb.tr_gt_atr ? ' ✓ EXPANDING' : ' ✗ flat'), bb.tr_gt_atr ? 'bull' : '');
+  }
+  setText('bb-exit', bb.exit_signal ? '⚠️ YES — upper band flat' : 'No',
+                     bb.exit_signal ? 'bear' : '');
+  setText('bb-score', bbScore ? (bbScore>=0?'+':'')+bbScore+' pts' : '—',
+                      bbScore > 0 ? 'bull' : bbScore < 0 ? 'bear' : '');
+  var bbDetailEl = document.getElementById('bb-detail');
+  if (bbDetailEl) bbDetailEl.textContent = bb.detail || '—';
+
+  // ── BB Flash Panel (left panel) ──────────────────────────────────────
+  var bbFlash      = document.getElementById('bb-flash');
+  var bbFlashBar   = document.getElementById('bb-flash-bar');
+  var bbFlashState = document.getElementById('bb-flash-state');
+  var bbFlashScore = document.getElementById('bb-flash-score');
+  var bbFlashConds = document.getElementById('bb-flash-conds');
+  var bbFlashDetail = document.getElementById('bb-flash-detail');
+
+  // Show flash for any non-neutral BB state
+  var _bbShow = bbState && bbState !== 'NEUTRAL' && bbState !== '—';
+  if (bbFlash) bbFlash.style.display = _bbShow ? 'block' : 'none';
+
+  if (_bbShow && bbFlashState) {
+    // Color scheme per state
+    var _bbFC = {
+      BREAKOUT_UP:   {bg:'rgba(0,255,136,0.07)', border:'rgba(0,255,136,0.5)', bar:'var(--buy)',  fg:'var(--buy)'},
+      BREAKOUT_DOWN: {bg:'rgba(255,51,85,0.07)', border:'rgba(255,51,85,0.5)', bar:'var(--sell)', fg:'var(--sell)'},
+      EXIT_SIGNAL:   {bg:'rgba(255,170,0,0.07)', border:'rgba(255,170,0,0.5)', bar:'var(--hold)', fg:'var(--hold)'},
+      SQUEEZING:     {bg:'rgba(0,200,255,0.06)', border:'rgba(0,200,255,0.4)', bar:'#00c8ff',     fg:'#00c8ff'},
+      EXPANDING:     {bg:'var(--bg3)',           border:'var(--border)',        bar:'var(--dim)',  fg:'var(--dim)'},
+    };
+    var _fc = _bbFC[bbState] || _bbFC.EXPANDING;
+    bbFlash.style.background   = _fc.bg;
+    bbFlash.style.borderColor  = _fc.border;
+    bbFlash.style.animation    = bbState === 'BREAKOUT_UP' || bbState === 'BREAKOUT_DOWN'
+                                 ? 'bbSlideIn 0.4s ease' : 'none';
+    if (bbFlashBar) bbFlashBar.style.background = _fc.bar;
+
+    // Label
+    var _bbLabels = {
+      BREAKOUT_UP:   '🚀 BREAKOUT UP',
+      BREAKOUT_DOWN: '💥 BREAKOUT DOWN',
+      EXIT_SIGNAL:   '🚪 EXIT SIGNAL',
+      SQUEEZING:     '🔄 SQUEEZING',
+      EXPANDING:     '📊 EXPANDING',
+    };
+    bbFlashState.textContent = _bbLabels[bbState] || bbState.replace(/_/g,' ');
+    bbFlashState.style.color = _fc.fg;
+
+    // Score badge
+    if (bbFlashScore) {
+      bbFlashScore.textContent = bbScore ? (bbScore>=0?'+':'')+bbScore : '';
+      bbFlashScore.style.color = bbScore > 0 ? 'var(--buy)' : bbScore < 0 ? 'var(--sell)' : 'var(--dim)';
+    }
+
+    // Condition pills
+    if (bbFlashConds) {
+      var _pillStyle = 'font-size:9px;padding:2px 7px;border-radius:10px;border:1px solid ';
+      var _pill = function(ok, label) {
+        var col = ok ? 'rgba(0,255,136,0.4)' : 'rgba(255,51,85,0.3)';
+        var fg  = ok ? 'var(--buy)' : 'var(--sell)';
+        return '<span style="' + _pillStyle + col + ';color:' + fg + '">' +
+               (ok ? '✓' : '✗') + ' ' + label + '</span>';
+      };
+      bbFlashConds.innerHTML =
+        _pill(bb.squeeze,      'SQUEEZE')    +
+        _pill(bb.above_mid,    'ABOVE MID')  +
+        _pill(bb.tr_gt_atr,    'TR>ATR')     +
+        _pill(bb.upper_rising, 'UP↑ RISING') +
+        _pill(bb.lower_falling,'LO↓ FALLING');
+    }
+
+    // Detail line
+    if (bbFlashDetail) {
+      var _bbW  = bb.bb_width  ? 'Width ' + bb.bb_width.toFixed(2) + '%' : '';
+      var _bbTR = bb.tr_now && bb.atr ? 'TR ' + bb.tr_now.toFixed(2) + ' / ATR ' + bb.atr.toFixed(2) : '';
+      var _bbU  = bb.upper ? 'U$' + bb.upper : '';
+      var _bbM  = bb.mid   ? 'M$' + bb.mid   : '';
+      var _bbL  = bb.lower ? 'L$' + bb.lower : '';
+      bbFlashDetail.textContent = [_bbW, _bbTR, [_bbU,_bbM,_bbL].filter(Boolean).join(' · ')].filter(Boolean).join(' | ');
+    }
+  }
 
   // Volume Hawk
   var vh = s.vol_hawk || {};
