@@ -9486,21 +9486,21 @@ def run_analysis(refresh_4h=True, refresh_news=True):
             "volume_today": int(volumes.iloc[-1]),
             "volume_avg":   int(avg_vol),
             "obv_trend":    obv_trend,
-            # Ichimoku
-            "ichimoku_signal": ichi["cloud_signal"],
-            "tenkan":          ichi["tenkan"],
-            "kijun":           ichi["kijun"],
-            # HMM
-            "hmm_regime":      hmm_result["regime"],
-            "hmm_confidence":  hmm_result["confidence"],
-            # Institutional models (for scoring)
-            "vwap":            vwap_r["vwap"],
-            "kalman_signal":   kalman_r["signal"],
-            "zscore":          zscore_r["zscore"],
-            "kelly_signal":    kelly_r["signal"],
-            "mc_prob_up":      mc_r["prob_up"],
-            "factor_signal":   factor_r["signal"],
-            "smi_signal":      smi_r["signal"],
+            # Ichimoku — safe .get() in case cloud calc failed
+            "ichimoku_signal": ichi.get("cloud_signal", "NEUTRAL") if ichi else "NEUTRAL",
+            "tenkan":          ichi.get("tenkan", 0) if ichi else 0,
+            "kijun":           ichi.get("kijun",  0) if ichi else 0,
+            # HMM — safe .get() in case HMM didn't run or is missing keys
+            "hmm_regime":      hmm_result.get("regime",     "NEUTRAL") if hmm_result else "NEUTRAL",
+            "hmm_confidence":  hmm_result.get("confidence", 0.5)       if hmm_result else 0.5,
+            # Institutional models — safe access
+            "vwap":            vwap_r.get("vwap",        0) if vwap_r    else 0,
+            "kalman_signal":   kalman_r.get("signal", "NEUTRAL") if kalman_r else "NEUTRAL",
+            "zscore":          zscore_r.get("zscore",    0) if zscore_r  else 0,
+            "kelly_signal":    kelly_r.get("signal",  "HOLD") if kelly_r  else "HOLD",
+            "mc_prob_up":      mc_r.get("prob_up",    0.5)   if mc_r     else 0.5,
+            "factor_signal":   factor_r.get("signal", "NEUTRAL") if factor_r else "NEUTRAL",
+            "smi_signal":      smi_r.get("signal",    "NEUTRAL") if smi_r    else "NEUTRAL",
             # SPY / Macro signals (for scoring)
             "macro_score":        spy_data.get("macro_score", 0),
             "macro_signal":       spy_data.get("macro_signal", "NEUTRAL"),
@@ -9565,7 +9565,14 @@ def run_analysis(refresh_4h=True, refresh_news=True):
             print(f"  ⚠️ CTA sizing error: {_e}")
             sizing = {"sizing_signal":"ERROR","final_exposure_pct":0,"final_exposure_dollar":0,"share_count":0,"vol_history":[]}
 
-        signal, strength, reasons = generate_signal(indicators, price)
+        try:
+            signal, strength, reasons = generate_signal(indicators, price)
+        except Exception as _gs_err:
+            import traceback as _tb_gs
+            print(f"  ⚠️ generate_signal error: {_gs_err}", flush=True)
+            for _gl in _tb_gs.format_exc().split("\n")[-6:-1]:
+                if _gl.strip(): print(f"     {_gl.strip()}", flush=True)
+            signal, strength, reasons = "HOLD", 0, []
 
         # ── EXIT / PEAK DETECTION ENGINE ──
         try:
@@ -11199,7 +11206,10 @@ def run_analysis(refresh_4h=True, refresh_news=True):
             print(f"  ⚠️ Spock trigger error: {_se}")
 
     except Exception as e:
-        print(f"❌ Analysis error: {e}")
+        import traceback as _tb_outer
+        print(f"❌ Analysis error: {e}", flush=True)
+        for _el in _tb_outer.format_exc().split("\n")[-10:-1]:
+            if _el.strip(): print(f"   {_el.strip()}", flush=True)
 
 
 def fetch_institutional_periodically():
@@ -14569,7 +14579,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>SPOCK — TSLA Intelligence v20260517_1500</title>
+<title>SPOCK — TSLA Intelligence v20260518_1200</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
